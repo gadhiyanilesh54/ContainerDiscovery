@@ -1649,10 +1649,12 @@ discover_docker_swarm() {
             master_nodes_list=""
             while IFS='|' read -r hostname node_id status; do
                 [ -z "$hostname" ] && continue
+                # Convert status to lowercase using tr (POSIX-compliant)
+                status_lower=$(echo "$status" | tr '[:upper:]' '[:lower:]')
                 node_obj=$(json_build_object \
                     "name" "$hostname" \
                     "node_id" "$node_id" \
-                    "status" "${status,,}")  # Convert to lowercase
+                    "status" "$status_lower")
                 if [ -z "$master_nodes_list" ]; then
                     master_nodes_list="$node_obj"
                 else
@@ -1670,10 +1672,12 @@ EOF
             worker_nodes_list=""
             while IFS='|' read -r hostname node_id status; do
                 [ -z "$hostname" ] && continue
+                # Convert status to lowercase using tr (POSIX-compliant)
+                status_lower=$(echo "$status" | tr '[:upper:]' '[:lower:]')
                 node_obj=$(json_build_object \
                     "name" "$hostname" \
                     "node_id" "$node_id" \
-                    "status" "${status,,}")  # Convert to lowercase
+                    "status" "$status_lower")
                 if [ -z "$worker_nodes_list" ]; then
                     worker_nodes_list="$node_obj"
                 else
