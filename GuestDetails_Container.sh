@@ -1703,11 +1703,47 @@ EOF
         service_count=$(try_command "docker service ls -q 2>/dev/null | wc -l" || echo "0")
     fi
 
+    # Container counts - get actual container counts on this node
+    total_container_count=0
+    system_container_count=0
+    user_container_count=0
+
+    priv=$(check_privilege)
+
+    # Get total container count (all containers on the node)
+    if [ "$priv" = "root" ]; then
+        total_container_count=$(try_command "docker ps -q 2>/dev/null | wc -l" || echo "0")
+    elif [ "$priv" = "sudo" ]; then
+        total_container_count=$(try_command "sudo docker ps -q 2>/dev/null | wc -l" || echo "0")
+    else
+        total_container_count=$(try_command "docker ps -q 2>/dev/null | wc -l" || echo "0")
+    fi
+
+    # For Swarm, system containers are those with system-related service names
+    # Common patterns: monitoring, logging, overlay network, ingress, etc.
+    if [ "$total_container_count" -gt "0" ]; then
+        if [ "$priv" = "root" ]; then
+            system_container_count=$(try_command "docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'ingress-sbox|_monitoring|_logging|portainer|swarm-agent' | wc -l" || echo "0")
+        elif [ "$priv" = "sudo" ]; then
+            system_container_count=$(try_command "sudo docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'ingress-sbox|_monitoring|_logging|portainer|swarm-agent' | wc -l" || echo "0")
+        else
+            system_container_count=$(try_command "docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'ingress-sbox|_monitoring|_logging|portainer|swarm-agent' | wc -l" || echo "0")
+        fi
+
+        # User containers = total - system
+        user_container_count=$((total_container_count - system_container_count))
+    fi
+
+    # Ensure all values are set
+    [ -z "$total_container_count" ] && total_container_count=0
+    [ -z "$system_container_count" ] && system_container_count=0
+    [ -z "$user_container_count" ] && user_container_count=0
+
     # Workloads
     workloads_json=$(json_build_object \
-        "total_container_count" "0" \
-        "system_container_count" "0" \
-        "user_container_count" "0" \
+        "total_container_count" "$total_container_count" \
+        "system_container_count" "$system_container_count" \
+        "user_container_count" "$user_container_count" \
         "pod_count" "0" \
         "service_count" "$service_count" \
         "deployment_count" "0" \
