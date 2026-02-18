@@ -1741,12 +1741,55 @@ discover_kubernetes() {
     [ "$master_count" = "0" ] && master_count=$(try_command "kubectl get nodes -l node-role.kubernetes.io/master --no-headers 2>/dev/null | wc -l" || echo "0")
     worker_count=$((total_count - master_count))
 
+    # Get master nodes list
+    master_nodes=""
+    if command_exists kubectl && [ "$total_count" -gt "0" ]; then
+        master_nodes=$(try_command "kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].metadata.name}' 2>/dev/null" | tr ' ' '\n')
+        if [ -z "$master_nodes" ]; then
+            master_nodes=$(try_command "kubectl get nodes -l node-role.kubernetes.io/master -o jsonpath='{.items[*].metadata.name}' 2>/dev/null" | tr ' ' '\n')
+        fi
+    fi
+    master_nodes_json=$(json_build_array "$master_nodes" false)
+
+    # Get worker nodes list - nodes without master or control-plane role
+    worker_nodes=""
+    if command_exists kubectl && [ "$total_count" -gt "0" ]; then
+        # Try to get nodes that are not labeled as control-plane or master
+        worker_nodes=$(try_command "kubectl get nodes -o jsonpath='{range .items[?(!@.metadata.labels.node-role\.kubernetes\.io/control-plane)]}{.metadata.name}{\"\n\"}{end}' 2>/dev/null")
+        if [ -z "$worker_nodes" ]; then
+            # Fallback: try with master label
+            worker_nodes=$(try_command "kubectl get nodes -o jsonpath='{range .items[?(!@.metadata.labels.node-role\.kubernetes\.io/master)]}{.metadata.name}{\"\n\"}{end}' 2>/dev/null")
+        fi
+        # If still empty but we have worker_count > 0, manually filter
+        if [ -z "$worker_nodes" ] && [ "$worker_count" -gt "0" ]; then
+            all_nodes=$(try_command "kubectl get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null" | tr ' ' '\n')
+            if [ -n "$all_nodes" ] && [ -n "$master_nodes" ]; then
+                # Create a simple filter by checking each node
+                worker_nodes=""
+                for node in $all_nodes; do
+                    is_master=false
+                    for master in $master_nodes; do
+                        if [ "$node" = "$master" ]; then
+                            is_master=true
+                            break
+                        fi
+                    done
+                    if [ "$is_master" = "false" ]; then
+                        worker_nodes="${worker_nodes}${node}
+"
+                    fi
+                done
+            fi
+        fi
+    fi
+    worker_nodes_json=$(json_build_array "$worker_nodes" false)
+
     nodes_json=$(json_build_object \
         "total_count" "$total_count" \
         "master_count" "$master_count" \
         "worker_count" "$worker_count" \
-        "master_nodes" "[]" \
-        "worker_nodes" "[]")
+        "master_nodes" "$master_nodes_json" \
+        "worker_nodes" "$worker_nodes_json")
 
     # Workload counts
     pod_count=$(try_command "kubectl get pods --all-namespaces --no-headers 2>/dev/null | wc -l" || echo "0")
@@ -1759,10 +1802,29 @@ discover_kubernetes() {
     namespaces=$(try_command "kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null" | tr ' ' '\n')
     namespaces_json=$(json_build_array "$namespaces" false)
 
+    # Container counts - calculate from pods
+    total_container_count=0
+    system_container_count=0
+    user_container_count=0
+
+    if command_exists kubectl && [ "$pod_count" -gt "0" ]; then
+        # Count containers in all pods
+        total_container_count=$(try_command "kubectl get pods --all-namespaces -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l" || echo "0")
+
+        # Count system containers (in kube-system, kube-public, kube-node-lease namespaces)
+        system_container_count=$(try_command "kubectl get pods -n kube-system -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l" || echo "0")
+        kube_public_count=$(try_command "kubectl get pods -n kube-public -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l" || echo "0")
+        kube_node_lease_count=$(try_command "kubectl get pods -n kube-node-lease -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l" || echo "0")
+        system_container_count=$((system_container_count + kube_public_count + kube_node_lease_count))
+
+        # User containers = total - system
+        user_container_count=$((total_container_count - system_container_count))
+    fi
+
     workloads_json=$(json_build_object \
-        "total_container_count" "0" \
-        "system_container_count" "0" \
-        "user_container_count" "0" \
+        "total_container_count" "$total_container_count" \
+        "system_container_count" "$system_container_count" \
+        "user_container_count" "$user_container_count" \
         "pod_count" "$pod_count" \
         "service_count" "$service_count" \
         "deployment_count" "$deployment_count" \
@@ -1783,17 +1845,22 @@ discover_kubernetes() {
         distribution="kind"
     fi
 
-    # CNI detection
+    # CNI detection with version
     cni_plugin="unknown"
+    cni_version=""
     if command_exists kubectl; then
         if try_command "kubectl get pods -n kube-system 2>/dev/null | grep -q calico"; then
             cni_plugin="calico"
+            cni_version=$(try_command "kubectl get pods -n kube-system -l k8s-app=calico-node -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
         elif try_command "kubectl get pods -n kube-system 2>/dev/null | grep -q flannel"; then
             cni_plugin="flannel"
+            cni_version=$(try_command "kubectl get pods -n kube-system -l app=flannel -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
         elif try_command "kubectl get pods -n kube-system 2>/dev/null | grep -q cilium"; then
             cni_plugin="cilium"
+            cni_version=$(try_command "kubectl get pods -n kube-system -l k8s-app=cilium -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
         elif try_command "kubectl get pods -n kube-system 2>/dev/null | grep -q weave"; then
             cni_plugin="weave"
+            cni_version=$(try_command "kubectl get pods -n kube-system -l name=weave-net -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null | grep -o '[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
         elif [ -d /etc/cni/net.d ]; then
             cni_conf=$(ls /etc/cni/net.d/*.conf 2>/dev/null | head -n1)
             if [ -n "$cni_conf" ]; then
@@ -1804,16 +1871,75 @@ discover_kubernetes() {
 
     # Cluster components
     api_server_json=$(json_build_object "version" "$version" "status" "Healthy")
-    coredns_json=$(json_build_object "version" "" "status" "Running")
-    ingress_json=$(json_build_object "type" "none" "version" "")
-    cni_json=$(json_build_object "type" "$cni_plugin" "version" "")
+
+    # CoreDNS detection with version
+    coredns_version=""
+    coredns_status="Unknown"
+    if command_exists kubectl; then
+        coredns_version=$(try_command "kubectl get deployment coredns -n kube-system -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
+        if [ -z "$coredns_version" ]; then
+            # Try as DaemonSet (some distributions)
+            coredns_version=$(try_command "kubectl get daemonset coredns -n kube-system -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
+        fi
+        if [ -z "$coredns_version" ]; then
+            # Try kube-dns (older clusters)
+            coredns_version=$(try_command "kubectl get deployment kube-dns -n kube-system -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | grep -o '[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
+        fi
+        # Get status
+        coredns_pods=$(try_command "kubectl get pods -n kube-system -l k8s-app=kube-dns --no-headers 2>/dev/null | grep -c Running" || echo "0")
+        if [ "$coredns_pods" -gt "0" ]; then
+            coredns_status="Running"
+        else
+            coredns_pods=$(try_command "kubectl get pods -n kube-system -l k8s-app=coredns --no-headers 2>/dev/null | grep -c Running" || echo "0")
+            if [ "$coredns_pods" -gt "0" ]; then
+                coredns_status="Running"
+            fi
+        fi
+    fi
+    coredns_json=$(json_build_object "version" "$coredns_version" "status" "$coredns_status")
+
+    # Ingress controller detection
+    ingress_type="none"
+    ingress_version=""
+    if command_exists kubectl; then
+        # Check for nginx ingress
+        if try_command "kubectl get pods --all-namespaces 2>/dev/null | grep -q nginx-ingress"; then
+            ingress_type="nginx"
+            ingress_version=$(try_command "kubectl get deployment -n ingress-nginx ingress-nginx-controller -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
+            if [ -z "$ingress_version" ]; then
+                ingress_version=$(try_command "kubectl get deployment -n kube-system nginx-ingress-controller -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | grep -o '[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
+            fi
+        # Check for traefik
+        elif try_command "kubectl get pods --all-namespaces 2>/dev/null | grep -q traefik"; then
+            ingress_type="traefik"
+            ingress_version=$(try_command "kubectl get deployment -n kube-system traefik -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
+        # Check for haproxy
+        elif try_command "kubectl get pods --all-namespaces 2>/dev/null | grep -q haproxy-ingress"; then
+            ingress_type="haproxy"
+            ingress_version=$(try_command "kubectl get deployment --all-namespaces -l app=haproxy-ingress -o jsonpath='{.items[0].spec.template.spec.containers[0].image}' 2>/dev/null | grep -o '[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
+        # Check for istio
+        elif try_command "kubectl get pods --all-namespaces 2>/dev/null | grep -q istio-ingressgateway"; then
+            ingress_type="istio"
+            ingress_version=$(try_command "kubectl get deployment -n istio-system istio-ingressgateway -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | grep -o '[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
+        fi
+    fi
+    ingress_json=$(json_build_object "type" "$ingress_type" "version" "$ingress_version")
+
+    cni_json=$(json_build_object "type" "$cni_plugin" "version" "$cni_version")
+
+    # CSI drivers detection
+    csi_drivers=""
+    if command_exists kubectl; then
+        csi_drivers=$(try_command "kubectl get csidrivers -o jsonpath='{.items[*].metadata.name}' 2>/dev/null" | tr ' ' '\n')
+    fi
+    csi_drivers_json=$(json_build_array "$csi_drivers" false)
 
     cluster_components_json=$(json_build_object \
         "api_server" "$api_server_json" \
         "coredns" "$coredns_json" \
         "ingress_controller" "$ingress_json" \
         "cni_plugin" "$cni_json" \
-        "csi_drivers" "[]")
+        "csi_drivers" "$csi_drivers_json")
 
     # Platform specific
     api_endpoint=$(try_command "kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null" || echo "")
