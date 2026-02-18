@@ -1,0 +1,669 @@
+{
+  "armResources": [
+    {
+      "type": "",
+      "name": "",
+      "apiVersion": "",
+      "properties": {
+        "schema_version": "7.0.0",
+        "discovery_timestamp": "2026-02-17T09:40:47Z",
+        "host_info": {
+          "hostname": "prod-k8s-node-01",
+          "fqdn": "prod-k8s-node-01.example.com",
+          "os": "Ubuntu 24.04.3 LTS | Red Hat Enterprise Linux 9.3 | SUSE Linux Enterprise Server 15 SP5 | CentOS Stream 9 | Flatcar Container Linux | VMware Photon OS 5.0 | Windows Server 2022",
+          "kernel": "6.17.0-14-generic",
+          "arch": "x86_64 | aarch64 | s390x | ppc64le",
+          "cpu_cores": 8,
+          "cpu_model": "Intel(R) Xeon(R) Gold 5220R CPU @ 2.20GHz",
+          "memory_total_mb": 16384,
+          "disks": [
+            { "name": "sda", "size_gb": 100 },
+            { "name": "sdb", "size_gb": 500 }
+          ]
+        },
+
+        "hypervisor": {
+          "type": "vmware | hyperv | kvm | xen | virtualbox | nutanix | physical | unknown",
+          "version": "12.5.0.51152 (build-24276846)"
+        },
+
+        "network": {
+          "ip_addresses": [
+            { "address": "10.150.252.169", "version": "ipv4", "interface": "eth0" },
+            { "address": "10.1.149.64", "version": "ipv4", "interface": "docker_gwbridge" },
+            { "address": "172.17.0.1", "version": "ipv4", "interface": "docker0" },
+            { "address": "10.244.0.1", "version": "ipv4", "interface": "cni0" },
+            { "address": "2404:f801:4800:23:250:56ff:fe85:6c22", "version": "ipv6", "interface": "eth0" }
+          ],
+          "default_gateway": "10.150.248.1",
+          "dns_servers": ["127.0.0.53", "10.96.0.10", "8.8.8.8"]
+        },
+
+        "container_runtimes": [
+          {
+            "name": "containerd",
+            "runtime_type": "containerd",
+            "version": "1.7.28",
+            "socket": "/run/containerd/containerd.sock",
+            "storage_driver": "overlayfs | btrfs | zfs | native",
+            "storage_root": "/var/lib/containerd",
+            "rootless": false,
+            "cgroup_driver": "systemd | cgroupfs",
+            "namespaces": ["default", "moby", "k8s.io"],
+            "image_count": 45,
+            "container_count": 32,
+            "running_container_count": 28,
+            "paused_container_count": 1,
+            "stopped_container_count": 3,
+            "client_version": "1.7.28",
+            "server_version": "1.7.28",
+            "crictl_version": "1.30.0",
+            "resource_usage": {
+              "cpu_cores": 0.25,
+              "memory_mb": 185.50
+            },
+            "registries": [
+              "registry.k8s.io",
+              "docker.io",
+              "gcr.io"
+            ],
+            "containers": [
+              {
+                "container_id": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+                "name": "kube-apiserver",
+                "image": "registry.k8s.io/kube-apiserver:v1.30.2",
+                "image_id": "sha256:abc123def456...",
+                "state": "running | paused | stopped | created | exited | dead | unknown",
+                "created_at": "2026-02-15T08:00:00Z",
+                "labels": {
+                  "io.kubernetes.pod.name": "kube-apiserver-node01",
+                  "io.kubernetes.pod.namespace": "kube-system",
+                  "io.kubernetes.container.name": "kube-apiserver"
+                },
+                "ports": [
+                  { "host_port": 6443, "container_port": 6443, "protocol": "tcp | udp" }
+                ],
+                "resource_usage": {
+                  "cpu": {
+                    "usage_cores": 0.15,
+                    "request_millicores": 250,
+                    "limit_millicores": 1000
+                  },
+                  "memory": {
+                    "usage_mb": 512.3,
+                    "request_mb": 256,
+                    "limit_mb": 1024
+                  }
+                },
+                "network_mode": "host | bridge | none | overlay | macvlan | ipvlan | custom",
+                "restart_policy": "always | unless-stopped | on-failure | no | Never | OnFailure | Always",
+                "orchestrator_managed": true,
+                "orchestrator_ref": {
+                  "type": "kubernetes",
+                  "service_name": "",
+                  "task_id": "",
+                  "pod_name": "kube-apiserver-node01",
+                  "namespace": "kube-system"
+                }
+              }
+            ],
+            "images": [
+              {
+                "image_id": "sha256:abc123def456...",
+                "repository": "registry.k8s.io/kube-apiserver",
+                "tag": "v1.30.2",
+                "size_mb": 120.5,
+                "created_at": "2026-01-10T12:00:00Z"
+              }
+            ]
+          },
+          {
+            "name": "docker",
+            "runtime_type": "docker",
+            "version": "28.2.2",
+            "socket": "/var/run/docker.sock",
+            "storage_driver": "overlay2 | fuse-overlayfs | btrfs | zfs | vfs | devicemapper",
+            "storage_root": "/var/lib/docker",
+            "rootless": false,
+            "cgroup_driver": "cgroupfs | systemd",
+            "namespaces": [],
+            "image_count": 12,
+            "container_count": 8,
+            "running_container_count": 6,
+            "paused_container_count": 0,
+            "stopped_container_count": 2,
+            "client_version": "28.2.2",
+            "server_version": "28.2.2",
+            "crictl_version": "",
+            "resource_usage": {
+              "cpu_cores": 0.10,
+              "memory_mb": 95.30
+            },
+            "registries": [
+              "docker.io",
+              "ghcr.io"
+            ],
+            "containers": [
+              {
+                "container_id": "f9e8d7c6b5a4f9e8d7c6b5a4f9e8d7c6",
+                "name": "swarm-nginx-web.1.xyz789",
+                "image": "nginx:1.25-alpine",
+                "image_id": "sha256:def789abc012...",
+                "state": "running",
+                "created_at": "2026-02-16T10:30:00Z",
+                "labels": {
+                  "com.docker.swarm.service.name": "nginx-web",
+                  "com.docker.swarm.task.id": "task-abc-123",
+                  "com.docker.swarm.node.id": "d0s3knkux7ov"
+                },
+                "ports": [
+                  { "host_port": 80, "container_port": 80, "protocol": "tcp" },
+                  { "host_port": 443, "container_port": 443, "protocol": "tcp" }
+                ],
+                "resource_usage": {
+                  "cpu": {
+                    "usage_cores": 0.03,
+                    "request_millicores": 0,
+                    "limit_millicores": 500
+                  },
+                  "memory": {
+                    "usage_mb": 64.2,
+                    "request_mb": 0,
+                    "limit_mb": 256
+                  }
+                },
+                "network_mode": "overlay",
+                "restart_policy": "always",
+                "orchestrator_managed": true,
+                "orchestrator_ref": {
+                  "type": "docker-swarm",
+                  "service_name": "nginx-web",
+                  "task_id": "task-abc-123",
+                  "pod_name": "",
+                  "namespace": ""
+                }
+              },
+              {
+                "container_id": "1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d",
+                "name": "standalone-redis",
+                "image": "redis:7.2",
+                "image_id": "sha256:ghi345jkl678...",
+                "state": "running",
+                "created_at": "2026-02-10T14:00:00Z",
+                "labels": {},
+                "ports": [
+                  { "host_port": 6379, "container_port": 6379, "protocol": "tcp" }
+                ],
+                "resource_usage": {
+                  "cpu": {
+                    "usage_cores": 0.02,
+                    "request_millicores": 0,
+                    "limit_millicores": 0
+                  },
+                  "memory": {
+                    "usage_mb": 32.8,
+                    "request_mb": 0,
+                    "limit_mb": 0
+                  }
+                },
+                "network_mode": "bridge",
+                "restart_policy": "unless-stopped",
+                "orchestrator_managed": false,
+                "orchestrator_ref": {
+                  "type": "",
+                  "service_name": "",
+                  "task_id": "",
+                  "pod_name": "",
+                  "namespace": ""
+                }
+              }
+            ],
+            "images": [
+              {
+                "image_id": "sha256:def789abc012...",
+                "repository": "nginx",
+                "tag": "1.25-alpine",
+                "size_mb": 42.3,
+                "created_at": "2026-01-20T08:00:00Z"
+              },
+              {
+                "image_id": "sha256:ghi345jkl678...",
+                "repository": "redis",
+                "tag": "7.2",
+                "size_mb": 138.7,
+                "created_at": "2026-01-15T06:00:00Z"
+              }
+            ]
+          },
+          {
+            "name": "crio",
+            "runtime_type": "crio",
+            "version": "1.30.4",
+            "socket": "/var/run/crio/crio.sock",
+            "storage_driver": "overlay | vfs | btrfs",
+            "storage_root": "/var/lib/containers/storage",
+            "rootless": false,
+            "cgroup_driver": "systemd | cgroupfs",
+            "namespaces": ["k8s.io"],
+            "image_count": 38,
+            "container_count": 25,
+            "running_container_count": 25,
+            "paused_container_count": 0,
+            "stopped_container_count": 0,
+            "client_version": "1.30.4",
+            "server_version": "1.30.4",
+            "crictl_version": "1.30.0",
+            "resource_usage": {
+              "cpu_cores": 0.18,
+              "memory_mb": 110.40
+            },
+            "registries": [
+              "registry.access.redhat.com",
+              "registry.redhat.io",
+              "quay.io",
+              "docker.io"
+            ],
+            "containers": [
+              {
+                "container_id": "c4d5e6f7a8b9c4d5e6f7a8b9c4d5e6f7",
+                "name": "openshift-apiserver",
+                "image": "quay.io/openshift-release-dev/ocp-v4.0-art-dev:v4.15.2",
+                "image_id": "sha256:ocp456def789...",
+                "state": "running",
+                "created_at": "2026-02-14T06:00:00Z",
+                "labels": {
+                  "io.kubernetes.pod.name": "openshift-apiserver-node01",
+                  "io.kubernetes.pod.namespace": "openshift-apiserver",
+                  "io.kubernetes.container.name": "openshift-apiserver"
+                },
+                "ports": [
+                  { "host_port": 0, "container_port": 8443, "protocol": "tcp" }
+                ],
+                "resource_usage": {
+                  "cpu": {
+                    "usage_cores": 0.35,
+                    "request_millicores": 300,
+                    "limit_millicores": 0
+                  },
+                  "memory": {
+                    "usage_mb": 780.5,
+                    "request_mb": 512,
+                    "limit_mb": 2048
+                  }
+                },
+                "network_mode": "host",
+                "restart_policy": "Always",
+                "orchestrator_managed": true,
+                "orchestrator_ref": {
+                  "type": "openshift",
+                  "service_name": "",
+                  "task_id": "",
+                  "pod_name": "openshift-apiserver-node01",
+                  "namespace": "openshift-apiserver"
+                }
+              }
+            ],
+            "images": [
+              {
+                "image_id": "sha256:ocp456def789...",
+                "repository": "quay.io/openshift-release-dev/ocp-v4.0-art-dev",
+                "tag": "v4.15.2",
+                "size_mb": 350.2,
+                "created_at": "2026-01-05T10:00:00Z"
+              }
+            ]
+          },
+          {
+            "name": "podman",
+            "runtime_type": "podman",
+            "version": "5.3.1",
+            "socket": "/run/podman/podman.sock | /run/user/1000/podman/podman.sock",
+            "storage_driver": "overlay | vfs | btrfs | zfs",
+            "storage_root": "/var/lib/containers/storage | /home/user/.local/share/containers/storage",
+            "rootless": true,
+            "cgroup_driver": "systemd | cgroupfs",
+            "namespaces": [],
+            "image_count": 5,
+            "container_count": 3,
+            "running_container_count": 2,
+            "paused_container_count": 0,
+            "stopped_container_count": 1,
+            "client_version": "5.3.1",
+            "server_version": "5.3.1",
+            "crictl_version": "",
+            "resource_usage": {
+              "cpu_cores": 0.05,
+              "memory_mb": 42.10
+            },
+            "registries": [
+              "registry.access.redhat.com",
+              "registry.redhat.io",
+              "docker.io",
+              "quay.io"
+            ],
+            "containers": [
+              {
+                "container_id": "e7f8a9b0c1d2e7f8a9b0c1d2e7f8a9b0",
+                "name": "dev-postgres",
+                "image": "docker.io/library/postgres:16",
+                "image_id": "sha256:pqr901stu234...",
+                "state": "running",
+                "created_at": "2026-02-17T07:00:00Z",
+                "labels": {
+                  "maintainer": "dev-team"
+                },
+                "ports": [
+                  { "host_port": 5432, "container_port": 5432, "protocol": "tcp" }
+                ],
+                "resource_usage": {
+                  "cpu": {
+                    "usage_cores": 0.08,
+                    "request_millicores": 0,
+                    "limit_millicores": 2000
+                  },
+                  "memory": {
+                    "usage_mb": 256.4,
+                    "request_mb": 0,
+                    "limit_mb": 512
+                  }
+                },
+                "network_mode": "bridge | slirp4netns | pasta | host | none",
+                "restart_policy": "always",
+                "orchestrator_managed": false,
+                "orchestrator_ref": {
+                  "type": "",
+                  "service_name": "",
+                  "task_id": "",
+                  "pod_name": "",
+                  "namespace": ""
+                }
+              }
+            ],
+            "images": [
+              {
+                "image_id": "sha256:pqr901stu234...",
+                "repository": "docker.io/library/postgres",
+                "tag": "16",
+                "size_mb": 432.1,
+                "created_at": "2026-02-01T04:00:00Z"
+              }
+            ]
+          }
+        ],
+
+        "orchestrators": [
+          {
+            "name": "docker_swarm",
+            "orchestrator_type": "docker-swarm",
+            "version": "28.2.2",
+            "cluster_id": "swarm-lh2wuxyrgjsg",
+            "cluster_name": "",
+            "state": "active | pending | inactive | locked | error | drain",
+            "current_node": {
+              "node_id": "d0s3knkux7ov0cftpuv1zwum7",
+              "role": "manager | worker",
+              "availability": "active | pause | drain"
+            },
+            "nodes": {
+              "total_count": 3,
+              "master_count": 1,
+              "worker_count": 2,
+              "master_nodes": [
+                { "name": "swarm-manager-01", "node_id": "d0s3knkux7ov", "status": "ready | down | disconnected | unknown" }
+              ],
+              "worker_nodes": [
+                { "name": "swarm-worker-01", "node_id": "w1a2b3c4d5e6", "status": "ready" },
+                { "name": "swarm-worker-02", "node_id": "w2f7g8h9i0j1", "status": "ready" }
+              ]
+            },
+            "workloads": {
+              "total_container_count": 6,
+              "system_container_count": 0,
+              "user_container_count": 6,
+              "pod_count": 0,
+              "service_count": 3,
+              "deployment_count": 0,
+              "daemonset_count": 0,
+              "statefulset_count": 0,
+              "namespace_count": 0,
+              "namespaces": []
+            },
+            "cluster_components": {
+              "api_server": { "version": "", "status": "" },
+              "coredns": { "version": "", "status": "" },
+              "ingress_controller": { "type": "", "version": "" },
+              "cni_plugin": { "type": "overlay", "version": "" },
+              "csi_drivers": []
+            },
+            "platform_specific": {
+              "swarm": {
+                "raft_index": 1542,
+                "task_history_limit": 5
+              },
+              "kubernetes": null,
+              "openshift": null,
+              "tanzu": null
+            },
+            "resource_usage": {
+              "cpu_cores": 0.08,
+              "memory_mb": 60.17
+            }
+          },
+          {
+            "name": "kubernetes",
+            "orchestrator_type": "kubernetes",
+            "version": "1.30.2",
+            "cluster_id": "k8s-cluster-abc123",
+            "cluster_name": "prod-cluster-east",
+            "state": "active | degraded | error | unknown",
+            "current_node": {
+              "node_id": "node-k8s-01",
+              "role": "control-plane | worker",
+              "availability": "Ready | NotReady | SchedulingDisabled | Unknown"
+            },
+            "nodes": {
+              "total_count": 5,
+              "master_count": 3,
+              "worker_count": 2,
+              "master_nodes": [
+                { "name": "k8s-cp-01", "node_id": "node-cp-01", "status": "Ready" },
+                { "name": "k8s-cp-02", "node_id": "node-cp-02", "status": "Ready" },
+                { "name": "k8s-cp-03", "node_id": "node-cp-03", "status": "Ready" }
+              ],
+              "worker_nodes": [
+                { "name": "k8s-worker-01", "node_id": "node-w-01", "status": "Ready" },
+                { "name": "k8s-worker-02", "node_id": "node-w-02", "status": "Ready" }
+              ]
+            },
+            "workloads": {
+              "total_container_count": 85,
+              "system_container_count": 35,
+              "user_container_count": 50,
+              "pod_count": 62,
+              "service_count": 18,
+              "deployment_count": 12,
+              "daemonset_count": 4,
+              "statefulset_count": 3,
+              "namespace_count": 8,
+              "namespaces": ["default", "kube-system", "kube-public", "kube-node-lease", "monitoring", "ingress-nginx", "app-prod", "app-staging"]
+            },
+            "cluster_components": {
+              "api_server": { "version": "1.30.2", "status": "Healthy | Unhealthy | Unknown" },
+              "coredns": { "version": "1.11.1", "status": "Running | Degraded | Unknown" },
+              "ingress_controller": { "type": "nginx | traefik | haproxy | contour | istio | kong | none", "version": "1.10.0" },
+              "cni_plugin": { "type": "calico | flannel | cilium | weave | canal | antrea | ovn-kubernetes | none", "version": "3.27.0" },
+              "csi_drivers": [
+                { "name": "disk.csi.azure.com | ebs.csi.aws.com | pd.csi.storage.gke.io | csi.vsphere.vmware.com | nfs.csi.k8s.io", "version": "1.30.0" }
+              ]
+            },
+            "platform_specific": {
+              "swarm": null,
+              "kubernetes": {
+                "distribution": "kubeadm | k3s | rke2 | microk8s | kind | minikube | eks | aks | gke",
+                "api_server_endpoint": "https://10.0.0.1:6443",
+                "cluster_cidr": "10.244.0.0/16",
+                "service_cidr": "10.96.0.0/12",
+                "kubeconfig_path": "/etc/kubernetes/admin.conf"
+              },
+              "openshift": null,
+              "tanzu": null
+            },
+            "resource_usage": {
+              "cpu_cores": 1.20,
+              "memory_mb": 2048.50
+            }
+          },
+          {
+            "name": "openshift",
+            "orchestrator_type": "openshift",
+            "version": "4.15.2",
+            "cluster_id": "ocp-cluster-def456",
+            "cluster_name": "ocp-prod-east",
+            "state": "active | degraded | progressing | error | unknown",
+            "current_node": {
+              "node_id": "ocp-node-01",
+              "role": "master | worker | infra",
+              "availability": "Ready | NotReady | SchedulingDisabled | Unknown"
+            },
+            "nodes": {
+              "total_count": 6,
+              "master_count": 3,
+              "worker_count": 3,
+              "master_nodes": [
+                { "name": "ocp-master-01", "node_id": "ocp-m-01", "status": "Ready" },
+                { "name": "ocp-master-02", "node_id": "ocp-m-02", "status": "Ready" },
+                { "name": "ocp-master-03", "node_id": "ocp-m-03", "status": "Ready" }
+              ],
+              "worker_nodes": [
+                { "name": "ocp-worker-01", "node_id": "ocp-w-01", "status": "Ready" },
+                { "name": "ocp-worker-02", "node_id": "ocp-w-02", "status": "Ready" },
+                { "name": "ocp-infra-01", "node_id": "ocp-i-01", "status": "Ready" }
+              ]
+            },
+            "workloads": {
+              "total_container_count": 220,
+              "system_container_count": 150,
+              "user_container_count": 70,
+              "pod_count": 180,
+              "service_count": 45,
+              "deployment_count": 28,
+              "daemonset_count": 8,
+              "statefulset_count": 5,
+              "namespace_count": 25,
+              "namespaces": ["default", "openshift-apiserver", "openshift-authentication", "openshift-console", "openshift-dns", "openshift-etcd", "openshift-ingress", "openshift-monitoring", "openshift-operators", "app-prod", "app-staging"]
+            },
+            "cluster_components": {
+              "api_server": { "version": "4.15.2", "status": "Healthy" },
+              "coredns": { "version": "1.11.1", "status": "Running" },
+              "ingress_controller": { "type": "haproxy | openshift-router", "version": "2.7.0" },
+              "cni_plugin": { "type": "ovn-kubernetes | openshift-sdn | calico", "version": "4.15.2" },
+              "csi_drivers": [
+                { "name": "csi.vsphere.vmware.com", "version": "3.1.0" }
+              ]
+            },
+            "platform_specific": {
+              "swarm": null,
+              "kubernetes": null,
+              "openshift": {
+                "ocp_version": "4.15.2",
+                "channel": "stable-4.15 | fast-4.15 | candidate-4.15 | eus-4.15",
+                "cluster_id": "ocp-cluster-uuid-abc123",
+                "infra_id": "ocp-prod-east-xyz",
+                "install_type": "IPI | UPI | assisted | SNO",
+                "project_count": 25,
+                "route_count": 12,
+                "build_config_count": 5,
+                "operator_count": 32,
+                "operator_hub_enabled": true,
+                "scc_count": 8,
+                "cluster_operators_degraded": 0,
+                "cluster_operators_available": 32
+              },
+              "tanzu": null
+            },
+            "resource_usage": {
+              "cpu_cores": 3.50,
+              "memory_mb": 6144.00
+            }
+          },
+          {
+            "name": "tanzu",
+            "orchestrator_type": "tanzu",
+            "version": "2.4.0",
+            "cluster_id": "tanzu-cluster-ghi789",
+            "cluster_name": "tkg-prod-west",
+            "state": "active | creating | deleting | updating | error | unknown",
+            "current_node": {
+              "node_id": "tanzu-node-01",
+              "role": "control-plane | worker",
+              "availability": "Ready | NotReady | Unknown"
+            },
+            "nodes": {
+              "total_count": 4,
+              "master_count": 1,
+              "worker_count": 3,
+              "master_nodes": [
+                { "name": "tanzu-cp-01", "node_id": "tanzu-cp-01", "status": "Ready" }
+              ],
+              "worker_nodes": [
+                { "name": "tanzu-worker-01", "node_id": "tanzu-w-01", "status": "Ready" },
+                { "name": "tanzu-worker-02", "node_id": "tanzu-w-02", "status": "Ready" },
+                { "name": "tanzu-worker-03", "node_id": "tanzu-w-03", "status": "Ready" }
+              ]
+            },
+            "workloads": {
+              "total_container_count": 95,
+              "system_container_count": 40,
+              "user_container_count": 55,
+              "pod_count": 72,
+              "service_count": 15,
+              "deployment_count": 10,
+              "daemonset_count": 3,
+              "statefulset_count": 2,
+              "namespace_count": 6,
+              "namespaces": ["default", "kube-system", "tkg-system", "tanzu-system-ingress", "app-prod", "app-staging"]
+            },
+            "cluster_components": {
+              "api_server": { "version": "1.29.4", "status": "Healthy" },
+              "coredns": { "version": "1.11.1", "status": "Running" },
+              "ingress_controller": { "type": "contour | nginx | istio", "version": "1.28.0" },
+              "cni_plugin": { "type": "antrea | calico | cilium", "version": "1.14.0" },
+              "csi_drivers": [
+                { "name": "csi.vsphere.vmware.com", "version": "3.1.2" }
+              ]
+            },
+            "platform_specific": {
+              "swarm": null,
+              "kubernetes": null,
+              "openshift": null,
+              "tanzu": {
+                "tkg_version": "2.4.0",
+                "tkr_version": "1.29.4---vmware.1-tkg.1",
+                "cluster_class": "tkg-vsphere-default-v1.1.0 | tkg-aws-default-v1.0.0",
+                "management_cluster": "mgmt-cluster-01",
+                "supervisor_cluster": "sv-cluster-01",
+                "vsphere_namespace": "ns-tanzu-prod",
+                "workload_cluster_count": 3,
+                "infrastructure_provider": "vsphere | aws | azure",
+                "ceip_enabled": true,
+                "pinniped_enabled": true
+              }
+            },
+            "resource_usage": {
+              "cpu_cores": 1.80,
+              "memory_mb": 3072.00
+            }
+          }
+        ],
+
+        "services": [
+          { "name": "containerd", "active": "active | inactive | failed | activating | deactivating", "enabled": "enabled | disabled | masked | static", "listening_ports": [] },
+          { "name": "docker", "active": "active", "enabled": "enabled", "listening_ports": [{ "port": 2375, "protocol": "tcp" }, { "port": 2376, "protocol": "tcp" }] },
+          { "name": "crio", "active": "active", "enabled": "enabled", "listening_ports": [] },
+          { "name": "podman", "active": "active", "enabled": "enabled", "listening_ports": [] },
+          { "name": "kubelet", "active": "active", "enabled": "enabled", "listening_ports": [{ "port": 10250, "protocol": "tcp" }, { "port": 10248, "protocol": "tcp" }] }
+        ]
+      }
+    }
+  ]
+}
