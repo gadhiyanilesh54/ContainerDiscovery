@@ -233,7 +233,8 @@ json_build_array() {
     result="["
     first=true
 
-    echo "$input" | while IFS= read -r line; do
+    # Use here-string to avoid subshell issue with pipe
+    while IFS= read -r line; do
         if [ -n "$line" ]; then
             if [ "$first" = false ]; then
                 result="$result,"
@@ -246,7 +247,9 @@ json_build_array() {
             fi
             first=false
         fi
-    done
+    done <<EOF
+$input
+EOF
 
     result="$result]"
     echo "$result"
