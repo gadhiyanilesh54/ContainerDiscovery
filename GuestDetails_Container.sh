@@ -1606,28 +1606,78 @@ discover_docker_swarm() {
     # Current node
     node_id=$(try_command "docker info --format '{{.Swarm.NodeID}}' 2>/dev/null" || echo "")
 
+    # Get current node availability
+    node_availability="active"
+    if [ -n "$node_id" ] && [ "$node_role" = "manager" ]; then
+        node_availability=$(try_command "docker node inspect $node_id --format '{{.Spec.Availability}}' 2>/dev/null" || echo "active")
+    fi
+
     current_node_json=$(json_build_object \
         "node_id" "$node_id" \
         "role" "$node_role" \
-        "availability" "active")
+        "availability" "$node_availability")
 
-    # Node counts
+    # Node counts and arrays
     total_count=0
     master_count=0
     worker_count=0
+    master_nodes_json="[]"
+    worker_nodes_json="[]"
 
     if [ "$node_role" = "manager" ]; then
         total_count=$(try_command "docker node ls -q 2>/dev/null | wc -l" || echo "0")
         master_count=$(try_command "docker node ls --filter role=manager -q 2>/dev/null | wc -l" || echo "0")
         worker_count=$((total_count - master_count))
+
+        # Build master nodes array
+        master_nodes_data=$(try_command "docker node ls --filter role=manager --format '{{.Hostname}}|{{.ID}}|{{.Status}}' 2>/dev/null" || echo "")
+        if [ -n "$master_nodes_data" ]; then
+            master_nodes_list=""
+            while IFS='|' read -r hostname node_id status; do
+                [ -z "$hostname" ] && continue
+                node_obj=$(json_build_object \
+                    "name" "$hostname" \
+                    "node_id" "$node_id" \
+                    "status" "${status,,}")  # Convert to lowercase
+                if [ -z "$master_nodes_list" ]; then
+                    master_nodes_list="$node_obj"
+                else
+                    master_nodes_list="$master_nodes_list,$node_obj"
+                fi
+            done << EOF
+$master_nodes_data
+EOF
+            [ -n "$master_nodes_list" ] && master_nodes_json="[$master_nodes_list]"
+        fi
+
+        # Build worker nodes array
+        worker_nodes_data=$(try_command "docker node ls --filter role=worker --format '{{.Hostname}}|{{.ID}}|{{.Status}}' 2>/dev/null" || echo "")
+        if [ -n "$worker_nodes_data" ]; then
+            worker_nodes_list=""
+            while IFS='|' read -r hostname node_id status; do
+                [ -z "$hostname" ] && continue
+                node_obj=$(json_build_object \
+                    "name" "$hostname" \
+                    "node_id" "$node_id" \
+                    "status" "${status,,}")  # Convert to lowercase
+                if [ -z "$worker_nodes_list" ]; then
+                    worker_nodes_list="$node_obj"
+                else
+                    worker_nodes_list="$worker_nodes_list,$node_obj"
+                fi
+            done << EOF
+$worker_nodes_data
+EOF
+            [ -n "$worker_nodes_list" ] && worker_nodes_json="[$worker_nodes_list]"
+        fi
     fi
 
     nodes_json=$(json_build_object \
         "total_count" "$total_count" \
         "master_count" "$master_count" \
         "worker_count" "$worker_count" \
-        "master_nodes" "[]" \
-        "worker_nodes" "[]")
+        "master_nodes" "$master_nodes_json" \
+        "worker_nodes" "$worker_nodes_json")
 
     # Service count
     service_count=0
