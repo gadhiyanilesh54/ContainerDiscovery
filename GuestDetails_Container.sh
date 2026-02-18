@@ -1892,16 +1892,28 @@ EOF
     system_container_count=0
     user_container_count=0
 
-    # Get total container count (all containers on the node)
-    total_container_count=$(try_command "$docker_cmd ps -q 2>/dev/null | wc -l" || echo "0")
+    # For managers, count running tasks cluster-wide to include services on other nodes
+    if [ "$node_role" = "manager" ]; then
+        running_tasks=$(try_command "$docker_cmd service ps --filter desired-state=running --format '{{.Name}}' 2>/dev/null" || echo "")
+        if [ -n "$running_tasks" ]; then
+            total_container_count=$(echo "$running_tasks" | wc -l | awk '{print $1}')
+            system_container_count=$(echo "$running_tasks" | grep -E 'ingress-sbox|_monitoring|_logging|portainer|swarm-agent' | wc -l | awk '{print $1}')
+            user_container_count=$((total_container_count - system_container_count))
+        fi
+    fi
 
-    # For Swarm, system containers are those with system-related service names
-    # Common patterns: monitoring, logging, overlay network, ingress, etc.
-    if [ "$total_container_count" -gt "0" ]; then
-        system_container_count=$(try_command "$docker_cmd ps --format '{{.Names}}' 2>/dev/null | grep -E 'ingress-sbox|_monitoring|_logging|portainer|swarm-agent' | wc -l" || echo "0")
+    # Fallback to local containers if no running tasks were found or on workers
+    if [ "$total_container_count" -eq "0" ]; then
+        total_container_count=$(try_command "$docker_cmd ps -q 2>/dev/null | wc -l" || echo "0")
 
-        # User containers = total - system
-        user_container_count=$((total_container_count - system_container_count))
+        # For Swarm, system containers are those with system-related service names
+        # Common patterns: monitoring, logging, overlay network, ingress, etc.
+        if [ "$total_container_count" -gt "0" ]; then
+            system_container_count=$(try_command "$docker_cmd ps --format '{{.Names}}' 2>/dev/null | grep -E 'ingress-sbox|_monitoring|_logging|portainer|swarm-agent' | wc -l" || echo "0")
+
+            # User containers = total - system
+            user_container_count=$((total_container_count - system_container_count))
+        fi
     fi
 
     # Ensure all values are set
