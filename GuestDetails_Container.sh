@@ -2256,7 +2256,7 @@ discover_openshift() {
         # Get current node details
         node_info=$($cmd get node "$node_name" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/master}{"|"}{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
         if [ -n "$node_info" ]; then
-            IFS='|' read -r role_label ready_status <<< "$node_info"
+            echo "$node_info" | IFS='|' read -r role_label ready_status
             [ -n "$role_label" ] && node_role="master"
             [ "$ready_status" = "True" ] && node_status="Ready" || node_status="NotReady"
         fi
@@ -2519,7 +2519,7 @@ discover_tanzu() {
         # Get current node details
         node_info=$(kubectl get node "$node_name" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/master}{"|"}{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
         if [ -n "$node_info" ]; then
-            IFS='|' read -r role_label ready_status <<< "$node_info"
+            echo "$node_info" | IFS='|' read -r role_label ready_status
             [ -n "$role_label" ] && node_role="control-plane"
             [ "$ready_status" = "True" ] && node_status="Ready" || node_status="NotReady"
         fi
