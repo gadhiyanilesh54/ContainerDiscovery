@@ -2510,6 +2510,184 @@ discover_tanzu() {
     fi
     [ -z "$cluster_name" ] && cluster_name=""
 
+    # Current node information using kubectl
+    node_name=$(hostname)
+    node_role="worker"
+    node_status="Unknown"
+
+    if command_exists kubectl; then
+        # Get current node details
+        node_info=$(kubectl get node "$node_name" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/master}{"|"}{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+        if [ -n "$node_info" ]; then
+            IFS='|' read -r role_label ready_status <<< "$node_info"
+            [ -n "$role_label" ] && node_role="control-plane"
+            [ "$ready_status" = "True" ] && node_status="Ready" || node_status="NotReady"
+        fi
+
+        # Check for control-plane label as well
+        control_plane=$(kubectl get node "$node_name" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/control-plane}' 2>/dev/null || echo "")
+        [ -n "$control_plane" ] && node_role="control-plane"
+    fi
+
+    current_node_json=$(json_build_object \
+        "node_id" "$node_name" \
+        "role" "$node_role" \
+        "availability" "$node_status")
+
+    # Node counts using kubectl
+    total_count=0
+    master_count=0
+    worker_count=0
+    master_nodes_json="[]"
+    worker_nodes_json="[]"
+
+    if command_exists kubectl; then
+        total_count=$(kubectl get nodes --no-headers 2>/dev/null | wc -l || echo "0")
+        master_count=$(kubectl get nodes -l node-role.kubernetes.io/master --no-headers 2>/dev/null | wc -l || echo "0")
+        [ "$master_count" = "0" ] && master_count=$(kubectl get nodes -l node-role.kubernetes.io/control-plane --no-headers 2>/dev/null | wc -l || echo "0")
+        worker_count=$((total_count - master_count))
+
+        # Get master nodes list
+        master_nodes=$(kubectl get nodes -l node-role.kubernetes.io/master -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
+        [ -z "$master_nodes" ] && master_nodes=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
+        master_nodes_json=$(json_build_array "$master_nodes" false)
+
+        # Get worker nodes list
+        worker_nodes=$(kubectl get nodes -o jsonpath='{range .items[?(!@.metadata.labels.node-role\.kubernetes\.io/master)]}{.metadata.name}{\"\n\"}{end}' 2>/dev/null)
+        [ -z "$worker_nodes" ] && worker_nodes=$(kubectl get nodes -o jsonpath='{range .items[?(!@.metadata.labels.node-role\.kubernetes\.io/control-plane)]}{.metadata.name}{\"\n\"}{end}' 2>/dev/null)
+        worker_nodes_json=$(json_build_array "$worker_nodes" false)
+    fi
+
+    nodes_json=$(json_build_object \
+        "total_count" "$total_count" \
+        "master_count" "$master_count" \
+        "worker_count" "$worker_count" \
+        "master_nodes" "$master_nodes_json" \
+        "worker_nodes" "$worker_nodes_json")
+
+    # Workloads using kubectl
+    pod_count=0
+    service_count=0
+    deployment_count=0
+    daemonset_count=0
+    statefulset_count=0
+    namespace_count=0
+    namespaces_json="[]"
+    total_container_count=0
+    system_container_count=0
+    user_container_count=0
+
+    if command_exists kubectl; then
+        pod_count=$(kubectl get pods --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        service_count=$(kubectl get services --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        deployment_count=$(kubectl get deployments --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        daemonset_count=$(kubectl get daemonsets --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        statefulset_count=$(kubectl get statefulsets --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        namespace_count=$(kubectl get namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+
+        namespaces=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
+        namespaces_json=$(json_build_array "$namespaces" false)
+
+        # Container counts
+        if [ "$pod_count" -gt "0" ]; then
+            total_container_count=$(kubectl get pods --all-namespaces -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l || echo "0")
+
+            # Tanzu system namespaces
+            for ns in tkg-system tanzu-system tanzu-system-ingress kube-system kube-public kube-node-lease vmware-system-tmc; do
+                ns_count=$(kubectl get pods -n $ns -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l || echo "0")
+                system_container_count=$((system_container_count + ns_count))
+            done
+
+            user_container_count=$((total_container_count - system_container_count))
+        fi
+    fi
+
+    workloads_json=$(json_build_object \
+        "total_container_count" "$total_container_count" \
+        "system_container_count" "$system_container_count" \
+        "user_container_count" "$user_container_count" \
+        "pod_count" "$pod_count" \
+        "service_count" "$service_count" \
+        "deployment_count" "$deployment_count" \
+        "daemonset_count" "$daemonset_count" \
+        "statefulset_count" "$statefulset_count" \
+        "namespace_count" "$namespace_count" \
+        "namespaces" "$namespaces_json")
+
+    # Cluster components (similar to Kubernetes)
+    api_server_version=""
+    api_server_status="Unknown"
+    coredns_version=""
+    coredns_status="Unknown"
+    ingress_type="contour"
+    ingress_version=""
+    cni_type="antrea"
+    cni_version=""
+
+    if command_exists kubectl; then
+        # API server version from pods
+        api_server_version=$(kubectl get pod -n kube-system -l component=kube-apiserver -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+' || echo "")
+        [ -n "$api_server_version" ] && api_server_status="Running"
+
+        # CoreDNS detection
+        coredns_version=$(kubectl get deployment -n kube-system coredns -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | grep -oP ':\K[0-9.]+' || echo "")
+        coredns_pods=$(kubectl get pods -n kube-system -l k8s-app=kube-dns --no-headers 2>/dev/null | wc -l || echo "0")
+        [ "$coredns_pods" -gt "0" ] && coredns_status="Running"
+
+        # Detect ingress controller type
+        if kubectl get namespace tanzu-system-ingress >/dev/null 2>&1; then
+            contour_pods=$(kubectl get pods -n tanzu-system-ingress -l app=contour 2>/dev/null | grep -c contour || echo "0")
+            [ "$contour_pods" -gt "0" ] && ingress_type="contour"
+        fi
+
+        # Detect CNI type
+        antrea_pods=$(kubectl get pods -n kube-system -l app=antrea 2>/dev/null | grep -c antrea || echo "0")
+        [ "$antrea_pods" -gt "0" ] && cni_type="antrea"
+        calico_pods=$(kubectl get pods -n kube-system -l k8s-app=calico-node 2>/dev/null | grep -c calico || echo "0")
+        [ "$calico_pods" -gt "0" ] && cni_type="calico"
+    fi
+
+    cluster_components_json=$(json_build_object \
+        "api_server" "$(json_build_object 'version' \"$api_server_version\" 'status' \"$api_server_status\")" \
+        "coredns" "$(json_build_object 'version' \"$coredns_version\" 'status' \"$coredns_status\")" \
+        "ingress_controller" "$(json_build_object 'type' \"$ingress_type\" 'version' \"$ingress_version\")" \
+        "cni_plugin" "$(json_build_object 'type' \"$cni_type\" 'version' \"$cni_version\")" \
+        "csi_drivers" "[]")
+
+    # Tanzu-specific platform data
+    tkr_version=$(try_command "kubectl get tkr -o jsonpath='{.items[0].metadata.name}' 2>/dev/null" || echo "")
+    cluster_class=""
+    management_cluster=""
+    supervisor_cluster=""
+    vsphere_namespace=""
+    workload_cluster_count=0
+    infrastructure_provider="vsphere"
+    ceip_enabled="false"
+    pinniped_enabled="false"
+
+    if command_exists tanzu; then
+        workload_cluster_count=$(tanzu cluster list -o json 2>/dev/null | grep -c '"name"' || echo "0")
+        management_cluster=$(tanzu management-cluster get 2>/dev/null | grep 'NAME' | awk '{print $2}' || echo "")
+    fi
+
+    tanzu_specific=$(json_build_object \
+        "tkg_version" "$tkg_version" \
+        "tkr_version" "$tkr_version" \
+        "cluster_class" "$cluster_class" \
+        "management_cluster" "$management_cluster" \
+        "supervisor_cluster" "$supervisor_cluster" \
+        "vsphere_namespace" "$vsphere_namespace" \
+        "workload_cluster_count" "$workload_cluster_count" \
+        "infrastructure_provider" "$infrastructure_provider" \
+        "ceip_enabled" "$ceip_enabled" \
+        "pinniped_enabled" "$pinniped_enabled")
+
+    platform_specific_json=$(json_build_object \
+        "swarm" "null" \
+        "kubernetes" "null" \
+        "openshift" "null" \
+        "tanzu" "$tanzu_specific")
+
     # Resource usage - get from Tanzu control plane processes
     tanzu_cpu_total=0
     tanzu_mem_total=0
@@ -2536,6 +2714,10 @@ discover_tanzu() {
     tanzu_cpu_total=$(printf "%.2f" "$tanzu_cpu_total" 2>/dev/null || echo "0")
     tanzu_mem_total=$(printf "%.2f" "$tanzu_mem_total" 2>/dev/null || echo "0")
 
+    resource_usage_json=$(json_build_object \
+        "cpu_cores" "$tanzu_cpu_total" \
+        "memory_mb" "$tanzu_mem_total")
+
     TANZU_JSON=$(json_build_object \
         "name" "tanzu" \
         "orchestrator_type" "tanzu" \
@@ -2543,12 +2725,12 @@ discover_tanzu() {
         "cluster_id" "$cluster_id" \
         "cluster_name" "$cluster_name" \
         "state" "active" \
-        "current_node" "$(json_build_object 'node_id' '' 'role' 'worker' 'availability' 'Ready')" \
-        "nodes" "$(json_build_object 'total_count' '0' 'master_count' '0' 'worker_count' '0' 'master_nodes' '[]' 'worker_nodes' '[]')" \
-        "workloads" "$(json_build_object 'total_container_count' '0' 'system_container_count' '0' 'user_container_count' '0' 'pod_count' '0' 'service_count' '0' 'deployment_count' '0' 'daemonset_count' '0' 'statefulset_count' '0' 'namespace_count' '0' 'namespaces' '[]')" \
-        "cluster_components" "$(json_build_object 'api_server' '$(json_build_object \"version\" \"\" \"status\" \"\")' 'coredns' '$(json_build_object \"version\" \"\" \"status\" \"\")' 'ingress_controller' '$(json_build_object \"type\" \"\" \"version\" \"\")' 'cni_plugin' '$(json_build_object \"type\" \"\" \"version\" \"\")' 'csi_drivers' '[]')" \
-        "platform_specific" "$(json_build_object 'swarm' 'null' 'kubernetes' 'null' 'openshift' 'null' 'tanzu' '$(json_build_object \"tkg_version\" \"$tkg_version\" \"tkr_version\" \"\" \"cluster_class\" \"\" \"management_cluster\" \"\" \"supervisor_cluster\" \"\" \"vsphere_namespace\" \"\" \"workload_cluster_count\" \"0\" \"infrastructure_provider\" \"\" \"ceip_enabled\" \"false\" \"pinniped_enabled\" \"false\")')" \
-        "resource_usage" "$(json_build_object 'cpu_cores' '$tanzu_cpu_total' 'memory_mb' '$tanzu_mem_total')")
+        "current_node" "$current_node_json" \
+        "nodes" "$nodes_json" \
+        "workloads" "$workloads_json" \
+        "cluster_components" "$cluster_components_json" \
+        "platform_specific" "$platform_specific_json" \
+        "resource_usage" "$resource_usage_json")
 
     log_info "Tanzu discovery completed"
 }
