@@ -325,37 +325,49 @@ get_listening_ports() {
     done
 
     # Step 2: Dynamic port discovery — try ss (both TCP and UDP)
+    # Always try with sudo first if available for better results
+    priv=$(check_privilege)
+
     if command_exists ss; then
-        tcp_ports=$(ss -tlnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
-        udp_ports=$(ss -ulnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+        if [ "$priv" = "root" ]; then
+            tcp_ports=$(ss -tlnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+            udp_ports=$(ss -ulnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+        elif [ "$priv" = "sudo" ]; then
+            tcp_ports=$(sudo ss -tlnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+            udp_ports=$(sudo ss -ulnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+        else
+            tcp_ports=$(ss -tlnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+            udp_ports=$(ss -ulnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+        fi
         port_lines=$(printf '%s\n%s' "$tcp_ports" "$udp_ports" | grep -v '^$' | sort -un)
         log_debug "  ss found ports: $port_lines"
     fi
 
-    # Also try with sudo if we have privilege and ss returned nothing
-    if [ -z "$port_lines" ] && command_exists ss; then
-        priv=$(check_privilege)
-        if [ "$priv" = "root" ] || [ "$priv" = "sudo" ]; then
-            prefix=""
-            [ "$priv" = "sudo" ] && prefix="sudo"
-            tcp_ports=$($prefix ss -tlnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
-            udp_ports=$($prefix ss -ulnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
-            port_lines=$(printf '%s\n%s' "$tcp_ports" "$udp_ports" | grep -v '^$' | sort -un)
-            log_debug "  ss (privileged) found ports: $port_lines"
-        fi
-    fi
-
-    # Step 3: Fallback to netstat
+    # Step 3: Fallback to netstat with sudo
     if [ -z "$port_lines" ] && command_exists netstat; then
-        tcp_ports=$(netstat -tlnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
-        udp_ports=$(netstat -ulnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+        if [ "$priv" = "root" ]; then
+            tcp_ports=$(netstat -tlnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+            udp_ports=$(netstat -ulnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+        elif [ "$priv" = "sudo" ]; then
+            tcp_ports=$(sudo netstat -tlnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+            udp_ports=$(sudo netstat -ulnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+        else
+            tcp_ports=$(netstat -tlnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+            udp_ports=$(netstat -ulnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+        fi
         port_lines=$(printf '%s\n%s' "$tcp_ports" "$udp_ports" | grep -v '^$' | sort -un)
         log_debug "  netstat found ports: $port_lines"
     fi
 
-    # Step 4: Fallback to lsof
+    # Step 4: Fallback to lsof with sudo
     if [ -z "$port_lines" ] && command_exists lsof; then
-        port_lines=$(lsof -i -P -n 2>/dev/null | grep -i "$grep_pattern" | grep LISTEN | awk '{print $9}' | sed 's/.*://g' | sort -u)
+        if [ "$priv" = "root" ]; then
+            port_lines=$(lsof -i -P -n 2>/dev/null | grep -i "$grep_pattern" | grep LISTEN | awk '{print $9}' | sed 's/.*://g' | sort -u)
+        elif [ "$priv" = "sudo" ]; then
+            port_lines=$(sudo lsof -i -P -n 2>/dev/null | grep -i "$grep_pattern" | grep LISTEN | awk '{print $9}' | sed 's/.*://g' | sort -u)
+        else
+            port_lines=$(lsof -i -P -n 2>/dev/null | grep -i "$grep_pattern" | grep LISTEN | awk '{print $9}' | sed 's/.*://g' | sort -u)
+        fi
         log_debug "  lsof found ports: $port_lines"
     fi
 
@@ -363,8 +375,19 @@ get_listening_ports() {
     if [ -z "$port_lines" ] && [ -n "$all_pids" ]; then
         proc_ports=""
         for pid in $all_pids; do
-            if [ -d "/proc/$pid/fd" ]; then
-                socket_inodes=$(ls -l /proc/$pid/fd 2>/dev/null | grep 'socket:\[' | sed 's/.*socket:\[\([0-9]*\)\]/\1/')
+            fd_dir="/proc/$pid/fd"
+            socket_inodes=""
+
+            # Access /proc with sudo if needed
+            if [ -d "$fd_dir" ]; then
+                if [ "$priv" = "root" ]; then
+                    socket_inodes=$(ls -l "$fd_dir" 2>/dev/null | grep 'socket:\[' | sed 's/.*socket:\[\([0-9]*\)\]/\1/')
+                elif [ "$priv" = "sudo" ]; then
+                    socket_inodes=$(sudo ls -l "$fd_dir" 2>/dev/null | grep 'socket:\[' | sed 's/.*socket:\[\([0-9]*\)\]/\1/')
+                else
+                    socket_inodes=$(ls -l "$fd_dir" 2>/dev/null | grep 'socket:\[' | sed 's/.*socket:\[\([0-9]*\)\]/\1/')
+                fi
+
                 if [ -n "$socket_inodes" ]; then
                     for net_file in /proc/net/tcp /proc/net/tcp6; do
                         [ -f "$net_file" ] || continue
@@ -493,8 +516,15 @@ get_listening_ports() {
         # Build a set of all socket inodes for our PIDs
         all_inodes=""
         for pid in $all_pids; do
-            if [ -d "/proc/$pid/fd" ]; then
-                inodes=$(ls -l /proc/$pid/fd 2>/dev/null | grep 'socket:\[' | sed 's/.*socket:\[\([0-9]*\)\]/\1/' | tr '\n' ' ')
+            fd_dir="/proc/$pid/fd"
+            if [ -d "$fd_dir" ]; then
+                if [ "$priv" = "root" ]; then
+                    inodes=$(ls -l "$fd_dir" 2>/dev/null | grep 'socket:\[' | sed 's/.*socket:\[\([0-9]*\)\]/\1/' | tr '\n' ' ')
+                elif [ "$priv" = "sudo" ]; then
+                    inodes=$(sudo ls -l "$fd_dir" 2>/dev/null | grep 'socket:\[' | sed 's/.*socket:\[\([0-9]*\)\]/\1/' | tr '\n' ' ')
+                else
+                    inodes=$(ls -l "$fd_dir" 2>/dev/null | grep 'socket:\[' | sed 's/.*socket:\[\([0-9]*\)\]/\1/' | tr '\n' ' ')
+                fi
                 all_inodes="$all_inodes $inodes"
             fi
         done
@@ -914,47 +944,99 @@ discover_containerd() {
     # Storage root
     storage_root="/var/lib/containerd"
 
-    # Namespaces
-    namespaces=$(try_privileged_command "ctr namespaces list -q" "")
+    # Namespaces - try multiple methods with sudo
+    namespaces=""
+    priv=$(check_privilege)
+
+    # Method 1: Try with privilege
+    if [ "$priv" = "root" ]; then
+        namespaces=$(try_command "ctr namespaces list -q")
+    elif [ "$priv" = "sudo" ]; then
+        namespaces=$(try_command "sudo ctr namespaces list -q")
+    fi
+
+    # Method 2: Fallback - check directories with privilege
     if [ -z "$namespaces" ]; then
-        # Fallback: check directories
-        if [ -d "/var/lib/containerd/io.containerd.grpc.v1.namespaces" ]; then
-            namespaces=$(ls /var/lib/containerd/io.containerd.grpc.v1.namespaces 2>/dev/null)
+        if [ "$priv" = "root" ]; then
+            if [ -d "/var/lib/containerd/io.containerd.grpc.v1.namespaces" ]; then
+                namespaces=$(ls /var/lib/containerd/io.containerd.grpc.v1.namespaces 2>/dev/null)
+            fi
+        elif [ "$priv" = "sudo" ]; then
+            namespaces=$(try_command "sudo ls /var/lib/containerd/io.containerd.grpc.v1.namespaces 2>/dev/null")
         fi
     fi
+
+    # Method 3: Try crictl if available
+    if [ -z "$namespaces" ] && command_exists crictl; then
+        # crictl uses k8s.io namespace by default
+        if try_command "crictl ps -a -q 2>/dev/null | head -n1" >/dev/null 2>&1; then
+            namespaces="k8s.io"
+        fi
+    fi
+
     namespaces_json=$(json_build_array "$namespaces" false)
 
-    # Container counts
+    # Container counts - use sudo for ctr commands
     container_count=0
     running_count=0
 
     if [ -n "$namespaces" ]; then
         for ns in $namespaces; do
-            ns_containers=$(try_command "ctr -n $ns containers list -q 2>/dev/null | wc -l" || echo "0")
+            if [ "$priv" = "root" ]; then
+                ns_containers=$(try_command "ctr -n $ns containers list -q 2>/dev/null | wc -l" || echo "0")
+                ns_running=$(try_command "ctr -n $ns tasks list -q 2>/dev/null | wc -l" || echo "0")
+            elif [ "$priv" = "sudo" ]; then
+                ns_containers=$(try_command "sudo ctr -n $ns containers list -q 2>/dev/null | wc -l" || echo "0")
+                ns_running=$(try_command "sudo ctr -n $ns tasks list -q 2>/dev/null | wc -l" || echo "0")
+            else
+                ns_containers=$(try_command "ctr -n $ns containers list -q 2>/dev/null | wc -l" || echo "0")
+                ns_running=$(try_command "ctr -n $ns tasks list -q 2>/dev/null | wc -l" || echo "0")
+            fi
             container_count=$((container_count + ns_containers))
-
-            ns_running=$(try_command "ctr -n $ns tasks list -q 2>/dev/null | wc -l" || echo "0")
             running_count=$((running_count + ns_running))
         done
     fi
 
-    # Fallback to crictl
+    # Fallback to crictl with sudo
     if [ "$container_count" -eq 0 ] && command_exists crictl; then
-        container_count=$(try_command "crictl ps -a -q 2>/dev/null | wc -l" || echo "0")
-        running_count=$(try_command "crictl ps -q 2>/dev/null | wc -l" || echo "0")
+        # Set runtime endpoint for crictl
+        export CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
+        if [ "$priv" = "root" ]; then
+            container_count=$(try_command "crictl ps -a -q 2>/dev/null | wc -l" || echo "0")
+            running_count=$(try_command "crictl ps -q 2>/dev/null | wc -l" || echo "0")
+        elif [ "$priv" = "sudo" ]; then
+            container_count=$(try_command "sudo crictl ps -a -q 2>/dev/null | wc -l" || echo "0")
+            running_count=$(try_command "sudo crictl ps -q 2>/dev/null | wc -l" || echo "0")
+        else
+            container_count=$(try_command "crictl ps -a -q 2>/dev/null | wc -l" || echo "0")
+            running_count=$(try_command "crictl ps -q 2>/dev/null | wc -l" || echo "0")
+        fi
     fi
 
-    # Image count
+    # Image count - use sudo for ctr commands
     image_count=0
     if [ -n "$namespaces" ]; then
         for ns in $namespaces; do
-            ns_images=$(try_command "ctr -n $ns images list -q 2>/dev/null | wc -l" || echo "0")
+            if [ "$priv" = "root" ]; then
+                ns_images=$(try_command "ctr -n $ns images list -q 2>/dev/null | wc -l" || echo "0")
+            elif [ "$priv" = "sudo" ]; then
+                ns_images=$(try_command "sudo ctr -n $ns images list -q 2>/dev/null | wc -l" || echo "0")
+            else
+                ns_images=$(try_command "ctr -n $ns images list -q 2>/dev/null | wc -l" || echo "0")
+            fi
             image_count=$((image_count + ns_images))
         done
     fi
 
+    # Fallback to crictl with sudo
     if [ "$image_count" -eq 0 ] && command_exists crictl; then
-        image_count=$(try_command "crictl images -q 2>/dev/null | wc -l" || echo "0")
+        if [ "$priv" = "root" ]; then
+            image_count=$(try_command "crictl images -q 2>/dev/null | wc -l" || echo "0")
+        elif [ "$priv" = "sudo" ]; then
+            image_count=$(try_command "sudo crictl images -q 2>/dev/null | wc -l" || echo "0")
+        else
+            image_count=$(try_command "crictl images -q 2>/dev/null | wc -l" || echo "0")
+        fi
     fi
 
     # Storage driver
@@ -983,9 +1065,18 @@ discover_containerd() {
         "cpu_cores" "${cpu_cores:-0}" \
         "memory_mb" "${memory_mb:-0}")
 
-    # Registries
+    # Registries - always provide default registries for Kubernetes/containerd
     registries="registry.k8s.io
 docker.io"
+
+    # Try to extract additional registries from config
+    if [ -f /etc/containerd/config.toml ]; then
+        config_registries=$(grep -A5 'plugins."io.containerd.grpc.v1.cri".registry.mirrors' /etc/containerd/config.toml 2>/dev/null | grep '\[' | sed 's/.*"\(.*\)".*/\1/' | grep -v '^\[')
+        if [ -n "$config_registries" ]; then
+            registries="$registries
+$config_registries"
+        fi
+    fi
     registries_json=$(json_build_array "$registries" false)
 
     # Containers (empty for now to keep script manageable)
@@ -1034,14 +1125,23 @@ discover_docker() {
     # Storage root
     storage_root="/var/lib/docker"
 
-    # Try docker info
+    # Try docker info with sudo
     container_count=0
     running_count=0
     image_count=0
     storage_driver="overlay2"
     cgroup_driver="cgroupfs"
 
-    docker_info=$(try_privileged_command "docker info --format json" "")
+    priv=$(check_privilege)
+    docker_info=""
+
+    if [ "$priv" = "root" ]; then
+        docker_info=$(try_command "docker info --format json")
+    elif [ "$priv" = "sudo" ]; then
+        docker_info=$(try_command "sudo docker info --format json")
+    else
+        docker_info=$(try_command "docker info --format json")
+    fi
 
     if [ -n "$docker_info" ]; then
         container_count=$(echo "$docker_info" | grep -o '"Containers":[0-9]*' | cut -d: -f2 | head -n1)
@@ -1053,14 +1153,28 @@ discover_docker() {
         cgroup_driver=$(echo "$docker_info" | grep -o '"CgroupDriver":"[^"]*"' | cut -d\" -f4 | head -n1)
     fi
 
-    # Fallback to docker ps
+    # Fallback to docker ps with sudo
     if [ "$container_count" = "0" ] || [ -z "$container_count" ]; then
-        container_count=$(try_command "docker ps -aq 2>/dev/null | wc -l" || echo "0")
-        running_count=$(try_command "docker ps -q 2>/dev/null | wc -l" || echo "0")
+        if [ "$priv" = "root" ]; then
+            container_count=$(try_command "docker ps -aq 2>/dev/null | wc -l" || echo "0")
+            running_count=$(try_command "docker ps -q 2>/dev/null | wc -l" || echo "0")
+        elif [ "$priv" = "sudo" ]; then
+            container_count=$(try_command "sudo docker ps -aq 2>/dev/null | wc -l" || echo "0")
+            running_count=$(try_command "sudo docker ps -q 2>/dev/null | wc -l" || echo "0")
+        else
+            container_count=$(try_command "docker ps -aq 2>/dev/null | wc -l" || echo "0")
+            running_count=$(try_command "docker ps -q 2>/dev/null | wc -l" || echo "0")
+        fi
     fi
 
     if [ "$image_count" = "0" ] || [ -z "$image_count" ]; then
-        image_count=$(try_command "docker images -q 2>/dev/null | wc -l" || echo "0")
+        if [ "$priv" = "root" ]; then
+            image_count=$(try_command "docker images -q 2>/dev/null | wc -l" || echo "0")
+        elif [ "$priv" = "sudo" ]; then
+            image_count=$(try_command "sudo docker images -q 2>/dev/null | wc -l" || echo "0")
+        else
+            image_count=$(try_command "docker images -q 2>/dev/null | wc -l" || echo "0")
+        fi
     fi
 
     # Defaults
@@ -1082,8 +1196,17 @@ discover_docker() {
         "cpu_cores" "${cpu_cores:-0}" \
         "memory_mb" "${memory_mb:-0}")
 
-    # Registries
+    # Registries - always provide default Docker registry
     registries="docker.io"
+
+    # Try to extract additional registries from daemon.json
+    if [ -f /etc/docker/daemon.json ]; then
+        config_registries=$(grep -o '"registry-mirrors"[^]]*' /etc/docker/daemon.json 2>/dev/null | grep -o 'https\?://[^"]*' | sed 's|https\?://||')
+        if [ -n "$config_registries" ]; then
+            registries="$registries
+$config_registries"
+        fi
+    fi
     registries_json=$(json_build_array "$registries" false)
 
     # Containers and images (empty for now)
@@ -1320,13 +1443,35 @@ detect_orchestrators() {
         fi
     fi
 
-    # Check for Kubernetes
-    if command_exists kubectl || command_exists kubelet || [ -d /etc/kubernetes ]; then
-        if try_command "kubectl cluster-info 2>/dev/null" >/dev/null 2>&1 || systemctl is-active kubelet >/dev/null 2>&1; then
-            ORCHESTRATORS_DETECTED="$ORCHESTRATORS_DETECTED kubernetes"
-            log_info "Kubernetes detected"
-            discover_kubernetes
+    # Check for Kubernetes - improved detection for worker nodes
+    k8s_detected=false
+
+    # Check if kubelet is running (most reliable for worker nodes)
+    if systemctl is-active kubelet >/dev/null 2>&1; then
+        k8s_detected=true
+    fi
+
+    # Check for kubernetes directories
+    if [ "$k8s_detected" = false ] && [ -d /etc/kubernetes ]; then
+        k8s_detected=true
+    fi
+
+    # Check for kubectl command
+    if [ "$k8s_detected" = false ] && command_exists kubectl; then
+        if try_command "kubectl cluster-info 2>/dev/null" >/dev/null 2>&1; then
+            k8s_detected=true
         fi
+    fi
+
+    # Check for kubelet binary
+    if [ "$k8s_detected" = false ] && command_exists kubelet; then
+        k8s_detected=true
+    fi
+
+    if [ "$k8s_detected" = true ]; then
+        ORCHESTRATORS_DETECTED="$ORCHESTRATORS_DETECTED kubernetes"
+        log_info "Kubernetes detected"
+        discover_kubernetes
     fi
 
     # Check for OpenShift
@@ -1495,25 +1640,47 @@ discover_docker_swarm() {
 discover_kubernetes() {
     log_info "Discovering Kubernetes..."
 
-    # Version
-    version=$(try_command "kubectl version --short 2>/dev/null | grep Server | awk '{print \$3}'")
-    [ -z "$version" ] && version=$(try_command "kubelet --version 2>/dev/null | awk '{print \$2}'")
+    priv=$(check_privilege)
+
+    # Version - try multiple methods
+    version=""
+    if command_exists kubectl; then
+        version=$(try_command "kubectl version --short 2>/dev/null | grep Server | awk '{print \$3}'")
+    fi
+    if [ -z "$version" ] && command_exists kubelet; then
+        version=$(try_command "kubelet --version 2>/dev/null | awk '{print \$2}'")
+    fi
+    if [ -z "$version" ]; then
+        # Try from manifest files with sudo
+        if [ "$priv" = "root" ]; then
+            version=$(grep -h "image:.*kube-apiserver" /etc/kubernetes/manifests/*.yaml 2>/dev/null | grep -o "v[0-9]*\.[0-9]*\.[0-9]*" | head -n1)
+        elif [ "$priv" = "sudo" ]; then
+            version=$(try_command "sudo grep -h 'image:.*kube-apiserver' /etc/kubernetes/manifests/*.yaml 2>/dev/null | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*' | head -n1")
+        fi
+    fi
     [ -z "$version" ] && version=""
 
     # Cluster ID - with multiple fallbacks
-    cluster_id=$(try_command "kubectl get ns kube-system -o jsonpath='{.metadata.uid}' 2>/dev/null")
+    cluster_id=""
+    if command_exists kubectl; then
+        cluster_id=$(try_command "kubectl get ns kube-system -o jsonpath='{.metadata.uid}' 2>/dev/null")
+    fi
     if [ -z "$cluster_id" ]; then
-        # Fallback: try to get from kubeadm config
-        cluster_id=$(try_privileged_command "cat /etc/kubernetes/admin.conf 2>/dev/null | grep cluster: | head -n1 | awk '{print \$2}'" "")
+        # Fallback: try to get from kubeadm config with sudo
+        if [ "$priv" = "root" ]; then
+            cluster_id=$(cat /etc/kubernetes/admin.conf 2>/dev/null | grep "cluster:" | head -n1 | awk '{print $2}')
+        elif [ "$priv" = "sudo" ]; then
+            cluster_id=$(try_command "sudo cat /etc/kubernetes/admin.conf 2>/dev/null | grep 'cluster:' | head -n1 | awk '{print \$2}'")
+        fi
     fi
     if [ -z "$cluster_id" ]; then
         # Fallback: try to get from kubelet config
-        cluster_id=$(try_command "cat /var/lib/kubelet/kubeadm-flags.env 2>/dev/null | grep -o 'cluster-name=[^ ]*' | cut -d= -f2" || echo "")
+        cluster_id=$(cat /var/lib/kubelet/kubeadm-flags.env 2>/dev/null | grep -o 'cluster-name=[^ ]*' | cut -d= -f2)
     fi
     if [ -z "$cluster_id" ]; then
         # Fallback: check for k3s
         if [ -d /var/lib/rancher/k3s ]; then
-            cluster_id=$(try_command "cat /var/lib/rancher/k3s/server/cred/cluster-id 2>/dev/null" || echo "")
+            cluster_id=$(cat /var/lib/rancher/k3s/server/cred/cluster-id 2>/dev/null)
         fi
     fi
     # Filter out kubectl error messages that might have been captured
@@ -1648,46 +1815,70 @@ discover_kubernetes() {
     # Platform specific
     api_endpoint=$(try_command "kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null" || echo "")
 
-    # Detect cluster CIDR - try multiple sources
+    # Detect cluster CIDR - try multiple sources with sudo
     cluster_cidr=""
     # Method 1: From kube-controller-manager pod
-    if [ -z "$cluster_cidr" ]; then
-        cluster_cidr=$(try_command "kubectl get pods -n kube-system -l component=kube-controller-manager -o jsonpath='{.items[0].spec.containers[0].command}' 2>/dev/null | grep -o 'cluster-cidr=[^ ]*' | cut -d= -f2" || echo "")
+    if [ -z "$cluster_cidr" ] && command_exists kubectl; then
+        cluster_cidr=$(try_command "kubectl get pods -n kube-system -l component=kube-controller-manager -o jsonpath='{.items[0].spec.containers[0].command}' 2>/dev/null | grep -o 'cluster-cidr=[^ ]*' | cut -d= -f2")
     fi
     # Method 2: From kube-proxy configmap
-    if [ -z "$cluster_cidr" ]; then
-        cluster_cidr=$(try_command "kubectl get configmap kube-proxy -n kube-system -o jsonpath='{.data.config\.conf}' 2>/dev/null | grep -o 'clusterCIDR: .*' | awk '{print \$2}'" || echo "")
+    if [ -z "$cluster_cidr" ] && command_exists kubectl; then
+        cluster_cidr=$(try_command "kubectl get configmap kube-proxy -n kube-system -o jsonpath='{.data.config\.conf}' 2>/dev/null | grep -o 'clusterCIDR: .*' | awk '{print \$2}'")
     fi
-    # Method 3: From kubeadm config
+    # Method 3: From kubeadm config with sudo
     if [ -z "$cluster_cidr" ]; then
-        cluster_cidr=$(try_privileged_command "grep -r 'podSubnet' /etc/kubernetes/manifests/ 2>/dev/null | grep -o 'podSubnet: .*' | awk '{print \$2}' | head -n1" "")
+        if [ "$priv" = "root" ]; then
+            cluster_cidr=$(grep -r 'podSubnet' /etc/kubernetes/manifests/ 2>/dev/null | grep -o 'podSubnet: .*' | awk '{print $2}' | head -n1)
+        elif [ "$priv" = "sudo" ]; then
+            cluster_cidr=$(try_command "sudo grep -r 'podSubnet' /etc/kubernetes/manifests/ 2>/dev/null | grep -o 'podSubnet: .*' | awk '{print \$2}' | head -n1")
+        fi
     fi
-    # Method 4: From kube-controller-manager manifest
+    # Method 4: From kube-controller-manager manifest with sudo
     if [ -z "$cluster_cidr" ]; then
-        cluster_cidr=$(try_privileged_command "grep -o 'cluster-cidr=[^ ]*' /etc/kubernetes/manifests/kube-controller-manager.yaml 2>/dev/null | cut -d= -f2" "")
+        if [ "$priv" = "root" ]; then
+            cluster_cidr=$(grep -o 'cluster-cidr=[^ ]*' /etc/kubernetes/manifests/kube-controller-manager.yaml 2>/dev/null | cut -d= -f2)
+        elif [ "$priv" = "sudo" ]; then
+            cluster_cidr=$(try_command "sudo grep -o 'cluster-cidr=[^ ]*' /etc/kubernetes/manifests/kube-controller-manager.yaml 2>/dev/null | cut -d= -f2")
+        fi
     fi
     # Method 5: For k3s
     if [ -z "$cluster_cidr" ] && [ -d /var/lib/rancher/k3s ]; then
-        cluster_cidr=$(try_privileged_command "grep -o 'cluster-cidr=[^ ]*' /etc/systemd/system/k3s.service 2>/dev/null | cut -d= -f2" "")
+        if [ "$priv" = "root" ]; then
+            cluster_cidr=$(grep -o 'cluster-cidr=[^ ]*' /etc/systemd/system/k3s.service 2>/dev/null | cut -d= -f2)
+        elif [ "$priv" = "sudo" ]; then
+            cluster_cidr=$(try_command "sudo grep -o 'cluster-cidr=[^ ]*' /etc/systemd/system/k3s.service 2>/dev/null | cut -d= -f2")
+        fi
     fi
 
-    # Detect service CIDR - try multiple sources
+    # Detect service CIDR - try multiple sources with sudo
     service_cidr=""
     # Method 1: From kube-apiserver pod
-    if [ -z "$service_cidr" ]; then
-        service_cidr=$(try_command "kubectl get pods -n kube-system -l component=kube-apiserver -o jsonpath='{.items[0].spec.containers[0].command}' 2>/dev/null | grep -o 'service-cluster-ip-range=[^ ]*' | cut -d= -f2" || echo "")
+    if [ -z "$service_cidr" ] && command_exists kubectl; then
+        service_cidr=$(try_command "kubectl get pods -n kube-system -l component=kube-apiserver -o jsonpath='{.items[0].spec.containers[0].command}' 2>/dev/null | grep -o 'service-cluster-ip-range=[^ ]*' | cut -d= -f2")
     fi
-    # Method 2: From kube-apiserver manifest
+    # Method 2: From kube-apiserver manifest with sudo
     if [ -z "$service_cidr" ]; then
-        service_cidr=$(try_privileged_command "grep -o 'service-cluster-ip-range=[^ ]*' /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null | cut -d= -f2" "")
+        if [ "$priv" = "root" ]; then
+            service_cidr=$(grep -o 'service-cluster-ip-range=[^ ]*' /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null | cut -d= -f2)
+        elif [ "$priv" = "sudo" ]; then
+            service_cidr=$(try_command "sudo grep -o 'service-cluster-ip-range=[^ ]*' /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null | cut -d= -f2")
+        fi
     fi
-    # Method 3: From kubeadm config
+    # Method 3: From kubeadm config with sudo
     if [ -z "$service_cidr" ]; then
-        service_cidr=$(try_privileged_command "grep -r 'serviceSubnet' /etc/kubernetes/ 2>/dev/null | grep -o 'serviceSubnet: .*' | awk '{print \$2}' | head -n1" "")
+        if [ "$priv" = "root" ]; then
+            service_cidr=$(grep -r 'serviceSubnet' /etc/kubernetes/ 2>/dev/null | grep -o 'serviceSubnet: .*' | awk '{print $2}' | head -n1)
+        elif [ "$priv" = "sudo" ]; then
+            service_cidr=$(try_command "sudo grep -r 'serviceSubnet' /etc/kubernetes/ 2>/dev/null | grep -o 'serviceSubnet: .*' | awk '{print \$2}' | head -n1")
+        fi
     fi
     # Method 4: For k3s
     if [ -z "$service_cidr" ] && [ -d /var/lib/rancher/k3s ]; then
-        service_cidr=$(try_privileged_command "grep -o 'service-cidr=[^ ]*' /etc/systemd/system/k3s.service 2>/dev/null | cut -d= -f2" "")
+        if [ "$priv" = "root" ]; then
+            service_cidr=$(grep -o 'service-cidr=[^ ]*' /etc/systemd/system/k3s.service 2>/dev/null | cut -d= -f2)
+        elif [ "$priv" = "sudo" ]; then
+            service_cidr=$(try_command "sudo grep -o 'service-cidr=[^ ]*' /etc/systemd/system/k3s.service 2>/dev/null | cut -d= -f2")
+        fi
     fi
 
     # Detect kubeconfig path dynamically
