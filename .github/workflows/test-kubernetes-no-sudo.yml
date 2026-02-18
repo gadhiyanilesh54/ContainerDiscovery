@@ -1,0 +1,76 @@
+name: Test Kubernetes Environment (without sudo)
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  test-kubernetes-no-sudo:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Kubernetes with kind
+      uses: helm/kind-action@v1
+      with:
+        cluster_name: test-cluster
+        wait: 5m
+
+    - name: Verify Kubernetes cluster
+      run: |
+        kubectl cluster-info
+        kubectl get nodes
+        kubectl get pods -A
+
+    - name: Install jq for JSON validation
+      run: sudo apt-get update && sudo apt-get install -y jq
+
+    - name: Set up kubeconfig for non-root user
+      run: |
+        mkdir -p $HOME/.kube
+        sudo cp /root/.kube/config $HOME/.kube/config || cp ~/.kube/config $HOME/.kube/config || true
+        sudo chown $(id -u):$(id -g) $HOME/.kube/config || true
+        chmod 600 $HOME/.kube/config || true
+
+    - name: Run discovery script without sudo
+      run: ./GuestDetails_Container.sh
+
+    - name: Run unprivileged test
+      run: ./test_unprivileged.sh
+
+    - name: Validate JSON output
+      run: |
+        if [ -f output.json ]; then
+          echo "JSON output exists"
+          jq . output.json > /dev/null
+          echo "JSON is valid"
+
+          # Check that script completed without crashing
+          runtime_count=$(jq '.armResources[0].properties.container_runtimes | length' output.json)
+          echo "Container runtimes detected: $runtime_count"
+
+          orch_count=$(jq '.armResources[0].properties.orchestrators | length' output.json)
+          echo "Orchestrators detected: $orch_count"
+
+          # Note: Detection may be limited without sudo, but script should not crash
+          echo "✓ Script completed successfully without sudo"
+        else
+          echo "✗ output.json not found"
+          exit 1
+        fi
+
+    - name: Upload artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: kubernetes-no-sudo-test-results
+        path: |
+          output.json
+          debug.txt
+          error.txt
+        retention-days: 7

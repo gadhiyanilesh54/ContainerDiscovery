@@ -1,0 +1,105 @@
+name: Test Docker Swarm Environment (with sudo)
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  test-docker-swarm-sudo:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Initialize Docker Swarm
+      run: |
+        sudo docker swarm init
+        sudo docker node ls
+
+    - name: Create test services in Swarm
+      run: |
+        # Create a simple service to test detection
+        sudo docker service create --name test-nginx --replicas 2 nginx:alpine
+
+        # Wait for services to be running
+        sleep 10
+        sudo docker service ls
+        sudo docker service ps test-nginx
+
+    - name: Verify Docker Swarm status
+      run: |
+        sudo docker info | grep -i swarm -A 10
+
+    - name: Install jq for JSON validation
+      run: sudo apt-get update && sudo apt-get install -y jq
+
+    - name: Run discovery script with sudo
+      run: sudo ./GuestDetails_Container.sh
+
+    - name: Run privileged test
+      run: sudo ./test_privileged.sh
+
+    - name: Validate JSON output
+      run: |
+        if [ -f output.json ]; then
+          echo "JSON output exists"
+          jq . output.json > /dev/null
+          echo "JSON is valid"
+
+          # Check for Docker Swarm detection
+          swarm_count=$(jq '.armResources[0].properties.orchestrators | map(select(.orchestrator_type == "docker_swarm")) | length' output.json)
+          echo "Docker Swarm orchestrators detected: $swarm_count"
+
+          if [ "$swarm_count" -gt 0 ]; then
+            echo "✓ Docker Swarm successfully detected"
+            jq '.armResources[0].properties.orchestrators[] | select(.orchestrator_type == "docker_swarm")' output.json
+
+            # Verify node role is detected
+            node_role=$(jq -r '.armResources[0].properties.orchestrators[] | select(.orchestrator_type == "docker_swarm") | .node_role' output.json)
+            echo "Node role: $node_role"
+            if [ "$node_role" = "manager" ]; then
+              echo "✓ Correctly detected as manager node"
+            else
+              echo "✗ Expected manager role but got: $node_role"
+              exit 1
+            fi
+          else
+            echo "✗ Docker Swarm not detected"
+            exit 1
+          fi
+
+          # Check for Docker runtime
+          docker_count=$(jq '.armResources[0].properties.container_runtimes | map(select(.name == "docker")) | length' output.json)
+          echo "Docker runtimes detected: $docker_count"
+
+          if [ "$docker_count" -gt 0 ]; then
+            echo "✓ Docker runtime successfully detected"
+          else
+            echo "✗ Docker runtime not detected"
+            exit 1
+          fi
+        else
+          echo "✗ output.json not found"
+          exit 1
+        fi
+
+    - name: Cleanup Docker Swarm
+      if: always()
+      run: |
+        sudo docker service rm test-nginx || true
+        sudo docker swarm leave --force || true
+
+    - name: Upload artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: docker-swarm-sudo-test-results
+        path: |
+          output.json
+          debug.txt
+          error.txt
+        retention-days: 7
