@@ -1,6 +1,6 @@
 # Container Discovery Schema — Enum Reference Table
 
-> **Schema Version**: 7.0.0
+> **Schema Version**: 1.0.0
 > **Last Updated**: 2026-02-18
 
 This document lists all possible values for every enumerated property in the normalized container discovery schema.

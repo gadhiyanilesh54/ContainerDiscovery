@@ -115,8 +115,8 @@ The script outputs a JSON document with the following structure:
     "name": "",
     "apiVersion": "",
     "properties": {
-      "schema_version": "7.0.0",
-      "discovery_timestamp": "2026-02-18T16:58:00Z",
+      "schema_version": "1.0.0",
+      "timestamp": "2026-02-18T16:58:00Z",
       "host_info": { ... },
       "hypervisor": { ... },
       "network": { ... },
@@ -308,7 +308,7 @@ Contributions are welcome! Areas for enhancement:
 ## Schema Compliance
 
 This script outputs JSON conforming to:
-- Schema version: **7.0.0**
+- Schema version: **1.0.0**
 - Schema definition: `schema.json`
 - Enum reference: `schema_reference.md`
 - Requirements: `prompt.md`
@@ -323,7 +323,7 @@ This script outputs JSON conforming to:
 
 ## Version History
 
-- **7.0.0** (2026-02-18) - Initial production release
+- **1.0.0** (2026-02-18) - Initial production release
   - Complete runtime discovery (containerd, Docker, CRI-O, Podman)
   - Complete orchestrator discovery (K8s, Swarm, OpenShift, Tanzu)
   - Comprehensive fallback mechanisms

@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # GuestDetails_Container.sh — Container & Orchestrator Discovery Script
-# Schema Version: 7.0.0
+# Schema Version: 1.0.0
 # Description: Production-grade POSIX-compatible shell script to discover container runtimes
 #              and orchestrators on Linux hosts with graceful privilege degradation
 
@@ -1648,12 +1648,12 @@ build_final_json() {
     orchestrators_array="$orchestrators_array]"
 
     # Discovery timestamp
-    DISCOVERY_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
     # Build properties object
     properties=$(json_build_object \
-        "schema_version" "7.0.0" \
-        "discovery_timestamp" "$DISCOVERY_TIMESTAMP" \
+        "schema_version" "1.0.0" \
+        "timestamp" "$TIMESTAMP" \
         "host_info" "$HOST_INFO_JSON" \
         "hypervisor" "$HYPERVISOR_JSON" \
         "network" "$NETWORK_JSON" \
@@ -1682,7 +1682,7 @@ build_final_json() {
 
 main() {
     log_info "===== Container Discovery Script Started ====="
-    log_info "Script version: 7.0.0"
+    log_info "Script version: 1.0.0"
     log_info "Timestamp: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     log_info "Running as user: $(whoami)"
     log_info "Privilege level: $(check_privilege)"

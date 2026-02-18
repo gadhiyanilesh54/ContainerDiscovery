@@ -308,7 +308,7 @@ Fallback: `service <name> status` or check `/etc/init.d/<name>`
 4. **Redact sensitive information** — do not include tokens, passwords, certificates, or kubeconfig credentials in output
 5. **Handle multiple instances** — if both Docker and containerd are running, report both; do not skip one
 6. **De-duplicate containers** — if containerd is running as Docker's backend, don't count the same container twice; use labels to determine the actual manager
-7. **Timestamp**: `discovery_timestamp` must be in UTC ISO 8601 format: `date -u +"%Y-%m-%dT%H:%M:%SZ"`
+7. **Timestamp**: `timestamp` must be in UTC ISO 8601 format: `date -u +"%Y-%m-%dT%H:%M:%SZ"`
 
 ---
 
