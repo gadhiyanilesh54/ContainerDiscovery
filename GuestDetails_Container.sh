@@ -1065,16 +1065,17 @@ discover_containerd() {
         "cpu_cores" "${cpu_cores:-0}" \
         "memory_mb" "${memory_mb:-0}")
 
-    # Registries - detect from config
-    registries=""
-    if [ -f /etc/containerd/config.toml ]; then
-        # Try to extract registries from config
-        registries=$(grep -A5 'plugins."io.containerd.grpc.v1.cri".registry.mirrors' /etc/containerd/config.toml 2>/dev/null | grep '\[' | sed 's/.*"\(.*\)".*/\1/' | grep -v '^\[')
-    fi
-    # Add default registries if none found
-    if [ -z "$registries" ]; then
-        registries="registry.k8s.io
+    # Registries - always provide default registries for Kubernetes/containerd
+    registries="registry.k8s.io
 docker.io"
+
+    # Try to extract additional registries from config
+    if [ -f /etc/containerd/config.toml ]; then
+        config_registries=$(grep -A5 'plugins."io.containerd.grpc.v1.cri".registry.mirrors' /etc/containerd/config.toml 2>/dev/null | grep '\[' | sed 's/.*"\(.*\)".*/\1/' | grep -v '^\[')
+        if [ -n "$config_registries" ]; then
+            registries="$registries
+$config_registries"
+        fi
     fi
     registries_json=$(json_build_array "$registries" false)
 
@@ -1195,8 +1196,17 @@ discover_docker() {
         "cpu_cores" "${cpu_cores:-0}" \
         "memory_mb" "${memory_mb:-0}")
 
-    # Registries
+    # Registries - always provide default Docker registry
     registries="docker.io"
+
+    # Try to extract additional registries from daemon.json
+    if [ -f /etc/docker/daemon.json ]; then
+        config_registries=$(grep -o '"registry-mirrors"[^]]*' /etc/docker/daemon.json 2>/dev/null | grep -o 'https\?://[^"]*' | sed 's|https\?://||')
+        if [ -n "$config_registries" ]; then
+            registries="$registries
+$config_registries"
+        fi
+    fi
     registries_json=$(json_build_array "$registries" false)
 
     # Containers and images (empty for now)
