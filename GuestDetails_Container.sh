@@ -819,6 +819,7 @@ discover_network() {
 discover_ip_addresses() {
     ip_json="["
     first=true
+    seen_ipv6=""
 
     if command_exists ip; then
         # Parse text output - use heredoc to avoid subshell
@@ -844,11 +845,24 @@ discover_ip_addresses() {
             elif echo "$line" | grep -q "inet6 "; then
                 addr=$(echo "$line" | grep -o "inet6 [0-9a-fA-F:]*" | awk '{print $2}')
                 if [ -n "$addr" ] && [ "$addr" != "::1" ]; then
-                    if [ "$first" = false ]; then
-                        ip_json="$ip_json,"
+                    # Check if this IPv6 address was already seen to avoid duplicates
+                    addr_found=false
+                    for seen_addr in $seen_ipv6; do
+                        if [ "$seen_addr" = "$addr" ]; then
+                            addr_found=true
+                            log_debug "Skipping duplicate IPv6 address $addr on $current_iface"
+                            break
+                        fi
+                    done
+
+                    if [ "$addr_found" = "false" ]; then
+                        if [ "$first" = false ]; then
+                            ip_json="$ip_json,"
+                        fi
+                        ip_json="$ip_json$(json_build_object "address" "$addr" "version" "ipv6" "interface" "$current_iface")"
+                        first=false
+                        seen_ipv6="$seen_ipv6 $addr"
                     fi
-                    ip_json="$ip_json$(json_build_object "address" "$addr" "version" "ipv6" "interface" "$current_iface")"
-                    first=false
                 fi
             fi
         done <<EOF
@@ -1635,10 +1649,12 @@ discover_docker_swarm() {
             master_nodes_list=""
             while IFS='|' read -r hostname node_id status; do
                 [ -z "$hostname" ] && continue
+                # Convert status to lowercase using tr (POSIX-compliant)
+                status_lower=$(echo "$status" | tr '[:upper:]' '[:lower:]')
                 node_obj=$(json_build_object \
                     "name" "$hostname" \
                     "node_id" "$node_id" \
-                    "status" "${status,,}")  # Convert to lowercase
+                    "status" "$status_lower")
                 if [ -z "$master_nodes_list" ]; then
                     master_nodes_list="$node_obj"
                 else
@@ -1656,10 +1672,12 @@ EOF
             worker_nodes_list=""
             while IFS='|' read -r hostname node_id status; do
                 [ -z "$hostname" ] && continue
+                # Convert status to lowercase using tr (POSIX-compliant)
+                status_lower=$(echo "$status" | tr '[:upper:]' '[:lower:]')
                 node_obj=$(json_build_object \
                     "name" "$hostname" \
                     "node_id" "$node_id" \
-                    "status" "${status,,}")  # Convert to lowercase
+                    "status" "$status_lower")
                 if [ -z "$worker_nodes_list" ]; then
                     worker_nodes_list="$node_obj"
                 else
