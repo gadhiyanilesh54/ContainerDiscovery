@@ -2244,6 +2244,192 @@ discover_openshift() {
     fi
     [ -z "$cluster_name" ] && cluster_name=""
 
+    # Current node information using kubectl
+    node_name=$(hostname)
+    node_role="worker"
+    node_status="Unknown"
+
+    if command_exists kubectl || command_exists oc; then
+        cmd="kubectl"
+        command_exists oc && cmd="oc"
+
+        # Get current node details
+        node_info=$($cmd get node "$node_name" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/master}{"|"}{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+        if [ -n "$node_info" ]; then
+            IFS='|' read -r role_label ready_status <<< "$node_info"
+            [ -n "$role_label" ] && node_role="master"
+            [ "$ready_status" = "True" ] && node_status="Ready" || node_status="NotReady"
+        fi
+
+        # Check for control-plane label as well
+        control_plane=$($cmd get node "$node_name" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/control-plane}' 2>/dev/null || echo "")
+        [ -n "$control_plane" ] && node_role="master"
+    fi
+
+    current_node_json=$(json_build_object \
+        "node_id" "$node_name" \
+        "role" "$node_role" \
+        "availability" "$node_status")
+
+    # Node counts using kubectl
+    total_count=0
+    master_count=0
+    worker_count=0
+    master_nodes_json="[]"
+    worker_nodes_json="[]"
+
+    if command_exists kubectl || command_exists oc; then
+        cmd="kubectl"
+        command_exists oc && cmd="oc"
+
+        total_count=$($cmd get nodes --no-headers 2>/dev/null | wc -l || echo "0")
+        master_count=$($cmd get nodes -l node-role.kubernetes.io/master --no-headers 2>/dev/null | wc -l || echo "0")
+        [ "$master_count" = "0" ] && master_count=$($cmd get nodes -l node-role.kubernetes.io/control-plane --no-headers 2>/dev/null | wc -l || echo "0")
+        worker_count=$((total_count - master_count))
+
+        # Get master nodes list
+        master_nodes=$($cmd get nodes -l node-role.kubernetes.io/master -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
+        [ -z "$master_nodes" ] && master_nodes=$($cmd get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
+        master_nodes_json=$(json_build_array "$master_nodes" false)
+
+        # Get worker nodes list
+        worker_nodes=$($cmd get nodes -o jsonpath='{range .items[?(!@.metadata.labels.node-role\.kubernetes\.io/master)]}{.metadata.name}{\"\n\"}{end}' 2>/dev/null)
+        [ -z "$worker_nodes" ] && worker_nodes=$($cmd get nodes -o jsonpath='{range .items[?(!@.metadata.labels.node-role\.kubernetes\.io/control-plane)]}{.metadata.name}{\"\n\"}{end}' 2>/dev/null)
+        worker_nodes_json=$(json_build_array "$worker_nodes" false)
+    fi
+
+    nodes_json=$(json_build_object \
+        "total_count" "$total_count" \
+        "master_count" "$master_count" \
+        "worker_count" "$worker_count" \
+        "master_nodes" "$master_nodes_json" \
+        "worker_nodes" "$worker_nodes_json")
+
+    # Workloads using kubectl
+    pod_count=0
+    service_count=0
+    deployment_count=0
+    daemonset_count=0
+    statefulset_count=0
+    namespace_count=0
+    namespaces_json="[]"
+    total_container_count=0
+    system_container_count=0
+    user_container_count=0
+
+    if command_exists kubectl || command_exists oc; then
+        cmd="kubectl"
+        command_exists oc && cmd="oc"
+
+        pod_count=$($cmd get pods --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        service_count=$($cmd get services --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        deployment_count=$($cmd get deployments --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        daemonset_count=$($cmd get daemonsets --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        statefulset_count=$($cmd get statefulsets --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        namespace_count=$($cmd get namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+
+        namespaces=$($cmd get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
+        namespaces_json=$(json_build_array "$namespaces" false)
+
+        # Container counts
+        if [ "$pod_count" -gt "0" ]; then
+            total_container_count=$($cmd get pods --all-namespaces -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l || echo "0")
+
+            # OpenShift system namespaces
+            for ns in openshift-apiserver openshift-authentication openshift-console openshift-dns openshift-etcd openshift-ingress openshift-monitoring openshift-operators kube-system kube-public kube-node-lease; do
+                ns_count=$($cmd get pods -n $ns -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l || echo "0")
+                system_container_count=$((system_container_count + ns_count))
+            done
+
+            user_container_count=$((total_container_count - system_container_count))
+        fi
+    fi
+
+    workloads_json=$(json_build_object \
+        "total_container_count" "$total_container_count" \
+        "system_container_count" "$system_container_count" \
+        "user_container_count" "$user_container_count" \
+        "pod_count" "$pod_count" \
+        "service_count" "$service_count" \
+        "deployment_count" "$deployment_count" \
+        "daemonset_count" "$daemonset_count" \
+        "statefulset_count" "$statefulset_count" \
+        "namespace_count" "$namespace_count" \
+        "namespaces" "$namespaces_json")
+
+    # Cluster components (similar to Kubernetes)
+    api_server_version=""
+    api_server_status="Unknown"
+    coredns_version=""
+    coredns_status="Unknown"
+    ingress_type="haproxy"
+    ingress_version=""
+    cni_type="ovn-kubernetes"
+    cni_version=""
+
+    if command_exists kubectl || command_exists oc; then
+        cmd="kubectl"
+        command_exists oc && cmd="oc"
+
+        # API server version from pods
+        api_server_version=$($cmd get pod -n openshift-apiserver -l app=openshift-apiserver -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+' || echo "")
+        [ -n "$api_server_version" ] && api_server_status="Running"
+
+        # CoreDNS status
+        coredns_pods=$($cmd get pods -n openshift-dns --no-headers 2>/dev/null | wc -l || echo "0")
+        [ "$coredns_pods" -gt "0" ] && coredns_status="Running"
+
+        # Detect CNI type
+        cni_pods=$($cmd get pods -n openshift-sdn 2>/dev/null | grep -c sdn || echo "0")
+        [ "$cni_pods" -gt "0" ] && cni_type="openshift-sdn"
+        cni_pods=$($cmd get pods -n openshift-ovn-kubernetes 2>/dev/null | grep -c ovn || echo "0")
+        [ "$cni_pods" -gt "0" ] && cni_type="ovn-kubernetes"
+    fi
+
+    cluster_components_json=$(json_build_object \
+        "api_server" "$(json_build_object 'version' \"$api_server_version\" 'status' \"$api_server_status\")" \
+        "coredns" "$(json_build_object 'version' \"$coredns_version\" 'status' \"$coredns_status\")" \
+        "ingress_controller" "$(json_build_object 'type' \"$ingress_type\" 'version' \"$ingress_version\")" \
+        "cni_plugin" "$(json_build_object 'type' \"$cni_type\" 'version' \"$cni_version\")" \
+        "csi_drivers" "[]")
+
+    # OpenShift-specific platform data
+    ocp_channel=$(try_command "oc get clusterversion -o jsonpath='{.items[0].spec.channel}' 2>/dev/null" || echo "")
+    infra_id=$(try_command "oc get infrastructure cluster -o jsonpath='{.status.infrastructureName}' 2>/dev/null" || echo "")
+    install_type=""  # Could be detected from config
+    project_count=0
+    route_count=0
+    build_config_count=0
+    operator_count=0
+
+    if command_exists oc; then
+        project_count=$(oc get projects --no-headers 2>/dev/null | wc -l || echo "0")
+        route_count=$(oc get routes --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        build_config_count=$(oc get buildconfig --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        operator_count=$(oc get csv --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+    fi
+
+    openshift_specific=$(json_build_object \
+        "ocp_version" "$ocp_version" \
+        "channel" "$ocp_channel" \
+        "cluster_id" "$cluster_id" \
+        "infra_id" "$infra_id" \
+        "install_type" "$install_type" \
+        "project_count" "$project_count" \
+        "route_count" "$route_count" \
+        "build_config_count" "$build_config_count" \
+        "operator_count" "$operator_count" \
+        "operator_hub_enabled" "false" \
+        "scc_count" "0" \
+        "cluster_operators_degraded" "0" \
+        "cluster_operators_available" "0")
+
+    platform_specific_json=$(json_build_object \
+        "swarm" "null" \
+        "kubernetes" "null" \
+        "openshift" "$openshift_specific" \
+        "tanzu" "null")
+
     # Resource usage - get from OpenShift control plane processes
     ocp_cpu_total=0
     ocp_mem_total=0
@@ -2270,6 +2456,10 @@ discover_openshift() {
     ocp_cpu_total=$(printf "%.2f" "$ocp_cpu_total" 2>/dev/null || echo "0")
     ocp_mem_total=$(printf "%.2f" "$ocp_mem_total" 2>/dev/null || echo "0")
 
+    resource_usage_json=$(json_build_object \
+        "cpu_cores" "$ocp_cpu_total" \
+        "memory_mb" "$ocp_mem_total")
+
     OPENSHIFT_JSON=$(json_build_object \
         "name" "openshift" \
         "orchestrator_type" "openshift" \
@@ -2277,12 +2467,12 @@ discover_openshift() {
         "cluster_id" "$cluster_id" \
         "cluster_name" "$cluster_name" \
         "state" "active" \
-        "current_node" "$(json_build_object 'node_id' '' 'role' 'worker' 'availability' 'Ready')" \
-        "nodes" "$(json_build_object 'total_count' '0' 'master_count' '0' 'worker_count' '0' 'master_nodes' '[]' 'worker_nodes' '[]')" \
-        "workloads" "$(json_build_object 'total_container_count' '0' 'system_container_count' '0' 'user_container_count' '0' 'pod_count' '0' 'service_count' '0' 'deployment_count' '0' 'daemonset_count' '0' 'statefulset_count' '0' 'namespace_count' '0' 'namespaces' '[]')" \
-        "cluster_components" "$(json_build_object 'api_server' '$(json_build_object \"version\" \"\" \"status\" \"\")' 'coredns' '$(json_build_object \"version\" \"\" \"status\" \"\")' 'ingress_controller' '$(json_build_object \"type\" \"\" \"version\" \"\")' 'cni_plugin' '$(json_build_object \"type\" \"\" \"version\" \"\")' 'csi_drivers' '[]')" \
-        "platform_specific" "$(json_build_object 'swarm' 'null' 'kubernetes' 'null' 'openshift' '$(json_build_object \"ocp_version\" \"$ocp_version\" \"channel\" \"\" \"cluster_id\" \"\" \"infra_id\" \"\" \"install_type\" \"\" \"project_count\" \"0\" \"route_count\" \"0\" \"build_config_count\" \"0\" \"operator_count\" \"0\" \"operator_hub_enabled\" \"false\" \"scc_count\" \"0\" \"cluster_operators_degraded\" \"0\" \"cluster_operators_available\" \"0\")' 'tanzu' 'null')" \
-        "resource_usage" "$(json_build_object 'cpu_cores' '$ocp_cpu_total' 'memory_mb' '$ocp_mem_total')")
+        "current_node" "$current_node_json" \
+        "nodes" "$nodes_json" \
+        "workloads" "$workloads_json" \
+        "cluster_components" "$cluster_components_json" \
+        "platform_specific" "$platform_specific_json" \
+        "resource_usage" "$resource_usage_json")
 
     log_info "OpenShift discovery completed"
 }
