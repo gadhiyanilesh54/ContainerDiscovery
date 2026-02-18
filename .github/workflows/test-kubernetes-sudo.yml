@@ -36,11 +36,11 @@ jobs:
         rm -f crictl-$VERSION-linux-amd64.tar.gz
 
         # Configure crictl to use containerd
-        sudo sh -c 'cat > /etc/crictl.yaml <<EOF
-runtime-endpoint: unix:///run/containerd/containerd.sock
-image-endpoint: unix:///run/containerd/containerd.sock
-timeout: 10
-EOF'
+        sudo sh -c 'cat > /etc/crictl.yaml <<'"'"'EOF'"'"'
+        runtime-endpoint: unix:///run/containerd/containerd.sock
+        image-endpoint: unix:///run/containerd/containerd.sock
+        timeout: 10
+        EOF'"'"
 
     - name: Install jq for JSON validation
       run: sudo apt-get update && sudo apt-get install -y jq
