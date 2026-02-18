@@ -43,6 +43,12 @@ jobs:
     - name: Run privileged test
       run: sudo ./test_privileged.sh
 
+    - name: Run comprehensive validation
+      run: ./test_validation_comprehensive.sh
+
+    - name: Run fallback mechanisms test
+      run: ./test_fallback_mechanisms.sh
+
     - name: Validate JSON output
       run: |
         if [ -f output.json ]; then
