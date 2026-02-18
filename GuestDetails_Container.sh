@@ -1045,14 +1045,26 @@ discover_containerd() {
     # Storage driver
     storage_driver="overlayfs"
     if [ -f /etc/containerd/config.toml ]; then
-        snap=$(grep snapshotter /etc/containerd/config.toml 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
+        if [ "$priv" = "root" ]; then
+            snap=$(grep snapshotter /etc/containerd/config.toml 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
+        elif [ "$priv" = "sudo" ]; then
+            snap=$(try_command "sudo cat /etc/containerd/config.toml 2>/dev/null | grep snapshotter | head -n1 | awk '{print \$3}' | tr -d '\"'")
+        else
+            snap=$(grep snapshotter /etc/containerd/config.toml 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
+        fi
         [ -n "$snap" ] && storage_driver="$snap"
     fi
 
     # Cgroup driver
     cgroup_driver="systemd"
     if [ -f /etc/containerd/config.toml ]; then
-        systemd_cgroup=$(grep SystemdCgroup /etc/containerd/config.toml 2>/dev/null | head -n1 | awk '{print $3}')
+        if [ "$priv" = "root" ]; then
+            systemd_cgroup=$(grep SystemdCgroup /etc/containerd/config.toml 2>/dev/null | head -n1 | awk '{print $3}')
+        elif [ "$priv" = "sudo" ]; then
+            systemd_cgroup=$(try_command "sudo cat /etc/containerd/config.toml 2>/dev/null | grep SystemdCgroup | head -n1 | awk '{print \$3}'")
+        else
+            systemd_cgroup=$(grep SystemdCgroup /etc/containerd/config.toml 2>/dev/null | head -n1 | awk '{print $3}')
+        fi
         if [ "$systemd_cgroup" = "false" ]; then
             cgroup_driver="cgroupfs"
         fi
@@ -1082,6 +1094,20 @@ $config_registries"
     fi
     registries_json=$(json_build_array "$registries" false)
 
+    # Rootless detection for containerd
+    rootless="false"
+    current_uid=$(id -u)
+    # Containerd is rootless if socket is in user directory or if running as non-root with user-specific socket
+    if [ "$current_uid" != "0" ] && [ -S "$HOME/.local/share/containerd/containerd.sock" ]; then
+        rootless="true"
+        socket="$HOME/.local/share/containerd/containerd.sock"
+        storage_root="$HOME/.local/share/containerd"
+    elif [ "$current_uid" != "0" ] && [ -S "/run/user/$current_uid/containerd/containerd.sock" ]; then
+        rootless="true"
+        socket="/run/user/$current_uid/containerd/containerd.sock"
+        storage_root="$HOME/.local/share/containerd"
+    fi
+
     # Containers (empty for now to keep script manageable)
     containers_json="[]"
     images_json="[]"
@@ -1094,7 +1120,7 @@ $config_registries"
         "socket" "$socket" \
         "storage_driver" "$storage_driver" \
         "storage_root" "$storage_root" \
-        "rootless" "false" \
+        "rootless" "$rootless" \
         "cgroup_driver" "$cgroup_driver" \
         "namespaces" "$namespaces_json" \
         "image_count" "$image_count" \
@@ -1258,24 +1284,53 @@ discover_crio() {
     # Storage root
     storage_root="/var/lib/containers/storage"
 
-    # Container counts
-    container_count=$(try_command "crictl ps -a -q 2>/dev/null | wc -l" || echo "0")
-    running_count=$(try_command "crictl ps -q 2>/dev/null | wc -l" || echo "0")
+    # Check privilege for crictl commands
+    priv=$(check_privilege)
 
-    # Image count
-    image_count=$(try_command "crictl images -q 2>/dev/null | wc -l" || echo "0")
+    # Container counts - use sudo for crictl commands
+    if [ "$priv" = "root" ]; then
+        container_count=$(try_command "crictl ps -a -q 2>/dev/null | wc -l" || echo "0")
+        running_count=$(try_command "crictl ps -q 2>/dev/null | wc -l" || echo "0")
+    elif [ "$priv" = "sudo" ]; then
+        container_count=$(try_command "sudo crictl ps -a -q 2>/dev/null | wc -l" || echo "0")
+        running_count=$(try_command "sudo crictl ps -q 2>/dev/null | wc -l" || echo "0")
+    else
+        container_count=$(try_command "crictl ps -a -q 2>/dev/null | wc -l" || echo "0")
+        running_count=$(try_command "crictl ps -q 2>/dev/null | wc -l" || echo "0")
+    fi
+
+    # Image count - use sudo for crictl commands
+    if [ "$priv" = "root" ]; then
+        image_count=$(try_command "crictl images -q 2>/dev/null | wc -l" || echo "0")
+    elif [ "$priv" = "sudo" ]; then
+        image_count=$(try_command "sudo crictl images -q 2>/dev/null | wc -l" || echo "0")
+    else
+        image_count=$(try_command "crictl images -q 2>/dev/null | wc -l" || echo "0")
+    fi
 
     # Storage driver
     storage_driver="overlay"
     if [ -f /etc/crio/crio.conf ]; then
-        driver=$(grep storage_driver /etc/crio/crio.conf 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
+        if [ "$priv" = "root" ]; then
+            driver=$(grep storage_driver /etc/crio/crio.conf 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
+        elif [ "$priv" = "sudo" ]; then
+            driver=$(try_command "sudo cat /etc/crio/crio.conf 2>/dev/null | grep storage_driver | head -n1 | awk '{print \$3}' | tr -d '\"'")
+        else
+            driver=$(grep storage_driver /etc/crio/crio.conf 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
+        fi
         [ -n "$driver" ] && storage_driver="$driver"
     fi
 
     # Cgroup driver
     cgroup_driver="systemd"
     if [ -f /etc/crio/crio.conf ]; then
-        cgm=$(grep cgroup_manager /etc/crio/crio.conf 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
+        if [ "$priv" = "root" ]; then
+            cgm=$(grep cgroup_manager /etc/crio/crio.conf 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
+        elif [ "$priv" = "sudo" ]; then
+            cgm=$(try_command "sudo cat /etc/crio/crio.conf 2>/dev/null | grep cgroup_manager | head -n1 | awk '{print \$3}' | tr -d '\"'")
+        else
+            cgm=$(grep cgroup_manager /etc/crio/crio.conf 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
+        fi
         [ -n "$cgm" ] && cgroup_driver="$cgm"
     fi
 
@@ -1300,6 +1355,20 @@ docker.io"
     namespaces="k8s.io"
     namespaces_json=$(json_build_array "$namespaces" false)
 
+    # Rootless detection for CRI-O
+    rootless="false"
+    current_uid=$(id -u)
+    # CRI-O is rootless if socket is in user directory or running as non-root with user-specific socket
+    if [ "$current_uid" != "0" ] && [ -S "/run/user/$current_uid/crio/crio.sock" ]; then
+        rootless="true"
+        socket="/run/user/$current_uid/crio/crio.sock"
+        storage_root="$HOME/.local/share/containers/storage"
+    elif [ "$current_uid" != "0" ] && [ ! -S "/var/run/crio/crio.sock" ] && [ -f "$HOME/.config/crio/crio.conf" ]; then
+        # If config exists in user directory, it's likely rootless
+        rootless="true"
+        storage_root="$HOME/.local/share/containers/storage"
+    fi
+
     # Containers and images
     containers_json="[]"
     images_json="[]"
@@ -1312,7 +1381,7 @@ docker.io"
         "socket" "$socket" \
         "storage_driver" "$storage_driver" \
         "storage_root" "$storage_root" \
-        "rootless" "false" \
+        "rootless" "$rootless" \
         "cgroup_driver" "$cgroup_driver" \
         "namespaces" "$namespaces_json" \
         "image_count" "$image_count" \
@@ -1537,28 +1606,78 @@ discover_docker_swarm() {
     # Current node
     node_id=$(try_command "docker info --format '{{.Swarm.NodeID}}' 2>/dev/null" || echo "")
 
+    # Get current node availability
+    node_availability="active"
+    if [ -n "$node_id" ] && [ "$node_role" = "manager" ]; then
+        node_availability=$(try_command "docker node inspect $node_id --format '{{.Spec.Availability}}' 2>/dev/null" || echo "active")
+    fi
+
     current_node_json=$(json_build_object \
         "node_id" "$node_id" \
         "role" "$node_role" \
-        "availability" "active")
+        "availability" "$node_availability")
 
-    # Node counts
+    # Node counts and arrays
     total_count=0
     master_count=0
     worker_count=0
+    master_nodes_json="[]"
+    worker_nodes_json="[]"
 
     if [ "$node_role" = "manager" ]; then
         total_count=$(try_command "docker node ls -q 2>/dev/null | wc -l" || echo "0")
         master_count=$(try_command "docker node ls --filter role=manager -q 2>/dev/null | wc -l" || echo "0")
         worker_count=$((total_count - master_count))
+
+        # Build master nodes array
+        master_nodes_data=$(try_command "docker node ls --filter role=manager --format '{{.Hostname}}|{{.ID}}|{{.Status}}' 2>/dev/null" || echo "")
+        if [ -n "$master_nodes_data" ]; then
+            master_nodes_list=""
+            while IFS='|' read -r hostname node_id status; do
+                [ -z "$hostname" ] && continue
+                node_obj=$(json_build_object \
+                    "name" "$hostname" \
+                    "node_id" "$node_id" \
+                    "status" "${status,,}")  # Convert to lowercase
+                if [ -z "$master_nodes_list" ]; then
+                    master_nodes_list="$node_obj"
+                else
+                    master_nodes_list="$master_nodes_list,$node_obj"
+                fi
+            done << EOF
+$master_nodes_data
+EOF
+            [ -n "$master_nodes_list" ] && master_nodes_json="[$master_nodes_list]"
+        fi
+
+        # Build worker nodes array
+        worker_nodes_data=$(try_command "docker node ls --filter role=worker --format '{{.Hostname}}|{{.ID}}|{{.Status}}' 2>/dev/null" || echo "")
+        if [ -n "$worker_nodes_data" ]; then
+            worker_nodes_list=""
+            while IFS='|' read -r hostname node_id status; do
+                [ -z "$hostname" ] && continue
+                node_obj=$(json_build_object \
+                    "name" "$hostname" \
+                    "node_id" "$node_id" \
+                    "status" "${status,,}")  # Convert to lowercase
+                if [ -z "$worker_nodes_list" ]; then
+                    worker_nodes_list="$node_obj"
+                else
+                    worker_nodes_list="$worker_nodes_list,$node_obj"
+                fi
+            done << EOF
+$worker_nodes_data
+EOF
+            [ -n "$worker_nodes_list" ] && worker_nodes_json="[$worker_nodes_list]"
+        fi
     fi
 
     nodes_json=$(json_build_object \
         "total_count" "$total_count" \
         "master_count" "$master_count" \
         "worker_count" "$worker_count" \
-        "master_nodes" "[]" \
-        "worker_nodes" "[]")
+        "master_nodes" "$master_nodes_json" \
+        "worker_nodes" "$worker_nodes_json")
 
     # Service count
     service_count=0
@@ -2125,6 +2244,194 @@ discover_openshift() {
     fi
     [ -z "$cluster_name" ] && cluster_name=""
 
+    # Current node information using kubectl
+    node_name=$(hostname)
+    node_role="worker"
+    node_status="Unknown"
+
+    if command_exists kubectl || command_exists oc; then
+        cmd="kubectl"
+        command_exists oc && cmd="oc"
+
+        # Get current node details
+        node_info=$($cmd get node "$node_name" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/master}{"|"}{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+        if [ -n "$node_info" ]; then
+            IFS='|' read -r role_label ready_status <<EOF
+$node_info
+EOF
+            [ -n "$role_label" ] && node_role="master"
+            [ "$ready_status" = "True" ] && node_status="Ready" || node_status="NotReady"
+        fi
+
+        # Check for control-plane label as well
+        control_plane=$($cmd get node "$node_name" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/control-plane}' 2>/dev/null || echo "")
+        [ -n "$control_plane" ] && node_role="master"
+    fi
+
+    current_node_json=$(json_build_object \
+        "node_id" "$node_name" \
+        "role" "$node_role" \
+        "availability" "$node_status")
+
+    # Node counts using kubectl
+    total_count=0
+    master_count=0
+    worker_count=0
+    master_nodes_json="[]"
+    worker_nodes_json="[]"
+
+    if command_exists kubectl || command_exists oc; then
+        cmd="kubectl"
+        command_exists oc && cmd="oc"
+
+        total_count=$($cmd get nodes --no-headers 2>/dev/null | wc -l || echo "0")
+        master_count=$($cmd get nodes -l node-role.kubernetes.io/master --no-headers 2>/dev/null | wc -l || echo "0")
+        [ "$master_count" = "0" ] && master_count=$($cmd get nodes -l node-role.kubernetes.io/control-plane --no-headers 2>/dev/null | wc -l || echo "0")
+        worker_count=$((total_count - master_count))
+
+        # Get master nodes list
+        master_nodes=$($cmd get nodes -l node-role.kubernetes.io/master -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
+        [ -z "$master_nodes" ] && master_nodes=$($cmd get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
+        master_nodes_json=$(json_build_array "$master_nodes" false)
+
+        # Get worker nodes list
+        worker_nodes=$($cmd get nodes -o jsonpath='{range .items[?(!@.metadata.labels.node-role\.kubernetes\.io/master)]}{.metadata.name}{\"\n\"}{end}' 2>/dev/null)
+        [ -z "$worker_nodes" ] && worker_nodes=$($cmd get nodes -o jsonpath='{range .items[?(!@.metadata.labels.node-role\.kubernetes\.io/control-plane)]}{.metadata.name}{\"\n\"}{end}' 2>/dev/null)
+        worker_nodes_json=$(json_build_array "$worker_nodes" false)
+    fi
+
+    nodes_json=$(json_build_object \
+        "total_count" "$total_count" \
+        "master_count" "$master_count" \
+        "worker_count" "$worker_count" \
+        "master_nodes" "$master_nodes_json" \
+        "worker_nodes" "$worker_nodes_json")
+
+    # Workloads using kubectl
+    pod_count=0
+    service_count=0
+    deployment_count=0
+    daemonset_count=0
+    statefulset_count=0
+    namespace_count=0
+    namespaces_json="[]"
+    total_container_count=0
+    system_container_count=0
+    user_container_count=0
+
+    if command_exists kubectl || command_exists oc; then
+        cmd="kubectl"
+        command_exists oc && cmd="oc"
+
+        pod_count=$($cmd get pods --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        service_count=$($cmd get services --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        deployment_count=$($cmd get deployments --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        daemonset_count=$($cmd get daemonsets --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        statefulset_count=$($cmd get statefulsets --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        namespace_count=$($cmd get namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+
+        namespaces=$($cmd get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
+        namespaces_json=$(json_build_array "$namespaces" false)
+
+        # Container counts
+        if [ "$pod_count" -gt "0" ]; then
+            total_container_count=$($cmd get pods --all-namespaces -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l || echo "0")
+
+            # OpenShift system namespaces
+            for ns in openshift-apiserver openshift-authentication openshift-console openshift-dns openshift-etcd openshift-ingress openshift-monitoring openshift-operators kube-system kube-public kube-node-lease; do
+                ns_count=$($cmd get pods -n $ns -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l || echo "0")
+                system_container_count=$((system_container_count + ns_count))
+            done
+
+            user_container_count=$((total_container_count - system_container_count))
+        fi
+    fi
+
+    workloads_json=$(json_build_object \
+        "total_container_count" "$total_container_count" \
+        "system_container_count" "$system_container_count" \
+        "user_container_count" "$user_container_count" \
+        "pod_count" "$pod_count" \
+        "service_count" "$service_count" \
+        "deployment_count" "$deployment_count" \
+        "daemonset_count" "$daemonset_count" \
+        "statefulset_count" "$statefulset_count" \
+        "namespace_count" "$namespace_count" \
+        "namespaces" "$namespaces_json")
+
+    # Cluster components (similar to Kubernetes)
+    api_server_version=""
+    api_server_status="Unknown"
+    coredns_version=""
+    coredns_status="Unknown"
+    ingress_type="haproxy"
+    ingress_version=""
+    cni_type="ovn-kubernetes"
+    cni_version=""
+
+    if command_exists kubectl || command_exists oc; then
+        cmd="kubectl"
+        command_exists oc && cmd="oc"
+
+        # API server version from pods
+        api_server_version=$($cmd get pod -n openshift-apiserver -l app=openshift-apiserver -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+' || echo "")
+        [ -n "$api_server_version" ] && api_server_status="Running"
+
+        # CoreDNS status
+        coredns_pods=$($cmd get pods -n openshift-dns --no-headers 2>/dev/null | wc -l || echo "0")
+        [ "$coredns_pods" -gt "0" ] && coredns_status="Running"
+
+        # Detect CNI type
+        cni_pods=$($cmd get pods -n openshift-sdn 2>/dev/null | grep -c sdn || echo "0")
+        [ "$cni_pods" -gt "0" ] && cni_type="openshift-sdn"
+        cni_pods=$($cmd get pods -n openshift-ovn-kubernetes 2>/dev/null | grep -c ovn || echo "0")
+        [ "$cni_pods" -gt "0" ] && cni_type="ovn-kubernetes"
+    fi
+
+    cluster_components_json=$(json_build_object \
+        "api_server" "$(json_build_object 'version' \"$api_server_version\" 'status' \"$api_server_status\")" \
+        "coredns" "$(json_build_object 'version' \"$coredns_version\" 'status' \"$coredns_status\")" \
+        "ingress_controller" "$(json_build_object 'type' \"$ingress_type\" 'version' \"$ingress_version\")" \
+        "cni_plugin" "$(json_build_object 'type' \"$cni_type\" 'version' \"$cni_version\")" \
+        "csi_drivers" "[]")
+
+    # OpenShift-specific platform data
+    ocp_channel=$(try_command "oc get clusterversion -o jsonpath='{.items[0].spec.channel}' 2>/dev/null" || echo "")
+    infra_id=$(try_command "oc get infrastructure cluster -o jsonpath='{.status.infrastructureName}' 2>/dev/null" || echo "")
+    install_type=""  # Could be detected from config
+    project_count=0
+    route_count=0
+    build_config_count=0
+    operator_count=0
+
+    if command_exists oc; then
+        project_count=$(oc get projects --no-headers 2>/dev/null | wc -l || echo "0")
+        route_count=$(oc get routes --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        build_config_count=$(oc get buildconfig --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        operator_count=$(oc get csv --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+    fi
+
+    openshift_specific=$(json_build_object \
+        "ocp_version" "$ocp_version" \
+        "channel" "$ocp_channel" \
+        "cluster_id" "$cluster_id" \
+        "infra_id" "$infra_id" \
+        "install_type" "$install_type" \
+        "project_count" "$project_count" \
+        "route_count" "$route_count" \
+        "build_config_count" "$build_config_count" \
+        "operator_count" "$operator_count" \
+        "operator_hub_enabled" "false" \
+        "scc_count" "0" \
+        "cluster_operators_degraded" "0" \
+        "cluster_operators_available" "0")
+
+    platform_specific_json=$(json_build_object \
+        "swarm" "null" \
+        "kubernetes" "null" \
+        "openshift" "$openshift_specific" \
+        "tanzu" "null")
+
     # Resource usage - get from OpenShift control plane processes
     ocp_cpu_total=0
     ocp_mem_total=0
@@ -2151,6 +2458,10 @@ discover_openshift() {
     ocp_cpu_total=$(printf "%.2f" "$ocp_cpu_total" 2>/dev/null || echo "0")
     ocp_mem_total=$(printf "%.2f" "$ocp_mem_total" 2>/dev/null || echo "0")
 
+    resource_usage_json=$(json_build_object \
+        "cpu_cores" "$ocp_cpu_total" \
+        "memory_mb" "$ocp_mem_total")
+
     OPENSHIFT_JSON=$(json_build_object \
         "name" "openshift" \
         "orchestrator_type" "openshift" \
@@ -2158,12 +2469,12 @@ discover_openshift() {
         "cluster_id" "$cluster_id" \
         "cluster_name" "$cluster_name" \
         "state" "active" \
-        "current_node" "$(json_build_object 'node_id' '' 'role' 'worker' 'availability' 'Ready')" \
-        "nodes" "$(json_build_object 'total_count' '0' 'master_count' '0' 'worker_count' '0' 'master_nodes' '[]' 'worker_nodes' '[]')" \
-        "workloads" "$(json_build_object 'total_container_count' '0' 'system_container_count' '0' 'user_container_count' '0' 'pod_count' '0' 'service_count' '0' 'deployment_count' '0' 'daemonset_count' '0' 'statefulset_count' '0' 'namespace_count' '0' 'namespaces' '[]')" \
-        "cluster_components" "$(json_build_object 'api_server' '$(json_build_object \"version\" \"\" \"status\" \"\")' 'coredns' '$(json_build_object \"version\" \"\" \"status\" \"\")' 'ingress_controller' '$(json_build_object \"type\" \"\" \"version\" \"\")' 'cni_plugin' '$(json_build_object \"type\" \"\" \"version\" \"\")' 'csi_drivers' '[]')" \
-        "platform_specific" "$(json_build_object 'swarm' 'null' 'kubernetes' 'null' 'openshift' '$(json_build_object \"ocp_version\" \"$ocp_version\" \"channel\" \"\" \"cluster_id\" \"\" \"infra_id\" \"\" \"install_type\" \"\" \"project_count\" \"0\" \"route_count\" \"0\" \"build_config_count\" \"0\" \"operator_count\" \"0\" \"operator_hub_enabled\" \"false\" \"scc_count\" \"0\" \"cluster_operators_degraded\" \"0\" \"cluster_operators_available\" \"0\")' 'tanzu' 'null')" \
-        "resource_usage" "$(json_build_object 'cpu_cores' '$ocp_cpu_total' 'memory_mb' '$ocp_mem_total')")
+        "current_node" "$current_node_json" \
+        "nodes" "$nodes_json" \
+        "workloads" "$workloads_json" \
+        "cluster_components" "$cluster_components_json" \
+        "platform_specific" "$platform_specific_json" \
+        "resource_usage" "$resource_usage_json")
 
     log_info "OpenShift discovery completed"
 }
@@ -2201,6 +2512,186 @@ discover_tanzu() {
     fi
     [ -z "$cluster_name" ] && cluster_name=""
 
+    # Current node information using kubectl
+    node_name=$(hostname)
+    node_role="worker"
+    node_status="Unknown"
+
+    if command_exists kubectl; then
+        # Get current node details
+        node_info=$(kubectl get node "$node_name" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/master}{"|"}{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+        if [ -n "$node_info" ]; then
+            IFS='|' read -r role_label ready_status <<EOF
+$node_info
+EOF
+            [ -n "$role_label" ] && node_role="control-plane"
+            [ "$ready_status" = "True" ] && node_status="Ready" || node_status="NotReady"
+        fi
+
+        # Check for control-plane label as well
+        control_plane=$(kubectl get node "$node_name" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/control-plane}' 2>/dev/null || echo "")
+        [ -n "$control_plane" ] && node_role="control-plane"
+    fi
+
+    current_node_json=$(json_build_object \
+        "node_id" "$node_name" \
+        "role" "$node_role" \
+        "availability" "$node_status")
+
+    # Node counts using kubectl
+    total_count=0
+    master_count=0
+    worker_count=0
+    master_nodes_json="[]"
+    worker_nodes_json="[]"
+
+    if command_exists kubectl; then
+        total_count=$(kubectl get nodes --no-headers 2>/dev/null | wc -l || echo "0")
+        master_count=$(kubectl get nodes -l node-role.kubernetes.io/master --no-headers 2>/dev/null | wc -l || echo "0")
+        [ "$master_count" = "0" ] && master_count=$(kubectl get nodes -l node-role.kubernetes.io/control-plane --no-headers 2>/dev/null | wc -l || echo "0")
+        worker_count=$((total_count - master_count))
+
+        # Get master nodes list
+        master_nodes=$(kubectl get nodes -l node-role.kubernetes.io/master -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
+        [ -z "$master_nodes" ] && master_nodes=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
+        master_nodes_json=$(json_build_array "$master_nodes" false)
+
+        # Get worker nodes list
+        worker_nodes=$(kubectl get nodes -o jsonpath='{range .items[?(!@.metadata.labels.node-role\.kubernetes\.io/master)]}{.metadata.name}{\"\n\"}{end}' 2>/dev/null)
+        [ -z "$worker_nodes" ] && worker_nodes=$(kubectl get nodes -o jsonpath='{range .items[?(!@.metadata.labels.node-role\.kubernetes\.io/control-plane)]}{.metadata.name}{\"\n\"}{end}' 2>/dev/null)
+        worker_nodes_json=$(json_build_array "$worker_nodes" false)
+    fi
+
+    nodes_json=$(json_build_object \
+        "total_count" "$total_count" \
+        "master_count" "$master_count" \
+        "worker_count" "$worker_count" \
+        "master_nodes" "$master_nodes_json" \
+        "worker_nodes" "$worker_nodes_json")
+
+    # Workloads using kubectl
+    pod_count=0
+    service_count=0
+    deployment_count=0
+    daemonset_count=0
+    statefulset_count=0
+    namespace_count=0
+    namespaces_json="[]"
+    total_container_count=0
+    system_container_count=0
+    user_container_count=0
+
+    if command_exists kubectl; then
+        pod_count=$(kubectl get pods --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        service_count=$(kubectl get services --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        deployment_count=$(kubectl get deployments --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        daemonset_count=$(kubectl get daemonsets --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        statefulset_count=$(kubectl get statefulsets --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+        namespace_count=$(kubectl get namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+
+        namespaces=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
+        namespaces_json=$(json_build_array "$namespaces" false)
+
+        # Container counts
+        if [ "$pod_count" -gt "0" ]; then
+            total_container_count=$(kubectl get pods --all-namespaces -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l || echo "0")
+
+            # Tanzu system namespaces
+            for ns in tkg-system tanzu-system tanzu-system-ingress kube-system kube-public kube-node-lease vmware-system-tmc; do
+                ns_count=$(kubectl get pods -n $ns -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l || echo "0")
+                system_container_count=$((system_container_count + ns_count))
+            done
+
+            user_container_count=$((total_container_count - system_container_count))
+        fi
+    fi
+
+    workloads_json=$(json_build_object \
+        "total_container_count" "$total_container_count" \
+        "system_container_count" "$system_container_count" \
+        "user_container_count" "$user_container_count" \
+        "pod_count" "$pod_count" \
+        "service_count" "$service_count" \
+        "deployment_count" "$deployment_count" \
+        "daemonset_count" "$daemonset_count" \
+        "statefulset_count" "$statefulset_count" \
+        "namespace_count" "$namespace_count" \
+        "namespaces" "$namespaces_json")
+
+    # Cluster components (similar to Kubernetes)
+    api_server_version=""
+    api_server_status="Unknown"
+    coredns_version=""
+    coredns_status="Unknown"
+    ingress_type="contour"
+    ingress_version=""
+    cni_type="antrea"
+    cni_version=""
+
+    if command_exists kubectl; then
+        # API server version from pods
+        api_server_version=$(kubectl get pod -n kube-system -l component=kube-apiserver -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+' || echo "")
+        [ -n "$api_server_version" ] && api_server_status="Running"
+
+        # CoreDNS detection
+        coredns_version=$(kubectl get deployment -n kube-system coredns -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | grep -oP ':\K[0-9.]+' || echo "")
+        coredns_pods=$(kubectl get pods -n kube-system -l k8s-app=kube-dns --no-headers 2>/dev/null | wc -l || echo "0")
+        [ "$coredns_pods" -gt "0" ] && coredns_status="Running"
+
+        # Detect ingress controller type
+        if kubectl get namespace tanzu-system-ingress >/dev/null 2>&1; then
+            contour_pods=$(kubectl get pods -n tanzu-system-ingress -l app=contour 2>/dev/null | grep -c contour || echo "0")
+            [ "$contour_pods" -gt "0" ] && ingress_type="contour"
+        fi
+
+        # Detect CNI type
+        antrea_pods=$(kubectl get pods -n kube-system -l app=antrea 2>/dev/null | grep -c antrea || echo "0")
+        [ "$antrea_pods" -gt "0" ] && cni_type="antrea"
+        calico_pods=$(kubectl get pods -n kube-system -l k8s-app=calico-node 2>/dev/null | grep -c calico || echo "0")
+        [ "$calico_pods" -gt "0" ] && cni_type="calico"
+    fi
+
+    cluster_components_json=$(json_build_object \
+        "api_server" "$(json_build_object 'version' \"$api_server_version\" 'status' \"$api_server_status\")" \
+        "coredns" "$(json_build_object 'version' \"$coredns_version\" 'status' \"$coredns_status\")" \
+        "ingress_controller" "$(json_build_object 'type' \"$ingress_type\" 'version' \"$ingress_version\")" \
+        "cni_plugin" "$(json_build_object 'type' \"$cni_type\" 'version' \"$cni_version\")" \
+        "csi_drivers" "[]")
+
+    # Tanzu-specific platform data
+    tkr_version=$(try_command "kubectl get tkr -o jsonpath='{.items[0].metadata.name}' 2>/dev/null" || echo "")
+    cluster_class=""
+    management_cluster=""
+    supervisor_cluster=""
+    vsphere_namespace=""
+    workload_cluster_count=0
+    infrastructure_provider="vsphere"
+    ceip_enabled="false"
+    pinniped_enabled="false"
+
+    if command_exists tanzu; then
+        workload_cluster_count=$(tanzu cluster list -o json 2>/dev/null | grep -c '"name"' || echo "0")
+        management_cluster=$(tanzu management-cluster get 2>/dev/null | grep 'NAME' | awk '{print $2}' || echo "")
+    fi
+
+    tanzu_specific=$(json_build_object \
+        "tkg_version" "$tkg_version" \
+        "tkr_version" "$tkr_version" \
+        "cluster_class" "$cluster_class" \
+        "management_cluster" "$management_cluster" \
+        "supervisor_cluster" "$supervisor_cluster" \
+        "vsphere_namespace" "$vsphere_namespace" \
+        "workload_cluster_count" "$workload_cluster_count" \
+        "infrastructure_provider" "$infrastructure_provider" \
+        "ceip_enabled" "$ceip_enabled" \
+        "pinniped_enabled" "$pinniped_enabled")
+
+    platform_specific_json=$(json_build_object \
+        "swarm" "null" \
+        "kubernetes" "null" \
+        "openshift" "null" \
+        "tanzu" "$tanzu_specific")
+
     # Resource usage - get from Tanzu control plane processes
     tanzu_cpu_total=0
     tanzu_mem_total=0
@@ -2227,6 +2718,10 @@ discover_tanzu() {
     tanzu_cpu_total=$(printf "%.2f" "$tanzu_cpu_total" 2>/dev/null || echo "0")
     tanzu_mem_total=$(printf "%.2f" "$tanzu_mem_total" 2>/dev/null || echo "0")
 
+    resource_usage_json=$(json_build_object \
+        "cpu_cores" "$tanzu_cpu_total" \
+        "memory_mb" "$tanzu_mem_total")
+
     TANZU_JSON=$(json_build_object \
         "name" "tanzu" \
         "orchestrator_type" "tanzu" \
@@ -2234,12 +2729,12 @@ discover_tanzu() {
         "cluster_id" "$cluster_id" \
         "cluster_name" "$cluster_name" \
         "state" "active" \
-        "current_node" "$(json_build_object 'node_id' '' 'role' 'worker' 'availability' 'Ready')" \
-        "nodes" "$(json_build_object 'total_count' '0' 'master_count' '0' 'worker_count' '0' 'master_nodes' '[]' 'worker_nodes' '[]')" \
-        "workloads" "$(json_build_object 'total_container_count' '0' 'system_container_count' '0' 'user_container_count' '0' 'pod_count' '0' 'service_count' '0' 'deployment_count' '0' 'daemonset_count' '0' 'statefulset_count' '0' 'namespace_count' '0' 'namespaces' '[]')" \
-        "cluster_components" "$(json_build_object 'api_server' '$(json_build_object \"version\" \"\" \"status\" \"\")' 'coredns' '$(json_build_object \"version\" \"\" \"status\" \"\")' 'ingress_controller' '$(json_build_object \"type\" \"\" \"version\" \"\")' 'cni_plugin' '$(json_build_object \"type\" \"\" \"version\" \"\")' 'csi_drivers' '[]')" \
-        "platform_specific" "$(json_build_object 'swarm' 'null' 'kubernetes' 'null' 'openshift' 'null' 'tanzu' '$(json_build_object \"tkg_version\" \"$tkg_version\" \"tkr_version\" \"\" \"cluster_class\" \"\" \"management_cluster\" \"\" \"supervisor_cluster\" \"\" \"vsphere_namespace\" \"\" \"workload_cluster_count\" \"0\" \"infrastructure_provider\" \"\" \"ceip_enabled\" \"false\" \"pinniped_enabled\" \"false\")')" \
-        "resource_usage" "$(json_build_object 'cpu_cores' '$tanzu_cpu_total' 'memory_mb' '$tanzu_mem_total')")
+        "current_node" "$current_node_json" \
+        "nodes" "$nodes_json" \
+        "workloads" "$workloads_json" \
+        "cluster_components" "$cluster_components_json" \
+        "platform_specific" "$platform_specific_json" \
+        "resource_usage" "$resource_usage_json")
 
     log_info "Tanzu discovery completed"
 }
