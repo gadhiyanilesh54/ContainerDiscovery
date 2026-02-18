@@ -1,0 +1,8 @@
+# Discovery script output files
+output.json
+error.txt
+debug.txt
+
+# Temporary files
+*.tmp
+*.temp
