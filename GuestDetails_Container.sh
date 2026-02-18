@@ -330,6 +330,19 @@ discover_host_info() {
 
 discover_disks() {
     if ! command_exists lsblk; then
+        # Fallback to using fdisk or other methods
+        if command_exists fdisk; then
+            disk_list=$(try_privileged_command "fdisk -l 2>/dev/null | grep '^Disk /dev/' | grep -v 'loop'" "")
+        fi
+        if [ -z "$disk_list" ]; then
+            echo "[]"
+            return
+        fi
+    else
+        disk_list=$(lsblk -dno NAME,SIZE 2>/dev/null | grep -v "^loop" | grep -v "^sr")
+    fi
+
+    if [ -z "$disk_list" ]; then
         echo "[]"
         return
     fi
@@ -337,22 +350,43 @@ discover_disks() {
     disks_json="["
     first=true
 
-    disk_list=$(lsblk -dno NAME,SIZE 2>/dev/null | grep -v "^loop" | grep -v "^sr")
-
-    echo "$disk_list" | while IFS= read -r line; do
+    # Use a while loop with process substitution to avoid subshell
+    while IFS= read -r line; do
         if [ -n "$line" ]; then
-            name=$(echo "$line" | awk '{print $1}')
-            size=$(echo "$line" | awk '{print $2}')
-            # Extract numeric part
-            size_num=$(echo "$size" | sed 's/[^0-9.]//g')
+            # Handle both lsblk and fdisk output
+            if echo "$line" | grep -q "^Disk /dev/"; then
+                # fdisk format: "Disk /dev/sda: 100 GiB, ..."
+                name=$(echo "$line" | sed 's|^Disk /dev/\([^:]*\):.*|\1|')
+                size=$(echo "$line" | sed 's|^Disk /dev/[^:]*: \([^ ]*\) \([^ ]*\).*|\1 \2|')
+                size_value=$(echo "$size" | awk '{print $1}')
+                size_unit=$(echo "$size" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
 
-            # Convert to GB
-            if echo "$size" | grep -qi "T"; then
-                size_gb=$(echo "scale=2; $size_num * 1024" | bc 2>/dev/null || echo "$size_num")
-            elif echo "$size" | grep -qi "M"; then
-                size_gb=$(echo "scale=2; $size_num / 1024" | bc 2>/dev/null || echo "0")
+                # Convert to GB
+                if [ "$size_unit" = "TIB" ] || [ "$size_unit" = "TB" ] || [ "$size_unit" = "T" ]; then
+                    size_gb=$(echo "scale=2; $size_value * 1024" | bc 2>/dev/null || echo "$size_value")
+                elif [ "$size_unit" = "MIB" ] || [ "$size_unit" = "MB" ] || [ "$size_unit" = "M" ]; then
+                    size_gb=$(echo "scale=2; $size_value / 1024" | bc 2>/dev/null || echo "0")
+                elif [ "$size_unit" = "GIB" ] || [ "$size_unit" = "GB" ] || [ "$size_unit" = "G" ]; then
+                    size_gb="$size_value"
+                else
+                    # Assume bytes, convert to GB
+                    size_gb=$(echo "scale=2; $size_value / 1073741824" | bc 2>/dev/null || echo "0")
+                fi
             else
-                size_gb="$size_num"
+                # lsblk format: "sda 100G"
+                name=$(echo "$line" | awk '{print $1}')
+                size=$(echo "$line" | awk '{print $2}')
+                # Extract numeric part
+                size_num=$(echo "$size" | sed 's/[^0-9.]//g')
+
+                # Convert to GB
+                if echo "$size" | grep -qi "T"; then
+                    size_gb=$(echo "scale=2; $size_num * 1024" | bc 2>/dev/null || echo "$size_num")
+                elif echo "$size" | grep -qi "M"; then
+                    size_gb=$(echo "scale=2; $size_num / 1024" | bc 2>/dev/null || echo "0")
+                else
+                    size_gb="$size_num"
+                fi
             fi
 
             if [ "$first" = false ]; then
@@ -361,7 +395,9 @@ discover_disks() {
             disks_json="$disks_json$(json_build_object "name" "$name" "size_gb" "${size_gb:-0}")"
             first=false
         fi
-    done
+    done <<EOF
+$disk_list
+EOF
 
     disks_json="$disks_json]"
     echo "$disks_json"
@@ -462,9 +498,11 @@ discover_ip_addresses() {
     first=true
 
     if command_exists ip; then
-        # Parse text output
+        # Parse text output - use heredoc to avoid subshell
         current_iface=""
-        ip addr show 2>/dev/null | while IFS= read -r line; do
+        ip_output=$(ip addr show 2>/dev/null)
+
+        while IFS= read -r line; do
             # Check for interface line
             if echo "$line" | grep -q "^[0-9]*:"; then
                 current_iface=$(echo "$line" | awk '{print $2}' | tr -d ':')
@@ -490,7 +528,9 @@ discover_ip_addresses() {
                     first=false
                 fi
             fi
-        done
+        done <<EOF
+$ip_output
+EOF
     fi
 
     ip_json="$ip_json]"
@@ -512,7 +552,7 @@ discover_dns_servers() {
     fi
 
     if [ -n "$dns_list" ]; then
-        echo "$dns_list" | while IFS= read -r dns; do
+        while IFS= read -r dns; do
             if [ -n "$dns" ]; then
                 if [ "$first" = false ]; then
                     dns_json="$dns_json,"
@@ -520,7 +560,9 @@ discover_dns_servers() {
                 dns_json="$dns_json\"$dns\""
                 first=false
             fi
-        done
+        done <<EOF
+$dns_list
+EOF
     fi
 
     dns_json="$dns_json]"
@@ -1020,8 +1062,25 @@ discover_docker_swarm() {
     # Swarm state
     swarm_state=$(try_command "docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null" || echo "inactive")
 
-    # Cluster ID
-    cluster_id=$(try_command "docker info --format '{{.Swarm.Cluster.ID}}' 2>/dev/null" || echo "")
+    # Cluster ID - with multiple fallbacks
+    cluster_id=$(try_command "docker info --format '{{.Swarm.Cluster.ID}}' 2>/dev/null")
+    if [ -z "$cluster_id" ]; then
+        # Fallback: try using socket API
+        cluster_id=$(try_privileged_command "curl -s --unix-socket /var/run/docker.sock http://localhost/info 2>/dev/null | grep -o '\"ClusterID\":\"[^\"]*\"' | cut -d'\"' -f4" "")
+    fi
+    if [ -z "$cluster_id" ]; then
+        # Fallback: try docker swarm info
+        cluster_id=$(try_command "docker system info 2>/dev/null | grep 'Cluster ID' | awk '{print \$3}'" || echo "")
+    fi
+    [ -z "$cluster_id" ] && cluster_id=""
+
+    # Cluster name - try to get from node labels or hostname
+    cluster_name=$(try_command "docker info --format '{{.Name}}' 2>/dev/null")
+    if [ -z "$cluster_name" ]; then
+        # Fallback: use hostname as cluster identifier
+        cluster_name=$(hostname 2>/dev/null || echo "")
+    fi
+    [ -z "$cluster_name" ] && cluster_name=""
 
     # Node role
     is_manager=$(try_command "docker info --format '{{.Swarm.ControlAvailable}}' 2>/dev/null")
@@ -1097,18 +1156,35 @@ discover_docker_swarm() {
         "openshift" "null" \
         "tanzu" "null")
 
-    # Resource usage
+    # Get Docker version for Swarm
+    swarm_version=$(try_command "docker version --format '{{.Server.Version}}' 2>/dev/null")
+    [ -z "$swarm_version" ] && swarm_version=""
+
+    # Resource usage - get from dockerd process
+    swarm_cpu=0
+    swarm_mem=0
+    dockerd_pid=$(get_pid "dockerd")
+    if [ -n "$dockerd_pid" ] && [ "$dockerd_pid" != "0" ]; then
+        cpu_mem=$(get_process_cpu_mem "$dockerd_pid")
+        swarm_cpu=$(echo "$cpu_mem" | awk '{print $1}')
+        swarm_mem=$(echo "$cpu_mem" | awk '{print $2}')
+    fi
+
+    # Format with 2 decimal places
+    swarm_cpu=$(printf "%.2f" "$swarm_cpu" 2>/dev/null || echo "0")
+    swarm_mem=$(printf "%.2f" "$swarm_mem" 2>/dev/null || echo "0")
+
     resource_usage_json=$(json_build_object \
-        "cpu_cores" "0" \
-        "memory_mb" "0")
+        "cpu_cores" "$swarm_cpu" \
+        "memory_mb" "$swarm_mem")
 
     # Build final JSON
     SWARM_JSON=$(json_build_object \
         "name" "docker_swarm" \
         "orchestrator_type" "docker-swarm" \
-        "version" "$DOCKER_VERSION" \
+        "version" "$swarm_version" \
         "cluster_id" "$cluster_id" \
-        "cluster_name" "" \
+        "cluster_name" "$cluster_name" \
         "state" "$swarm_state" \
         "current_node" "$current_node_json" \
         "nodes" "$nodes_json" \
@@ -1128,11 +1204,39 @@ discover_kubernetes() {
     [ -z "$version" ] && version=$(try_command "kubelet --version 2>/dev/null | awk '{print \$2}'")
     [ -z "$version" ] && version=""
 
-    # Cluster ID
-    cluster_id=$(try_command "kubectl get ns kube-system -o jsonpath='{.metadata.uid}' 2>/dev/null" || echo "")
+    # Cluster ID - with multiple fallbacks
+    cluster_id=$(try_command "kubectl get ns kube-system -o jsonpath='{.metadata.uid}' 2>/dev/null")
+    if [ -z "$cluster_id" ]; then
+        # Fallback: try to get from kubeadm config
+        cluster_id=$(try_privileged_command "cat /etc/kubernetes/admin.conf 2>/dev/null | grep cluster: | head -n1 | awk '{print \$2}'" "")
+    fi
+    if [ -z "$cluster_id" ]; then
+        # Fallback: try to get from kubelet config
+        cluster_id=$(try_command "cat /var/lib/kubelet/kubeadm-flags.env 2>/dev/null | grep -o 'cluster-name=[^ ]*' | cut -d= -f2" || echo "")
+    fi
+    if [ -z "$cluster_id" ]; then
+        # Fallback: check for k3s
+        if [ -d /var/lib/rancher/k3s ]; then
+            cluster_id=$(try_command "cat /var/lib/rancher/k3s/server/cred/cluster-id 2>/dev/null" || echo "")
+        fi
+    fi
+    [ -z "$cluster_id" ] && cluster_id=""
 
-    # Cluster name
-    cluster_name=$(try_command "kubectl config current-context 2>/dev/null" || echo "")
+    # Cluster name - with multiple fallbacks
+    cluster_name=$(try_command "kubectl config current-context 2>/dev/null")
+    if [ -z "$cluster_name" ]; then
+        # Fallback: try to get from kubeconfig
+        cluster_name=$(try_command "kubectl config view --minify -o jsonpath='{.clusters[0].name}' 2>/dev/null" || echo "")
+    fi
+    if [ -z "$cluster_name" ]; then
+        # Fallback: try to get from kubelet config
+        cluster_name=$(try_command "cat /var/lib/kubelet/kubeadm-flags.env 2>/dev/null | grep -o 'cluster-name=[^ ]*' | cut -d= -f2" || echo "")
+    fi
+    if [ -z "$cluster_name" ]; then
+        # Fallback: check hostname or domain
+        cluster_name=$(try_command "hostname -d 2>/dev/null | cut -d. -f1" || echo "")
+    fi
+    [ -z "$cluster_name" ] && cluster_name=""
 
     # State
     state="active"
@@ -1255,10 +1359,37 @@ discover_kubernetes() {
         "openshift" "null" \
         "tanzu" "null")
 
-    # Resource usage
+    # Resource usage - calculate from running components
+    k8s_cpu_total=0
+    k8s_mem_total=0
+
+    # Try to get resource usage from kubelet and kube-proxy
+    if command_exists pgrep; then
+        for proc_name in kubelet kube-proxy kube-apiserver kube-controller kube-scheduler etcd; do
+            pid=$(get_pid "$proc_name")
+            if [ -n "$pid" ] && [ "$pid" != "0" ]; then
+                cpu_mem=$(get_process_cpu_mem "$pid")
+                proc_cpu=$(echo "$cpu_mem" | awk '{print $1}')
+                proc_mem=$(echo "$cpu_mem" | awk '{print $2}')
+
+                # Add to totals (handle decimal addition)
+                if [ -n "$proc_cpu" ] && [ "$proc_cpu" != "0.0" ]; then
+                    k8s_cpu_total=$(echo "$k8s_cpu_total + $proc_cpu" | bc 2>/dev/null || echo "$k8s_cpu_total")
+                fi
+                if [ -n "$proc_mem" ] && [ "$proc_mem" != "0.0" ]; then
+                    k8s_mem_total=$(echo "$k8s_mem_total + $proc_mem" | bc 2>/dev/null || echo "$k8s_mem_total")
+                fi
+            fi
+        done
+    fi
+
+    # Format with 2 decimal places
+    k8s_cpu_total=$(printf "%.2f" "$k8s_cpu_total" 2>/dev/null || echo "0")
+    k8s_mem_total=$(printf "%.2f" "$k8s_mem_total" 2>/dev/null || echo "0")
+
     resource_usage_json=$(json_build_object \
-        "cpu_cores" "0" \
-        "memory_mb" "0")
+        "cpu_cores" "$k8s_cpu_total" \
+        "memory_mb" "$k8s_mem_total")
 
     # Build final JSON
     K8S_JSON=$(json_build_object \
@@ -1286,22 +1417,65 @@ discover_openshift() {
     [ -z "$ocp_version" ] && ocp_version=$(try_command "kubectl get clusterversion -o jsonpath='{.items[0].status.desired.version}' 2>/dev/null")
     [ -z "$ocp_version" ] && ocp_version=""
 
-    # For simplicity, create a minimal OpenShift entry
-    # Most fields would follow similar pattern to Kubernetes
+    # Cluster ID - with multiple fallbacks
+    cluster_id=$(try_command "oc get clusterversion -o jsonpath='{.items[0].spec.clusterID}' 2>/dev/null")
+    if [ -z "$cluster_id" ]; then
+        # Fallback: try to get from namespace
+        cluster_id=$(try_command "kubectl get ns openshift-apiserver -o jsonpath='{.metadata.uid}' 2>/dev/null" || echo "")
+    fi
+    [ -z "$cluster_id" ] && cluster_id=""
+
+    # Cluster name - with multiple fallbacks
+    cluster_name=$(try_command "oc get infrastructure cluster -o jsonpath='{.status.infrastructureName}' 2>/dev/null")
+    if [ -z "$cluster_name" ]; then
+        # Fallback: try current context
+        cluster_name=$(try_command "oc config current-context 2>/dev/null" || echo "")
+    fi
+    if [ -z "$cluster_name" ]; then
+        # Fallback: use hostname
+        cluster_name=$(hostname 2>/dev/null || echo "")
+    fi
+    [ -z "$cluster_name" ] && cluster_name=""
+
+    # Resource usage - get from OpenShift control plane processes
+    ocp_cpu_total=0
+    ocp_mem_total=0
+
+    if command_exists pgrep; then
+        for proc_name in openshift-apiserver openshift-controller hyperkube oc; do
+            pid=$(get_pid "$proc_name")
+            if [ -n "$pid" ] && [ "$pid" != "0" ]; then
+                cpu_mem=$(get_process_cpu_mem "$pid")
+                proc_cpu=$(echo "$cpu_mem" | awk '{print $1}')
+                proc_mem=$(echo "$cpu_mem" | awk '{print $2}')
+
+                if [ -n "$proc_cpu" ] && [ "$proc_cpu" != "0.0" ]; then
+                    ocp_cpu_total=$(echo "$ocp_cpu_total + $proc_cpu" | bc 2>/dev/null || echo "$ocp_cpu_total")
+                fi
+                if [ -n "$proc_mem" ] && [ "$proc_mem" != "0.0" ]; then
+                    ocp_mem_total=$(echo "$ocp_mem_total + $proc_mem" | bc 2>/dev/null || echo "$ocp_mem_total")
+                fi
+            fi
+        done
+    fi
+
+    # Format with 2 decimal places
+    ocp_cpu_total=$(printf "%.2f" "$ocp_cpu_total" 2>/dev/null || echo "0")
+    ocp_mem_total=$(printf "%.2f" "$ocp_mem_total" 2>/dev/null || echo "0")
 
     OPENSHIFT_JSON=$(json_build_object \
         "name" "openshift" \
         "orchestrator_type" "openshift" \
         "version" "$ocp_version" \
-        "cluster_id" "" \
-        "cluster_name" "" \
+        "cluster_id" "$cluster_id" \
+        "cluster_name" "$cluster_name" \
         "state" "active" \
         "current_node" "$(json_build_object 'node_id' '' 'role' 'worker' 'availability' 'Ready')" \
         "nodes" "$(json_build_object 'total_count' '0' 'master_count' '0' 'worker_count' '0' 'master_nodes' '[]' 'worker_nodes' '[]')" \
         "workloads" "$(json_build_object 'total_container_count' '0' 'system_container_count' '0' 'user_container_count' '0' 'pod_count' '0' 'service_count' '0' 'deployment_count' '0' 'daemonset_count' '0' 'statefulset_count' '0' 'namespace_count' '0' 'namespaces' '[]')" \
         "cluster_components" "$(json_build_object 'api_server' '$(json_build_object \"version\" \"\" \"status\" \"\")' 'coredns' '$(json_build_object \"version\" \"\" \"status\" \"\")' 'ingress_controller' '$(json_build_object \"type\" \"\" \"version\" \"\")' 'cni_plugin' '$(json_build_object \"type\" \"\" \"version\" \"\")' 'csi_drivers' '[]')" \
         "platform_specific" "$(json_build_object 'swarm' 'null' 'kubernetes' 'null' 'openshift' '$(json_build_object \"ocp_version\" \"$ocp_version\" \"channel\" \"\" \"cluster_id\" \"\" \"infra_id\" \"\" \"install_type\" \"\" \"project_count\" \"0\" \"route_count\" \"0\" \"build_config_count\" \"0\" \"operator_count\" \"0\" \"operator_hub_enabled\" \"false\" \"scc_count\" \"0\" \"cluster_operators_degraded\" \"0\" \"cluster_operators_available\" \"0\")' 'tanzu' 'null')" \
-        "resource_usage" "$(json_build_object 'cpu_cores' '0' 'memory_mb' '0')")
+        "resource_usage" "$(json_build_object 'cpu_cores' '$ocp_cpu_total' 'memory_mb' '$ocp_mem_total')")
 
     log_info "OpenShift discovery completed"
 }
@@ -1313,21 +1487,65 @@ discover_tanzu() {
     tkg_version=$(try_command "tanzu version 2>/dev/null | grep version | awk '{print \$2}'")
     [ -z "$tkg_version" ] && tkg_version=""
 
-    # For simplicity, create a minimal Tanzu entry
+    # Cluster ID - with multiple fallbacks
+    cluster_id=$(try_command "kubectl get cluster -o jsonpath='{.items[0].metadata.uid}' 2>/dev/null")
+    if [ -z "$cluster_id" ]; then
+        # Fallback: try to get from namespace
+        cluster_id=$(try_command "kubectl get ns tkg-system -o jsonpath='{.metadata.uid}' 2>/dev/null" || echo "")
+    fi
+    [ -z "$cluster_id" ] && cluster_id=""
+
+    # Cluster name - with multiple fallbacks
+    cluster_name=$(try_command "kubectl get cluster -o jsonpath='{.items[0].metadata.name}' 2>/dev/null")
+    if [ -z "$cluster_name" ]; then
+        # Fallback: try current context
+        cluster_name=$(try_command "kubectl config current-context 2>/dev/null" || echo "")
+    fi
+    if [ -z "$cluster_name" ]; then
+        # Fallback: check for tanzu config
+        cluster_name=$(try_command "tanzu cluster list -o json 2>/dev/null | grep -o '\"name\":\"[^\"]*\"' | head -n1 | cut -d'\"' -f4" || echo "")
+    fi
+    [ -z "$cluster_name" ] && cluster_name=""
+
+    # Resource usage - get from Tanzu control plane processes
+    tanzu_cpu_total=0
+    tanzu_mem_total=0
+
+    if command_exists pgrep; then
+        for proc_name in tanzu kapp-controller; do
+            pid=$(get_pid "$proc_name")
+            if [ -n "$pid" ] && [ "$pid" != "0" ]; then
+                cpu_mem=$(get_process_cpu_mem "$pid")
+                proc_cpu=$(echo "$cpu_mem" | awk '{print $1}')
+                proc_mem=$(echo "$cpu_mem" | awk '{print $2}')
+
+                if [ -n "$proc_cpu" ] && [ "$proc_cpu" != "0.0" ]; then
+                    tanzu_cpu_total=$(echo "$tanzu_cpu_total + $proc_cpu" | bc 2>/dev/null || echo "$tanzu_cpu_total")
+                fi
+                if [ -n "$proc_mem" ] && [ "$proc_mem" != "0.0" ]; then
+                    tanzu_mem_total=$(echo "$tanzu_mem_total + $proc_mem" | bc 2>/dev/null || echo "$tanzu_mem_total")
+                fi
+            fi
+        done
+    fi
+
+    # Format with 2 decimal places
+    tanzu_cpu_total=$(printf "%.2f" "$tanzu_cpu_total" 2>/dev/null || echo "0")
+    tanzu_mem_total=$(printf "%.2f" "$tanzu_mem_total" 2>/dev/null || echo "0")
 
     TANZU_JSON=$(json_build_object \
         "name" "tanzu" \
         "orchestrator_type" "tanzu" \
         "version" "$tkg_version" \
-        "cluster_id" "" \
-        "cluster_name" "" \
+        "cluster_id" "$cluster_id" \
+        "cluster_name" "$cluster_name" \
         "state" "active" \
         "current_node" "$(json_build_object 'node_id' '' 'role' 'worker' 'availability' 'Ready')" \
         "nodes" "$(json_build_object 'total_count' '0' 'master_count' '0' 'worker_count' '0' 'master_nodes' '[]' 'worker_nodes' '[]')" \
         "workloads" "$(json_build_object 'total_container_count' '0' 'system_container_count' '0' 'user_container_count' '0' 'pod_count' '0' 'service_count' '0' 'deployment_count' '0' 'daemonset_count' '0' 'statefulset_count' '0' 'namespace_count' '0' 'namespaces' '[]')" \
         "cluster_components" "$(json_build_object 'api_server' '$(json_build_object \"version\" \"\" \"status\" \"\")' 'coredns' '$(json_build_object \"version\" \"\" \"status\" \"\")' 'ingress_controller' '$(json_build_object \"type\" \"\" \"version\" \"\")' 'cni_plugin' '$(json_build_object \"type\" \"\" \"version\" \"\")' 'csi_drivers' '[]')" \
         "platform_specific" "$(json_build_object 'swarm' 'null' 'kubernetes' 'null' 'openshift' 'null' 'tanzu' '$(json_build_object \"tkg_version\" \"$tkg_version\" \"tkr_version\" \"\" \"cluster_class\" \"\" \"management_cluster\" \"\" \"supervisor_cluster\" \"\" \"vsphere_namespace\" \"\" \"workload_cluster_count\" \"0\" \"infrastructure_provider\" \"\" \"ceip_enabled\" \"false\" \"pinniped_enabled\" \"false\")')" \
-        "resource_usage" "$(json_build_object 'cpu_cores' '0' 'memory_mb' '0')")
+        "resource_usage" "$(json_build_object 'cpu_cores' '$tanzu_cpu_total' 'memory_mb' '$tanzu_mem_total')")
 
     log_info "Tanzu discovery completed"
 }
