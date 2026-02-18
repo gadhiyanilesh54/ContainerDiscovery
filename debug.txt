@@ -1,45 +1,18 @@
-[2026-02-18T17:16:24Z] [INFO] ===== Container Discovery Script Started =====
-[2026-02-18T17:16:24Z] [INFO] Script version: 7.0.0
-[2026-02-18T17:16:24Z] [INFO] Timestamp: 2026-02-18T17:16:24Z
-[2026-02-18T17:16:25Z] [INFO] Running as user: runner
-[2026-02-18T17:16:25Z] [INFO] Privilege level: sudo
-[2026-02-18T17:16:25Z] [INFO] Discovering host information...
-[2026-02-18T17:16:25Z] [DEBUG] Executing: hostname
-[2026-02-18T17:16:25Z] [DEBUG] Executing: hostname -f
-[2026-02-18T17:16:25Z] [DEBUG] Executing: uname -r
-[2026-02-18T17:16:25Z] [DEBUG] Executing: uname -m
-[2026-02-18T17:16:25Z] [DEBUG] Executing: nproc
-[2026-02-18T17:16:25Z] [DEBUG] Executing: grep 'model name' /proc/cpuinfo | head -n1 | cut -d':' -f2 | sed 's/^[ 	]*//'
-[2026-02-18T17:16:25Z] [INFO] Host info discovered: runnervmjduv7 (Ubuntu 24.04.3 LTS, x86_64)
-[2026-02-18T17:16:25Z] [INFO] Discovering hypervisor...
-[2026-02-18T17:16:25Z] [DEBUG] Executing: systemd-detect-virt
-[2026-02-18T17:16:25Z] [INFO] Hypervisor detected: hyperv
-[2026-02-18T17:16:25Z] [INFO] Discovering network information...
-[2026-02-18T17:16:25Z] [DEBUG] Executing: ip route | grep default | awk '{print $3}' | head -n1
-[2026-02-18T17:16:25Z] [INFO] Network discovery completed
-[2026-02-18T17:16:25Z] [INFO] Detecting container runtimes...
-[2026-02-18T17:16:25Z] [INFO] containerd detected
-[2026-02-18T17:16:25Z] [INFO] Discovering containerd...
-[2026-02-18T17:16:25Z] [DEBUG] Executing: containerd --version 2>/dev/null | awk '{print $3}' | sed 's/^v//'
-[2026-02-18T17:16:25Z] [DEBUG] Executing: sudo ctr namespaces list -q
-[2026-02-18T17:16:25Z] [DEBUG] Executing: ctr -n moby containers list -q 2>/dev/null | wc -l
-[2026-02-18T17:16:25Z] [DEBUG] Executing: ctr -n moby tasks list -q 2>/dev/null | wc -l
-[2026-02-18T17:16:25Z] [DEBUG] Executing: ctr -n moby images list -q 2>/dev/null | wc -l
-[2026-02-18T17:16:25Z] [DEBUG] Executing: crictl --version 2>/dev/null | awk \"{print \\$3}\"
-[2026-02-18T17:16:25Z] [DEBUG] Command failed or returned empty: crictl --version 2>/dev/null | awk \"{print \\$3}\"
-[2026-02-18T17:16:25Z] [INFO] containerd discovery completed: 0 containers, 0 running
-[2026-02-18T17:16:25Z] [INFO] Docker detected
-[2026-02-18T17:16:25Z] [INFO] Discovering Docker...
-[2026-02-18T17:16:25Z] [DEBUG] Executing: docker version --format '{{.Server.Version}}' 2>/dev/null
-[2026-02-18T17:16:25Z] [DEBUG] Executing: sudo docker info --format json
-[2026-02-18T17:16:25Z] [DEBUG] Executing: docker ps -aq 2>/dev/null | wc -l
-[2026-02-18T17:16:25Z] [DEBUG] Executing: docker ps -q 2>/dev/null | wc -l
-[2026-02-18T17:16:25Z] [INFO] Docker discovery completed: 0 containers, 0 running
-[2026-02-18T17:16:25Z] [INFO] Podman detected
-[2026-02-18T17:16:25Z] [INFO] Discovering Podman...
-[2026-02-18T17:16:25Z] [DEBUG] Executing: podman version --format '{{.Server.Version}}' 2>/dev/null
-[2026-02-18T17:16:25Z] [DEBUG] Executing: podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null
-[2026-02-18T17:16:26Z] [DEBUG] Executing: podman ps -a -q 2>/dev/null | wc -l
-[2026-02-18T17:16:26Z] [DEBUG] Executing: podman ps -q 2>/dev/null | wc -l
-[2026-02-18T17:16:26Z] [DEBUG] Executing: podman images -q 2>/dev/null | wc -l
-[2026-02-18T17:16:26Z] [DEBUG] Executing: podman info --format '{{.Store.GraphDriverName}}' 2>/dev/null
+[2026-02-18T17:17:49Z] [INFO] ===== Container Discovery Script Started =====
+[2026-02-18T17:17:49Z] [INFO] Script version: 7.0.0
+[2026-02-18T17:17:49Z] [INFO] Timestamp: 2026-02-18T17:17:49Z
+[2026-02-18T17:17:49Z] [INFO] Running as user: runner
+[2026-02-18T17:17:49Z] [INFO] Privilege level: sudo
+[2026-02-18T17:17:49Z] [INFO] Discovering host information...
+[2026-02-18T17:17:49Z] [DEBUG] Executing: hostname
+[2026-02-18T17:17:49Z] [DEBUG] Executing: hostname -f
+[2026-02-18T17:17:49Z] [DEBUG] Executing: uname -r
+[2026-02-18T17:17:49Z] [DEBUG] Executing: uname -m
+[2026-02-18T17:17:49Z] [DEBUG] Executing: nproc
+[2026-02-18T17:17:49Z] [DEBUG] Executing: grep 'model name' /proc/cpuinfo | head -n1 | cut -d':' -f2 | sed 's/^[ 	]*//'
+[2026-02-18T17:17:49Z] [INFO] Host info discovered: runnervmjduv7 (Ubuntu 24.04.3 LTS, x86_64)
+[2026-02-18T17:17:49Z] [INFO] Discovering hypervisor...
+[2026-02-18T17:17:49Z] [DEBUG] Executing: systemd-detect-virt
+[2026-02-18T17:17:49Z] [INFO] Hypervisor detected: hyperv
+[2026-02-18T17:17:49Z] [INFO] Discovering network information...
+[2026-02-18T17:17:50Z] [DEBUG] Executing: ip route | grep default | awk '{print $3}' | head -n1
