@@ -94,15 +94,32 @@ The script generates three files in its directory:
 
 ### Testing
 
-The repository includes test scripts for both privileged and unprivileged execution:
+The repository includes comprehensive test scripts for validation:
 
 ```bash
-# Test with privileged access (requires sudo/root)
+# Basic tests with privileged access (requires sudo/root)
+sudo ./GuestDetails_Container.sh
 sudo ./test_privileged.sh
 
-# Test without privileges (run as normal user)
+# Basic tests without privileges (run as normal user)
+./GuestDetails_Container.sh
 ./test_unprivileged.sh
+
+# Comprehensive validation tests (after running GuestDetails_Container.sh)
+./test_validation_comprehensive.sh   # Validates output consistency
+./test_fallback_mechanisms.sh        # Validates fallback logic
+./test_kubernetes_fields.sh          # Validates Kubernetes-specific fields (if K8s is running)
 ```
+
+#### Test Scripts
+
+| Script | Purpose | Requirements |
+|--------|---------|--------------|
+| `test_privileged.sh` | Basic validation with sudo | sudo/root access |
+| `test_unprivileged.sh` | Basic validation without sudo | Normal user |
+| `test_validation_comprehensive.sh` | Cross-field validation, hardcoded value checks, error filtering | jq, output.json |
+| `test_fallback_mechanisms.sh` | Validates fallback detection methods | jq, debug.txt |
+| `test_kubernetes_fields.sh` | Kubernetes node/workload validation | jq, Kubernetes cluster |
 
 ## Output Format
 
@@ -312,6 +329,20 @@ This script outputs JSON conforming to:
 - Schema definition: `schema.json`
 - Enum reference: `schema_reference.md`
 - Requirements: `prompt.md`
+- **Validation Report**: `VALIDATION_REPORT.md` - Comprehensive validation results
+
+## Validation
+
+The script has been thoroughly validated for:
+- ✅ All container runtimes (containerd, dockerd, crio, podman) detection
+- ✅ All orchestrators (Kubernetes, Docker Swarm, OpenShift, Tanzu) detection
+- ✅ Fallback mechanisms when primary detection fails
+- ✅ Privilege degradation (root, sudo, no privileges)
+- ✅ No hardcoded values in dynamic output
+- ✅ Cross-field consistency validation
+- ✅ Error message filtering
+
+See `VALIDATION_REPORT.md` for detailed validation results.
 
 ## License
 

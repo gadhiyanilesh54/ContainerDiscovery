@@ -107,6 +107,13 @@ jobs:
       if: matrix.environment == 'kubernetes' && matrix.privilege == 'sudo'
       run: ./test_kubernetes_fields.sh
 
+    - name: Run comprehensive validation
+      if: matrix.privilege == 'sudo'
+      run: ./test_validation_comprehensive.sh
+
+    - name: Run fallback mechanisms test
+      run: ./test_fallback_mechanisms.sh
+
     - name: Validate Kubernetes detection
       if: matrix.environment == 'kubernetes' && matrix.privilege == 'sudo'
       run: |
