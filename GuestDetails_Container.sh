@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env sh
 # GuestDetails_Container.sh — Container & Orchestrator Discovery Script
 # Schema Version: 7.0.0
 # Description: Production-grade POSIX-compatible shell script to discover container runtimes
