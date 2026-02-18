@@ -254,29 +254,276 @@ json_build_array() {
 
 # Get listening ports for a process/service
 get_listening_ports() {
-    process_name="$1"
+    service_name="$1"
     ports_json="["
     first=true
+    port_lines=""
 
-    # Try to get ports using ss (modern tool)
-    if command_exists ss; then
-        # Get listening TCP and UDP ports for the process
-        port_lines=$(ss -tlnp 2>/dev/null | grep "$process_name" | awk '{print $4}' | sed 's/.*://g' | sort -u)
-        if [ -z "$port_lines" ]; then
-            port_lines=$(ss -ulnp 2>/dev/null | grep "$process_name" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+    log_debug "get_listening_ports: discovering ports for service '$service_name'"
+
+    # Step 1: Collect all PIDs related to this service
+    all_pids=""
+
+    # Method A: Get MainPID from systemd (most reliable for services)
+    if command_exists systemctl; then
+        main_pid=$(systemctl show -p MainPID "$service_name" 2>/dev/null | cut -d= -f2)
+        if [ -n "$main_pid" ] && [ "$main_pid" != "0" ]; then
+            all_pids="$main_pid"
+            # Also get child processes
+            if command_exists pgrep; then
+                child_pids=$(pgrep -P "$main_pid" 2>/dev/null | tr '\n' ' ')
+                all_pids="$all_pids $child_pids"
+            fi
+            log_debug "  systemctl MainPID=$main_pid, children: $child_pids"
         fi
-    # Fallback to netstat
-    elif command_exists netstat; then
-        port_lines=$(netstat -tlnp 2>/dev/null | grep "$process_name" | awk '{print $4}' | sed 's/.*://g' | sort -u)
-        if [ -z "$port_lines" ]; then
-            port_lines=$(netstat -ulnp 2>/dev/null | grep "$process_name" | awk '{print $4}' | sed 's/.*://g' | sort -u)
-        fi
-    # Last resort: use lsof if available
-    elif command_exists lsof; then
-        port_lines=$(lsof -i -P -n 2>/dev/null | grep "$process_name" | grep LISTEN | awk '{print $9}' | sed 's/.*://g' | sort -u)
     fi
 
-    # Build JSON array of port numbers
+    # Method B: Map service name to known daemon process names and pgrep them
+    daemon_names="$service_name"
+    case "$service_name" in
+        docker)     daemon_names="docker dockerd docker-proxy" ;;
+        containerd) daemon_names="containerd containerd-shim containerd-shim-runc-v2" ;;
+        podman)     daemon_names="podman conmon" ;;
+        crio)       daemon_names="crio conmon" ;;
+        kubelet)    daemon_names="kubelet kube-proxy" ;;
+    esac
+
+    if command_exists pgrep; then
+        for dname in $daemon_names; do
+            dpids=$(pgrep -x "$dname" 2>/dev/null | tr '\n' ' ')
+            all_pids="$all_pids $dpids"
+        done
+    fi
+    if command_exists pidof; then
+        for dname in $daemon_names; do
+            dpids=$(pidof "$dname" 2>/dev/null | tr ' ' ' ')
+            all_pids="$all_pids $dpids"
+        done
+    fi
+
+    # Method C: Broader pattern match (e.g. "dockerd" contains "docker")
+    if command_exists pgrep; then
+        fpids=$(pgrep -f "^${service_name}" 2>/dev/null | tr '\n' ' ')
+        all_pids="$all_pids $fpids"
+    fi
+
+    # Deduplicate PIDs
+    all_pids=$(echo "$all_pids" | tr ' ' '\n' | grep -v '^$' | grep -v '^0$' | sort -un | tr '\n' ' ')
+    log_debug "  all PIDs for '$service_name': $all_pids"
+
+    # Build grep patterns from daemon names and PIDs
+    grep_pattern=""
+    for dn in $daemon_names; do
+        if [ -z "$grep_pattern" ]; then
+            grep_pattern="$dn"
+        else
+            grep_pattern="$grep_pattern\\|$dn"
+        fi
+    done
+    for pid in $all_pids; do
+        grep_pattern="$grep_pattern\\|pid=$pid\\|,$pid,"
+    done
+
+    # Step 2: Dynamic port discovery — try ss (both TCP and UDP)
+    if command_exists ss; then
+        tcp_ports=$(ss -tlnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+        udp_ports=$(ss -ulnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+        port_lines=$(printf '%s\n%s' "$tcp_ports" "$udp_ports" | grep -v '^$' | sort -un)
+        log_debug "  ss found ports: $port_lines"
+    fi
+
+    # Also try with sudo if we have privilege and ss returned nothing
+    if [ -z "$port_lines" ] && command_exists ss; then
+        priv=$(check_privilege)
+        if [ "$priv" = "root" ] || [ "$priv" = "sudo" ]; then
+            prefix=""
+            [ "$priv" = "sudo" ] && prefix="sudo"
+            tcp_ports=$($prefix ss -tlnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+            udp_ports=$($prefix ss -ulnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+            port_lines=$(printf '%s\n%s' "$tcp_ports" "$udp_ports" | grep -v '^$' | sort -un)
+            log_debug "  ss (privileged) found ports: $port_lines"
+        fi
+    fi
+
+    # Step 3: Fallback to netstat
+    if [ -z "$port_lines" ] && command_exists netstat; then
+        tcp_ports=$(netstat -tlnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+        udp_ports=$(netstat -ulnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+        port_lines=$(printf '%s\n%s' "$tcp_ports" "$udp_ports" | grep -v '^$' | sort -un)
+        log_debug "  netstat found ports: $port_lines"
+    fi
+
+    # Step 4: Fallback to lsof
+    if [ -z "$port_lines" ] && command_exists lsof; then
+        port_lines=$(lsof -i -P -n 2>/dev/null | grep -i "$grep_pattern" | grep LISTEN | awk '{print $9}' | sed 's/.*://g' | sort -u)
+        log_debug "  lsof found ports: $port_lines"
+    fi
+
+    # Step 5: PID-based /proc/net/tcp fallback
+    if [ -z "$port_lines" ] && [ -n "$all_pids" ]; then
+        proc_ports=""
+        for pid in $all_pids; do
+            if [ -d "/proc/$pid/fd" ]; then
+                socket_inodes=$(ls -l /proc/$pid/fd 2>/dev/null | grep 'socket:\[' | sed 's/.*socket:\[\([0-9]*\)\]/\1/')
+                if [ -n "$socket_inodes" ]; then
+                    for net_file in /proc/net/tcp /proc/net/tcp6; do
+                        [ -f "$net_file" ] || continue
+                        while IFS= read -r line; do
+                            echo "$line" | grep -q "local_address" && continue
+                            state=$(echo "$line" | awk '{print $4}')
+                            [ "$state" = "0A" ] || continue  # 0A = LISTEN
+                            inode=$(echo "$line" | awk '{print $10}')
+                            if echo "$socket_inodes" | grep -qw "$inode"; then
+                                hex_port=$(echo "$line" | awk '{print $2}' | sed 's/.*://')
+                                dec_port=$(printf '%d' "0x$hex_port" 2>/dev/null)
+                                [ -n "$dec_port" ] && [ "$dec_port" -gt 0 ] 2>/dev/null && proc_ports="$proc_ports $dec_port"
+                            fi
+                        done < "$net_file"
+                    done
+                fi
+            fi
+        done
+        port_lines=$(echo "$proc_ports" | tr ' ' '\n' | grep -v '^$' | sort -un)
+        log_debug "  /proc/net fallback found ports: $port_lines"
+    fi
+
+    # Step 6: Parse config files for configured listen addresses
+    if [ -z "$port_lines" ]; then
+        config_ports=""
+        case "$service_name" in
+            docker)
+                # Check Docker daemon.json for TCP hosts
+                for cfg in /etc/docker/daemon.json; do
+                    if [ -f "$cfg" ]; then
+                        cfg_ports=$(grep -o 'tcp://[^"]*' "$cfg" 2>/dev/null | sed 's/.*://g')
+                        config_ports="$config_ports $cfg_ports"
+                    fi
+                done
+                # Check systemd override for -H tcp://...
+                if command_exists systemctl; then
+                    exec_line=$(systemctl cat docker.service 2>/dev/null | grep 'ExecStart=' | tail -1)
+                    if [ -n "$exec_line" ]; then
+                        cfg_ports=$(echo "$exec_line" | grep -o 'tcp://[^ ]*' | sed 's/.*://g')
+                        config_ports="$config_ports $cfg_ports"
+                    fi
+                fi
+                ;;
+            kubelet)
+                # Check kubelet config for port settings
+                for cfg in /var/lib/kubelet/config.yaml /etc/kubernetes/kubelet-config.yaml; do
+                    if [ -f "$cfg" ]; then
+                        port_val=$(grep '^port:' "$cfg" 2>/dev/null | awk '{print $2}')
+                        [ -n "$port_val" ] && config_ports="$config_ports $port_val"
+                        healthz_port=$(grep 'healthzPort:' "$cfg" 2>/dev/null | awk '{print $2}')
+                        [ -n "$healthz_port" ] && config_ports="$config_ports $healthz_port"
+                    fi
+                done
+                ;;
+            containerd)
+                # Check containerd config for TCP gRPC listeners
+                for cfg in /etc/containerd/config.toml; do
+                    if [ -f "$cfg" ]; then
+                        cfg_ports=$(grep -A5 '\[grpc\]' "$cfg" 2>/dev/null | grep 'address' | grep -o '[0-9]*\.[0-9]*\.[0-9]*\.[0-9]*:[0-9]*' | sed 's/.*://')
+                        [ -n "$cfg_ports" ] && config_ports="$config_ports $cfg_ports"
+                    fi
+                done
+                ;;
+        esac
+
+        # Verify config-discovered ports are actually listening
+        if [ -n "$config_ports" ]; then
+            verified=""
+            for cp in $config_ports; do
+                case "$cp" in ''|*[!0-9]*) continue ;; esac
+                if command_exists ss; then
+                    if ss -tln 2>/dev/null | grep -q ":${cp} "; then
+                        verified="$verified $cp"
+                    fi
+                elif command_exists netstat; then
+                    if netstat -tln 2>/dev/null | grep -q ":${cp} "; then
+                        verified="$verified $cp"
+                    fi
+                fi
+            done
+            port_lines=$(echo "$verified" | tr ' ' '\n' | grep -v '^$' | sort -un)
+            log_debug "  config file ports (verified): $port_lines"
+        fi
+    fi
+
+    # Step 7: Well-known port fallback — if service is active, check if known ports are open
+    if [ -z "$port_lines" ]; then
+        wellknown_ports=""
+        case "$service_name" in
+            docker)     wellknown_ports="2375 2376" ;;
+            kubelet)    wellknown_ports="10250 10248 10255" ;;
+            containerd) wellknown_ports="2379" ;;  # containerd metrics/debug
+            crio)       wellknown_ports="10010" ;;  # CRI-O stream port
+        esac
+
+        if [ -n "$wellknown_ports" ]; then
+            verified=""
+            for wkp in $wellknown_ports; do
+                port_open=false
+                if command_exists ss; then
+                    ss -tln 2>/dev/null | grep -q ":${wkp} " && port_open=true
+                elif command_exists netstat; then
+                    netstat -tln 2>/dev/null | grep -q ":${wkp} " && port_open=true
+                fi
+                # Also try /proc/net/tcp if ss/netstat didn't work
+                if [ "$port_open" = false ] && [ -f /proc/net/tcp ]; then
+                    hex_port=$(printf '%04X' "$wkp" 2>/dev/null)
+                    if [ -n "$hex_port" ]; then
+                        if grep -qi ":${hex_port} " /proc/net/tcp 2>/dev/null || grep -qi ":${hex_port} " /proc/net/tcp6 2>/dev/null; then
+                            port_open=true
+                        fi
+                    fi
+                fi
+                if [ "$port_open" = true ]; then
+                    verified="$verified $wkp"
+                fi
+            done
+            port_lines=$(echo "$verified" | tr ' ' '\n' | grep -v '^$' | sort -un)
+            log_debug "  well-known port fallback (verified): $port_lines"
+        fi
+    fi
+
+    # Step 8: Last resort — scan all listening ports and match by PID in /proc
+    if [ -z "$port_lines" ] && [ -n "$all_pids" ] && [ -f /proc/net/tcp ]; then
+        proc_ports=""
+        # Build a set of all socket inodes for our PIDs
+        all_inodes=""
+        for pid in $all_pids; do
+            if [ -d "/proc/$pid/fd" ]; then
+                inodes=$(ls -l /proc/$pid/fd 2>/dev/null | grep 'socket:\[' | sed 's/.*socket:\[\([0-9]*\)\]/\1/' | tr '\n' ' ')
+                all_inodes="$all_inodes $inodes"
+            fi
+        done
+        if [ -n "$all_inodes" ]; then
+            for net_file in /proc/net/tcp /proc/net/tcp6; do
+                [ -f "$net_file" ] || continue
+                while IFS= read -r line; do
+                    echo "$line" | grep -q "local_address" && continue
+                    state=$(echo "$line" | awk '{print $4}')
+                    [ "$state" = "0A" ] || continue
+                    inode=$(echo "$line" | awk '{print $10}')
+                    for si in $all_inodes; do
+                        if [ "$inode" = "$si" ]; then
+                            hex_port=$(echo "$line" | awk '{print $2}' | sed 's/.*://')
+                            dec_port=$(printf '%d' "0x$hex_port" 2>/dev/null)
+                            [ -n "$dec_port" ] && [ "$dec_port" -gt 0 ] 2>/dev/null && proc_ports="$proc_ports $dec_port"
+                            break
+                        fi
+                    done
+                done < "$net_file"
+            done
+        fi
+        port_lines=$(echo "$proc_ports" | tr ' ' '\n' | grep -v '^$' | sort -un)
+        log_debug "  /proc inode scan found ports: $port_lines"
+    fi
+
+    log_debug "  final ports for '$service_name': $port_lines"
+
+    # Build JSON array of port objects matching schema: [{"port":N,"protocol":"tcp"}]
     if [ -n "$port_lines" ]; then
         for port in $port_lines; do
             # Validate port is a number
@@ -287,7 +534,7 @@ get_listening_ports() {
             if [ "$first" = false ]; then
                 ports_json="$ports_json,"
             fi
-            ports_json="$ports_json$port"
+            ports_json="${ports_json}{\"port\":${port},\"protocol\":\"tcp\"}"
             first=false
         done
     fi

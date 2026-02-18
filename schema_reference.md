@@ -231,6 +231,8 @@ This document lists all possible values for every enumerated property in the nor
 | `services[].name` | `containerd`, `docker`, `crio`, `podman`, `kubelet` | Systemd service name |
 | `services[].active` | `active`, `inactive`, `failed`, `activating`, `deactivating` | Systemd active state |
 | `services[].enabled` | `enabled`, `disabled`, `masked`, `static` | Systemd enabled state |
+| `services[].listening_ports[].port` | Integer (e.g. `10250`, `2375`) | TCP/UDP port number |
+| `services[].listening_ports[].protocol` | `tcp`, `udp` | Listener protocol type |
 
 ---
 
