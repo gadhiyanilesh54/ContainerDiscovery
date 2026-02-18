@@ -252,6 +252,49 @@ json_build_array() {
     echo "$result"
 }
 
+# Get listening ports for a process/service
+get_listening_ports() {
+    process_name="$1"
+    ports_json="["
+    first=true
+
+    # Try to get ports using ss (modern tool)
+    if command_exists ss; then
+        # Get listening TCP and UDP ports for the process
+        port_lines=$(ss -tlnp 2>/dev/null | grep "$process_name" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+        if [ -z "$port_lines" ]; then
+            port_lines=$(ss -ulnp 2>/dev/null | grep "$process_name" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+        fi
+    # Fallback to netstat
+    elif command_exists netstat; then
+        port_lines=$(netstat -tlnp 2>/dev/null | grep "$process_name" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+        if [ -z "$port_lines" ]; then
+            port_lines=$(netstat -ulnp 2>/dev/null | grep "$process_name" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+        fi
+    # Last resort: use lsof if available
+    elif command_exists lsof; then
+        port_lines=$(lsof -i -P -n 2>/dev/null | grep "$process_name" | grep LISTEN | awk '{print $9}' | sed 's/.*://g' | sort -u)
+    fi
+
+    # Build JSON array of port numbers
+    if [ -n "$port_lines" ]; then
+        for port in $port_lines; do
+            # Validate port is a number
+            case "$port" in
+                ''|*[!0-9]*) continue ;;
+            esac
+
+            if [ "$first" = false ]; then
+                ports_json="$ports_json,"
+            fi
+            ports_json="$ports_json$port"
+            first=false
+        done
+    fi
+
+    echo "$ports_json]"
+}
+
 # Check if container ID has been seen
 is_container_seen() {
     cid="$1"
@@ -1346,12 +1389,72 @@ discover_kubernetes() {
     # Platform specific
     api_endpoint=$(try_command "kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null" || echo "")
 
+    # Detect cluster CIDR - try multiple sources
+    cluster_cidr=""
+    # Method 1: From kube-controller-manager pod
+    if [ -z "$cluster_cidr" ]; then
+        cluster_cidr=$(try_command "kubectl get pods -n kube-system -l component=kube-controller-manager -o jsonpath='{.items[0].spec.containers[0].command}' 2>/dev/null | grep -o 'cluster-cidr=[^ ]*' | cut -d= -f2" || echo "")
+    fi
+    # Method 2: From kube-proxy configmap
+    if [ -z "$cluster_cidr" ]; then
+        cluster_cidr=$(try_command "kubectl get configmap kube-proxy -n kube-system -o jsonpath='{.data.config\.conf}' 2>/dev/null | grep -o 'clusterCIDR: .*' | awk '{print \$2}'" || echo "")
+    fi
+    # Method 3: From kubeadm config
+    if [ -z "$cluster_cidr" ]; then
+        cluster_cidr=$(try_privileged_command "grep -r 'podSubnet' /etc/kubernetes/manifests/ 2>/dev/null | grep -o 'podSubnet: .*' | awk '{print \$2}' | head -n1" "")
+    fi
+    # Method 4: From kube-controller-manager manifest
+    if [ -z "$cluster_cidr" ]; then
+        cluster_cidr=$(try_privileged_command "grep -o 'cluster-cidr=[^ ]*' /etc/kubernetes/manifests/kube-controller-manager.yaml 2>/dev/null | cut -d= -f2" "")
+    fi
+    # Method 5: For k3s
+    if [ -z "$cluster_cidr" ] && [ -d /var/lib/rancher/k3s ]; then
+        cluster_cidr=$(try_privileged_command "grep -o 'cluster-cidr=[^ ]*' /etc/systemd/system/k3s.service 2>/dev/null | cut -d= -f2" "")
+    fi
+
+    # Detect service CIDR - try multiple sources
+    service_cidr=""
+    # Method 1: From kube-apiserver pod
+    if [ -z "$service_cidr" ]; then
+        service_cidr=$(try_command "kubectl get pods -n kube-system -l component=kube-apiserver -o jsonpath='{.items[0].spec.containers[0].command}' 2>/dev/null | grep -o 'service-cluster-ip-range=[^ ]*' | cut -d= -f2" || echo "")
+    fi
+    # Method 2: From kube-apiserver manifest
+    if [ -z "$service_cidr" ]; then
+        service_cidr=$(try_privileged_command "grep -o 'service-cluster-ip-range=[^ ]*' /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null | cut -d= -f2" "")
+    fi
+    # Method 3: From kubeadm config
+    if [ -z "$service_cidr" ]; then
+        service_cidr=$(try_privileged_command "grep -r 'serviceSubnet' /etc/kubernetes/ 2>/dev/null | grep -o 'serviceSubnet: .*' | awk '{print \$2}' | head -n1" "")
+    fi
+    # Method 4: For k3s
+    if [ -z "$service_cidr" ] && [ -d /var/lib/rancher/k3s ]; then
+        service_cidr=$(try_privileged_command "grep -o 'service-cidr=[^ ]*' /etc/systemd/system/k3s.service 2>/dev/null | cut -d= -f2" "")
+    fi
+
+    # Detect kubeconfig path dynamically
+    kubeconfig_path=""
+    # Method 1: From environment variable
+    if [ -n "$KUBECONFIG" ]; then
+        kubeconfig_path="$KUBECONFIG"
+    # Method 2: Standard locations
+    elif [ -f "/etc/kubernetes/admin.conf" ]; then
+        kubeconfig_path="/etc/kubernetes/admin.conf"
+    elif [ -f "$HOME/.kube/config" ]; then
+        kubeconfig_path="$HOME/.kube/config"
+    elif [ -f "/var/lib/rancher/k3s/server/cred/admin.kubeconfig" ]; then
+        kubeconfig_path="/var/lib/rancher/k3s/server/cred/admin.kubeconfig"
+    elif [ -f "/var/lib/rancher/rke2/server/cred/admin.kubeconfig" ]; then
+        kubeconfig_path="/var/lib/rancher/rke2/server/cred/admin.kubeconfig"
+    else
+        kubeconfig_path=""
+    fi
+
     k8s_specific=$(json_build_object \
         "distribution" "$distribution" \
         "api_server_endpoint" "$api_endpoint" \
-        "cluster_cidr" "" \
-        "service_cidr" "" \
-        "kubeconfig_path" "/etc/kubernetes/admin.conf")
+        "cluster_cidr" "$cluster_cidr" \
+        "service_cidr" "$service_cidr" \
+        "kubeconfig_path" "$kubeconfig_path")
 
     platform_specific_json=$(json_build_object \
         "swarm" "null" \
@@ -1563,8 +1666,14 @@ discover_services() {
     for service_name in containerd docker crio podman kubelet; do
         active="inactive"
         enabled="disabled"
+        service_exists=false
 
         if command_exists systemctl; then
+            # Check if service exists first
+            if systemctl list-unit-files "$service_name.service" 2>/dev/null | grep -q "$service_name.service"; then
+                service_exists=true
+            fi
+
             active_check=$(systemctl is-active "$service_name" 2>/dev/null)
             [ -n "$active_check" ] && active="$active_check"
 
@@ -1573,16 +1682,37 @@ discover_services() {
         else
             # SysV init fallback
             if service "$service_name" status >/dev/null 2>&1; then
+                service_exists=true
                 active="active"
             fi
             enabled="unknown"
         fi
 
+        # Skip services that are both inactive and not-found/disabled
+        # Only include services that are either:
+        # 1. Active (running)
+        # 2. Enabled (will start on boot)
+        # 3. Have a process running (not a systemd service but exists as a process)
+        if [ "$active" = "inactive" ] && [ "$enabled" = "not-found" ]; then
+            # Check if process is actually running (might not be a service)
+            if ! pgrep -x "$service_name" >/dev/null 2>&1; then
+                continue
+            fi
+        fi
+
+        # Also skip services that don't exist and are inactive
+        if [ "$service_exists" = false ] && [ "$active" = "inactive" ] && [ "$enabled" = "disabled" ]; then
+            continue
+        fi
+
+        # Get listening ports for the service
+        listening_ports=$(get_listening_ports "$service_name")
+
         service_json=$(json_build_object \
             "name" "$service_name" \
             "active" "$active" \
             "enabled" "$enabled" \
-            "listening_ports" "[]")
+            "listening_ports" "$listening_ports")
 
         if [ "$first" = false ]; then
             services_json="$services_json,"
