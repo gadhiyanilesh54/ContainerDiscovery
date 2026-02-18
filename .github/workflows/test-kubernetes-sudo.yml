@@ -1,0 +1,89 @@
+name: Test Kubernetes Environment (with sudo)
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  test-kubernetes-sudo:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Kubernetes with kind
+      uses: helm/kind-action@v1
+      with:
+        cluster_name: test-cluster
+        wait: 5m
+
+    - name: Verify Kubernetes cluster
+      run: |
+        kubectl cluster-info
+        kubectl get nodes
+        kubectl get pods -A
+
+    - name: Install container tools
+      run: |
+        # Install crictl for CRI testing
+        VERSION="v1.28.0"
+        wget -q https://github.com/kubernetes-sigs/cri-tools/releases/download/$VERSION/crictl-$VERSION-linux-amd64.tar.gz
+        sudo tar zxvf crictl-$VERSION-linux-amd64.tar.gz -C /usr/local/bin
+        rm -f crictl-$VERSION-linux-amd64.tar.gz
+
+        # Configure crictl to use containerd
+        sudo sh -c 'cat > /etc/crictl.yaml <<'"'"'EOF'"'"'
+        runtime-endpoint: unix:///run/containerd/containerd.sock
+        image-endpoint: unix:///run/containerd/containerd.sock
+        timeout: 10
+        EOF'"'"
+
+    - name: Install jq for JSON validation
+      run: sudo apt-get update && sudo apt-get install -y jq
+
+    - name: Run discovery script with sudo
+      run: sudo ./GuestDetails_Container.sh
+
+    - name: Run privileged test
+      run: sudo ./test_privileged.sh
+
+    - name: Run Kubernetes fields validation
+      run: ./test_kubernetes_fields.sh
+
+    - name: Validate JSON output
+      run: |
+        if [ -f output.json ]; then
+          echo "JSON output exists"
+          jq . output.json > /dev/null
+          echo "JSON is valid"
+
+          # Check for Kubernetes detection
+          k8s_count=$(jq '.armResources[0].properties.orchestrators | map(select(.orchestrator_type == "kubernetes")) | length' output.json)
+          echo "Kubernetes orchestrators detected: $k8s_count"
+
+          if [ "$k8s_count" -gt 0 ]; then
+            echo "✓ Kubernetes successfully detected"
+            jq '.armResources[0].properties.orchestrators[] | select(.orchestrator_type == "kubernetes")' output.json
+          else
+            echo "✗ Kubernetes not detected"
+            exit 1
+          fi
+        else
+          echo "✗ output.json not found"
+          exit 1
+        fi
+
+    - name: Upload artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: kubernetes-sudo-test-results
+        path: |
+          output.json
+          debug.txt
+          error.txt
+        retention-days: 7
