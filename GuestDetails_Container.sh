@@ -1695,10 +1695,13 @@ detect_orchestrators() {
     log_info "Detecting orchestrators..."
 
     ORCHESTRATORS_DETECTED=""
+    priv=$(check_privilege)
+    docker_cmd="docker"
+    [ "$priv" = "sudo" ] && docker_cmd="sudo docker"
 
     # Check for Docker Swarm
     if echo "$RUNTIMES_DETECTED" | grep -q "docker"; then
-        swarm_state=$(try_command "docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null")
+        swarm_state=$(try_command "$docker_cmd info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null")
         if [ "$swarm_state" = "active" ]; then
             ORCHESTRATORS_DETECTED="$ORCHESTRATORS_DETECTED docker-swarm"
             log_info "Docker Swarm detected"
@@ -1757,18 +1760,22 @@ detect_orchestrators() {
 discover_docker_swarm() {
     log_info "Discovering Docker Swarm..."
 
+    priv=$(check_privilege)
+    docker_cmd="docker"
+    [ "$priv" = "sudo" ] && docker_cmd="sudo docker"
+
     # Swarm state
-    swarm_state=$(try_command "docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null" || echo "inactive")
+    swarm_state=$(try_command "$docker_cmd info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null" || echo "inactive")
 
     # Cluster ID - with multiple fallbacks
-    cluster_id=$(try_command "docker info --format '{{.Swarm.Cluster.ID}}' 2>/dev/null")
+    cluster_id=$(try_command "$docker_cmd info --format '{{.Swarm.Cluster.ID}}' 2>/dev/null")
     if [ -z "$cluster_id" ]; then
         # Fallback: try using socket API
         cluster_id=$(try_privileged_command "curl -s --unix-socket /var/run/docker.sock http://localhost/info 2>/dev/null | grep -o '\"ClusterID\":\"[^\"]*\"' | cut -d'\"' -f4" "")
     fi
     if [ -z "$cluster_id" ]; then
         # Fallback: try docker swarm info
-        cluster_id=$(try_command "docker system info 2>/dev/null | grep 'Cluster ID' | awk '{print \$3}'" || echo "")
+        cluster_id=$(try_command "$docker_cmd system info 2>/dev/null | grep 'Cluster ID' | awk '{print \$3}'" || echo "")
     fi
     # Filter out error messages that might have been captured
     case "$cluster_id" in
@@ -1779,7 +1786,7 @@ discover_docker_swarm() {
     [ -z "$cluster_id" ] && cluster_id=""
 
     # Cluster name - try to get from node labels or hostname
-    cluster_name=$(try_command "docker info --format '{{.Name}}' 2>/dev/null")
+    cluster_name=$(try_command "$docker_cmd info --format '{{.Name}}' 2>/dev/null")
     if [ -z "$cluster_name" ]; then
         # Fallback: use hostname as cluster identifier
         cluster_name=$(hostname 2>/dev/null || echo "")
@@ -1787,7 +1794,7 @@ discover_docker_swarm() {
     [ -z "$cluster_name" ] && cluster_name=""
 
     # Node role
-    is_manager=$(try_command "docker info --format '{{.Swarm.ControlAvailable}}' 2>/dev/null")
+    is_manager=$(try_command "$docker_cmd info --format '{{.Swarm.ControlAvailable}}' 2>/dev/null")
     if [ "$is_manager" = "true" ]; then
         node_role="manager"
     else
@@ -1795,12 +1802,12 @@ discover_docker_swarm() {
     fi
 
     # Current node
-    node_id=$(try_command "docker info --format '{{.Swarm.NodeID}}' 2>/dev/null" || echo "")
+    node_id=$(try_command "$docker_cmd info --format '{{.Swarm.NodeID}}' 2>/dev/null" || echo "")
 
     # Get current node availability
     node_availability="active"
     if [ -n "$node_id" ] && [ "$node_role" = "manager" ]; then
-        node_availability=$(try_command "docker node inspect $node_id --format '{{.Spec.Availability}}' 2>/dev/null" || echo "active")
+        node_availability=$(try_command "$docker_cmd node inspect $node_id --format '{{.Spec.Availability}}' 2>/dev/null" || echo "active")
     fi
 
     current_node_json=$(json_build_object \
@@ -1816,12 +1823,12 @@ discover_docker_swarm() {
     worker_nodes_json="[]"
 
     if [ "$node_role" = "manager" ]; then
-        total_count=$(try_command "docker node ls -q 2>/dev/null | wc -l" || echo "0")
-        master_count=$(try_command "docker node ls --filter role=manager -q 2>/dev/null | wc -l" || echo "0")
+        total_count=$(try_command "$docker_cmd node ls -q 2>/dev/null | wc -l" || echo "0")
+        master_count=$(try_command "$docker_cmd node ls --filter role=manager -q 2>/dev/null | wc -l" || echo "0")
         worker_count=$((total_count - master_count))
 
         # Build master nodes array
-        master_nodes_data=$(try_command "docker node ls --filter role=manager --format '{{.Hostname}}|{{.ID}}|{{.Status}}' 2>/dev/null" || echo "")
+        master_nodes_data=$(try_command "$docker_cmd node ls --filter role=manager --format '{{.Hostname}}|{{.ID}}|{{.Status}}' 2>/dev/null" || echo "")
         if [ -n "$master_nodes_data" ]; then
             master_nodes_list=""
             while IFS='|' read -r hostname node_id status; do
@@ -1844,7 +1851,7 @@ EOF
         fi
 
         # Build worker nodes array
-        worker_nodes_data=$(try_command "docker node ls --filter role=worker --format '{{.Hostname}}|{{.ID}}|{{.Status}}' 2>/dev/null" || echo "")
+        worker_nodes_data=$(try_command "$docker_cmd node ls --filter role=worker --format '{{.Hostname}}|{{.ID}}|{{.Status}}' 2>/dev/null" || echo "")
         if [ -n "$worker_nodes_data" ]; then
             worker_nodes_list=""
             while IFS='|' read -r hostname node_id status; do
@@ -1877,7 +1884,7 @@ EOF
     # Service count
     service_count=0
     if [ "$node_role" = "manager" ]; then
-        service_count=$(try_command "docker service ls -q 2>/dev/null | wc -l" || echo "0")
+        service_count=$(try_command "$docker_cmd service ls -q 2>/dev/null | wc -l" || echo "0")
     fi
 
     # Container counts - get actual container counts on this node
@@ -1885,27 +1892,13 @@ EOF
     system_container_count=0
     user_container_count=0
 
-    priv=$(check_privilege)
-
     # Get total container count (all containers on the node)
-    if [ "$priv" = "root" ]; then
-        total_container_count=$(try_command "docker ps -q 2>/dev/null | wc -l" || echo "0")
-    elif [ "$priv" = "sudo" ]; then
-        total_container_count=$(try_command "sudo docker ps -q 2>/dev/null | wc -l" || echo "0")
-    else
-        total_container_count=$(try_command "docker ps -q 2>/dev/null | wc -l" || echo "0")
-    fi
+    total_container_count=$(try_command "$docker_cmd ps -q 2>/dev/null | wc -l" || echo "0")
 
     # For Swarm, system containers are those with system-related service names
     # Common patterns: monitoring, logging, overlay network, ingress, etc.
     if [ "$total_container_count" -gt "0" ]; then
-        if [ "$priv" = "root" ]; then
-            system_container_count=$(try_command "docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'ingress-sbox|_monitoring|_logging|portainer|swarm-agent' | wc -l" || echo "0")
-        elif [ "$priv" = "sudo" ]; then
-            system_container_count=$(try_command "sudo docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'ingress-sbox|_monitoring|_logging|portainer|swarm-agent' | wc -l" || echo "0")
-        else
-            system_container_count=$(try_command "docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'ingress-sbox|_monitoring|_logging|portainer|swarm-agent' | wc -l" || echo "0")
-        fi
+        system_container_count=$(try_command "$docker_cmd ps --format '{{.Names}}' 2>/dev/null | grep -E 'ingress-sbox|_monitoring|_logging|portainer|swarm-agent' | wc -l" || echo "0")
 
         # User containers = total - system
         user_container_count=$((total_container_count - system_container_count))
@@ -1938,7 +1931,7 @@ EOF
         "csi_drivers" "[]")
 
     # Platform specific
-    raft_index=$(try_command "docker info --format '{{.Swarm.Cluster.RaftIndex}}' 2>/dev/null" || echo "0")
+    raft_index=$(try_command "$docker_cmd info --format '{{.Swarm.Cluster.RaftIndex}}' 2>/dev/null" || echo "0")
 
     swarm_specific=$(json_build_object \
         "raft_index" "$raft_index" \
@@ -1951,7 +1944,7 @@ EOF
         "tanzu" "null")
 
     # Get Docker version for Swarm
-    swarm_version=$(try_command "docker version --format '{{.Server.Version}}' 2>/dev/null")
+    swarm_version=$(try_command "$docker_cmd version --format '{{.Server.Version}}' 2>/dev/null")
     [ -z "$swarm_version" ] && swarm_version=""
 
     # Resource usage - get from dockerd process
