@@ -1252,9 +1252,186 @@ $config_registries"
     fi
     registries_json=$(json_build_array "$registries" false)
 
-    # Containers and images (empty for now)
+    # Collect container details
     containers_json="[]"
+    if [ "$container_count" -gt 0 ]; then
+        container_list=""
+
+        # Get container details with format: ID|Name|Image|State|CreatedAt|Labels
+        if [ "$priv" = "root" ]; then
+            container_data=$(try_command "docker ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.CreatedAt}}|{{.Labels}}' 2>/dev/null" || echo "")
+        elif [ "$priv" = "sudo" ]; then
+            container_data=$(try_command "sudo docker ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.CreatedAt}}|{{.Labels}}' 2>/dev/null" || echo "")
+        else
+            container_data=$(try_command "docker ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.CreatedAt}}|{{.Labels}}' 2>/dev/null" || echo "")
+        fi
+
+        if [ -n "$container_data" ]; then
+            while IFS='|' read -r container_id name image state created_at labels; do
+                [ -z "$container_id" ] && continue
+
+                # Convert state to lowercase
+                state_lower=$(echo "$state" | tr '[:upper:]' '[:lower:]')
+
+                # Parse labels into JSON object (POSIX-compliant)
+                labels_json="{}"
+                if [ -n "$labels" ]; then
+                    # Labels come in format: key1=value1,key2=value2
+                    # Build a simple JSON object
+                    label_pairs=""
+                    # Replace commas with newlines for POSIX-compliant parsing
+                    label_list=$(echo "$labels" | tr ',' '\n')
+                    while IFS= read -r label; do
+                        if [ -n "$label" ]; then
+                            label_key=$(echo "$label" | cut -d= -f1)
+                            label_value=$(echo "$label" | cut -d= -f2-)
+                            if [ -z "$label_pairs" ]; then
+                                label_pairs="\"$label_key\":\"$(json_escape "$label_value")\""
+                            else
+                                label_pairs="$label_pairs,\"$label_key\":\"$(json_escape "$label_value")\""
+                            fi
+                        fi
+                    done <<EOF
+$label_list
+EOF
+                    [ -n "$label_pairs" ] && labels_json="{$label_pairs}"
+                fi
+
+                # Determine if orchestrator managed (check for swarm labels)
+                orchestrator_managed="false"
+                orchestrator_type=""
+                service_name=""
+                task_id=""
+
+                case "$labels" in
+                    *com.docker.swarm.service.name=*)
+                        orchestrator_managed="true"
+                        orchestrator_type="docker-swarm"
+                        service_name=$(echo "$labels" | grep -o 'com.docker.swarm.service.name=[^,]*' | cut -d= -f2)
+                        task_id=$(echo "$labels" | grep -o 'com.docker.swarm.task.id=[^,]*' | cut -d= -f2)
+                        ;;
+                    *io.kubernetes.pod.name=*)
+                        orchestrator_managed="true"
+                        orchestrator_type="kubernetes"
+                        ;;
+                esac
+
+                orchestrator_ref_json=$(json_build_object \
+                    "type" "$orchestrator_type" \
+                    "service_name" "$service_name" \
+                    "task_id" "$task_id" \
+                    "pod_name" "" \
+                    "namespace" "")
+
+                # Get image ID
+                if [ "$priv" = "root" ]; then
+                    image_id=$(try_command "docker inspect --format '{{.Image}}' $container_id 2>/dev/null" || echo "")
+                elif [ "$priv" = "sudo" ]; then
+                    image_id=$(try_command "sudo docker inspect --format '{{.Image}}' $container_id 2>/dev/null" || echo "")
+                else
+                    image_id=$(try_command "docker inspect --format '{{.Image}}' $container_id 2>/dev/null" || echo "")
+                fi
+                [ -z "$image_id" ] && image_id=""
+
+                # Build resource usage (empty for now as detailed stats require more API calls)
+                cpu_usage_json=$(json_build_object \
+                    "usage_cores" "0" \
+                    "request_millicores" "0" \
+                    "limit_millicores" "0")
+
+                memory_usage_json=$(json_build_object \
+                    "usage_mb" "0" \
+                    "request_mb" "0" \
+                    "limit_mb" "0")
+
+                resource_usage_json=$(json_build_object \
+                    "cpu" "$cpu_usage_json" \
+                    "memory" "$memory_usage_json")
+
+                # Build container object
+                container_obj=$(json_build_object \
+                    "container_id" "$container_id" \
+                    "name" "$name" \
+                    "image" "$image" \
+                    "image_id" "$image_id" \
+                    "state" "$state_lower" \
+                    "created_at" "$created_at" \
+                    "labels" "$labels_json" \
+                    "ports" "[]" \
+                    "resource_usage" "$resource_usage_json" \
+                    "network_mode" "" \
+                    "restart_policy" "" \
+                    "orchestrator_managed" "$orchestrator_managed" \
+                    "orchestrator_ref" "$orchestrator_ref_json")
+
+                if [ -z "$container_list" ]; then
+                    container_list="$container_obj"
+                else
+                    container_list="$container_list,$container_obj"
+                fi
+            done << EOF
+$container_data
+EOF
+            [ -n "$container_list" ] && containers_json="[$container_list]"
+        fi
+    fi
+
+    # Collect image details
     images_json="[]"
+    if [ "$image_count" -gt 0 ]; then
+        image_list=""
+
+        # Get image details with format: ID|Repository|Tag|CreatedAt|Size
+        if [ "$priv" = "root" ]; then
+            image_data=$(try_command "docker images --format '{{.ID}}|{{.Repository}}|{{.Tag}}|{{.CreatedAt}}|{{.Size}}' 2>/dev/null" || echo "")
+        elif [ "$priv" = "sudo" ]; then
+            image_data=$(try_command "sudo docker images --format '{{.ID}}|{{.Repository}}|{{.Tag}}|{{.CreatedAt}}|{{.Size}}' 2>/dev/null" || echo "")
+        else
+            image_data=$(try_command "docker images --format '{{.ID}}|{{.Repository}}|{{.Tag}}|{{.CreatedAt}}|{{.Size}}' 2>/dev/null" || echo "")
+        fi
+
+        if [ -n "$image_data" ]; then
+            while IFS='|' read -r image_id repository tag created_at size; do
+                [ -z "$image_id" ] && continue
+
+                # Convert size to MB (handle KB, MB, GB)
+                size_mb="0"
+                case "$size" in
+                    *KB)
+                        size_num=$(echo "$size" | sed 's/KB//')
+                        size_mb=$(awk "BEGIN {printf \"%.2f\", $size_num / 1024}")
+                        ;;
+                    *MB)
+                        size_mb=$(echo "$size" | sed 's/MB//')
+                        ;;
+                    *GB)
+                        size_num=$(echo "$size" | sed 's/GB//')
+                        size_mb=$(awk "BEGIN {printf \"%.2f\", $size_num * 1024}")
+                        ;;
+                    *)
+                        size_mb="0"
+                        ;;
+                esac
+
+                # Build image object
+                image_obj=$(json_build_object \
+                    "image_id" "$image_id" \
+                    "repository" "$repository" \
+                    "tag" "$tag" \
+                    "size_mb" "$size_mb" \
+                    "created_at" "$created_at")
+
+                if [ -z "$image_list" ]; then
+                    image_list="$image_obj"
+                else
+                    image_list="$image_list,$image_obj"
+                fi
+            done << EOF
+$image_data
+EOF
+            [ -n "$image_list" ] && images_json="[$image_list]"
+        fi
+    fi
 
     # Build final JSON
     DOCKER_JSON=$(json_build_object \
