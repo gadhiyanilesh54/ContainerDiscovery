@@ -1045,14 +1045,26 @@ discover_containerd() {
     # Storage driver
     storage_driver="overlayfs"
     if [ -f /etc/containerd/config.toml ]; then
-        snap=$(grep snapshotter /etc/containerd/config.toml 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
+        if [ "$priv" = "root" ]; then
+            snap=$(grep snapshotter /etc/containerd/config.toml 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
+        elif [ "$priv" = "sudo" ]; then
+            snap=$(try_command "sudo cat /etc/containerd/config.toml 2>/dev/null | grep snapshotter | head -n1 | awk '{print \$3}' | tr -d '\"'")
+        else
+            snap=$(grep snapshotter /etc/containerd/config.toml 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
+        fi
         [ -n "$snap" ] && storage_driver="$snap"
     fi
 
     # Cgroup driver
     cgroup_driver="systemd"
     if [ -f /etc/containerd/config.toml ]; then
-        systemd_cgroup=$(grep SystemdCgroup /etc/containerd/config.toml 2>/dev/null | head -n1 | awk '{print $3}')
+        if [ "$priv" = "root" ]; then
+            systemd_cgroup=$(grep SystemdCgroup /etc/containerd/config.toml 2>/dev/null | head -n1 | awk '{print $3}')
+        elif [ "$priv" = "sudo" ]; then
+            systemd_cgroup=$(try_command "sudo cat /etc/containerd/config.toml 2>/dev/null | grep SystemdCgroup | head -n1 | awk '{print \$3}'")
+        else
+            systemd_cgroup=$(grep SystemdCgroup /etc/containerd/config.toml 2>/dev/null | head -n1 | awk '{print $3}')
+        fi
         if [ "$systemd_cgroup" = "false" ]; then
             cgroup_driver="cgroupfs"
         fi
@@ -1082,6 +1094,20 @@ $config_registries"
     fi
     registries_json=$(json_build_array "$registries" false)
 
+    # Rootless detection for containerd
+    rootless="false"
+    current_uid=$(id -u)
+    # Containerd is rootless if socket is in user directory or if running as non-root with user-specific socket
+    if [ "$current_uid" != "0" ] && [ -S "$HOME/.local/share/containerd/containerd.sock" ]; then
+        rootless="true"
+        socket="$HOME/.local/share/containerd/containerd.sock"
+        storage_root="$HOME/.local/share/containerd"
+    elif [ "$current_uid" != "0" ] && [ -S "/run/user/$current_uid/containerd/containerd.sock" ]; then
+        rootless="true"
+        socket="/run/user/$current_uid/containerd/containerd.sock"
+        storage_root="$HOME/.local/share/containerd"
+    fi
+
     # Containers (empty for now to keep script manageable)
     containers_json="[]"
     images_json="[]"
@@ -1094,7 +1120,7 @@ $config_registries"
         "socket" "$socket" \
         "storage_driver" "$storage_driver" \
         "storage_root" "$storage_root" \
-        "rootless" "false" \
+        "rootless" "$rootless" \
         "cgroup_driver" "$cgroup_driver" \
         "namespaces" "$namespaces_json" \
         "image_count" "$image_count" \
@@ -1258,24 +1284,53 @@ discover_crio() {
     # Storage root
     storage_root="/var/lib/containers/storage"
 
-    # Container counts
-    container_count=$(try_command "crictl ps -a -q 2>/dev/null | wc -l" || echo "0")
-    running_count=$(try_command "crictl ps -q 2>/dev/null | wc -l" || echo "0")
+    # Check privilege for crictl commands
+    priv=$(check_privilege)
 
-    # Image count
-    image_count=$(try_command "crictl images -q 2>/dev/null | wc -l" || echo "0")
+    # Container counts - use sudo for crictl commands
+    if [ "$priv" = "root" ]; then
+        container_count=$(try_command "crictl ps -a -q 2>/dev/null | wc -l" || echo "0")
+        running_count=$(try_command "crictl ps -q 2>/dev/null | wc -l" || echo "0")
+    elif [ "$priv" = "sudo" ]; then
+        container_count=$(try_command "sudo crictl ps -a -q 2>/dev/null | wc -l" || echo "0")
+        running_count=$(try_command "sudo crictl ps -q 2>/dev/null | wc -l" || echo "0")
+    else
+        container_count=$(try_command "crictl ps -a -q 2>/dev/null | wc -l" || echo "0")
+        running_count=$(try_command "crictl ps -q 2>/dev/null | wc -l" || echo "0")
+    fi
+
+    # Image count - use sudo for crictl commands
+    if [ "$priv" = "root" ]; then
+        image_count=$(try_command "crictl images -q 2>/dev/null | wc -l" || echo "0")
+    elif [ "$priv" = "sudo" ]; then
+        image_count=$(try_command "sudo crictl images -q 2>/dev/null | wc -l" || echo "0")
+    else
+        image_count=$(try_command "crictl images -q 2>/dev/null | wc -l" || echo "0")
+    fi
 
     # Storage driver
     storage_driver="overlay"
     if [ -f /etc/crio/crio.conf ]; then
-        driver=$(grep storage_driver /etc/crio/crio.conf 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
+        if [ "$priv" = "root" ]; then
+            driver=$(grep storage_driver /etc/crio/crio.conf 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
+        elif [ "$priv" = "sudo" ]; then
+            driver=$(try_command "sudo cat /etc/crio/crio.conf 2>/dev/null | grep storage_driver | head -n1 | awk '{print \$3}' | tr -d '\"'")
+        else
+            driver=$(grep storage_driver /etc/crio/crio.conf 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
+        fi
         [ -n "$driver" ] && storage_driver="$driver"
     fi
 
     # Cgroup driver
     cgroup_driver="systemd"
     if [ -f /etc/crio/crio.conf ]; then
-        cgm=$(grep cgroup_manager /etc/crio/crio.conf 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
+        if [ "$priv" = "root" ]; then
+            cgm=$(grep cgroup_manager /etc/crio/crio.conf 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
+        elif [ "$priv" = "sudo" ]; then
+            cgm=$(try_command "sudo cat /etc/crio/crio.conf 2>/dev/null | grep cgroup_manager | head -n1 | awk '{print \$3}' | tr -d '\"'")
+        else
+            cgm=$(grep cgroup_manager /etc/crio/crio.conf 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
+        fi
         [ -n "$cgm" ] && cgroup_driver="$cgm"
     fi
 
@@ -1300,6 +1355,20 @@ docker.io"
     namespaces="k8s.io"
     namespaces_json=$(json_build_array "$namespaces" false)
 
+    # Rootless detection for CRI-O
+    rootless="false"
+    current_uid=$(id -u)
+    # CRI-O is rootless if socket is in user directory or running as non-root with user-specific socket
+    if [ "$current_uid" != "0" ] && [ -S "/run/user/$current_uid/crio/crio.sock" ]; then
+        rootless="true"
+        socket="/run/user/$current_uid/crio/crio.sock"
+        storage_root="$HOME/.local/share/containers/storage"
+    elif [ "$current_uid" != "0" ] && [ ! -S "/var/run/crio/crio.sock" ] && [ -f "$HOME/.config/crio/crio.conf" ]; then
+        # If config exists in user directory, it's likely rootless
+        rootless="true"
+        storage_root="$HOME/.local/share/containers/storage"
+    fi
+
     # Containers and images
     containers_json="[]"
     images_json="[]"
@@ -1312,7 +1381,7 @@ docker.io"
         "socket" "$socket" \
         "storage_driver" "$storage_driver" \
         "storage_root" "$storage_root" \
-        "rootless" "false" \
+        "rootless" "$rootless" \
         "cgroup_driver" "$cgroup_driver" \
         "namespaces" "$namespaces_json" \
         "image_count" "$image_count" \
