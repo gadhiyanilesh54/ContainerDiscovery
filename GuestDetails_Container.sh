@@ -1115,6 +1115,12 @@ discover_docker_swarm() {
         # Fallback: try docker swarm info
         cluster_id=$(try_command "docker system info 2>/dev/null | grep 'Cluster ID' | awk '{print \$3}'" || echo "")
     fi
+    # Filter out error messages that might have been captured
+    case "$cluster_id" in
+        *"error"*|*"Error"*|*"ERROR"*|*"failed"*|*"refused"*|*"debug"*)
+            cluster_id=""
+            ;;
+    esac
     [ -z "$cluster_id" ] && cluster_id=""
 
     # Cluster name - try to get from node labels or hostname
@@ -1263,6 +1269,12 @@ discover_kubernetes() {
             cluster_id=$(try_command "cat /var/lib/rancher/k3s/server/cred/cluster-id 2>/dev/null" || echo "")
         fi
     fi
+    # Filter out kubectl error messages that might have been captured
+    case "$cluster_id" in
+        *"To further debug"*|*"cluster-info dump"*|*"connection"*"refused"*)
+            cluster_id=""
+            ;;
+    esac
     [ -z "$cluster_id" ] && cluster_id=""
 
     # Cluster name - with multiple fallbacks
@@ -1526,6 +1538,12 @@ discover_openshift() {
         # Fallback: try to get from namespace
         cluster_id=$(try_command "kubectl get ns openshift-apiserver -o jsonpath='{.metadata.uid}' 2>/dev/null" || echo "")
     fi
+    # Filter out error messages that might have been captured
+    case "$cluster_id" in
+        *"error"*|*"Error"*|*"ERROR"*|*"failed"*|*"refused"*|*"debug"*|*"To further debug"*|*"cluster-info dump"*|*"connection"*"refused"*)
+            cluster_id=""
+            ;;
+    esac
     [ -z "$cluster_id" ] && cluster_id=""
 
     # Cluster name - with multiple fallbacks
@@ -1596,6 +1614,12 @@ discover_tanzu() {
         # Fallback: try to get from namespace
         cluster_id=$(try_command "kubectl get ns tkg-system -o jsonpath='{.metadata.uid}' 2>/dev/null" || echo "")
     fi
+    # Filter out error messages that might have been captured
+    case "$cluster_id" in
+        *"error"*|*"Error"*|*"ERROR"*|*"failed"*|*"refused"*|*"debug"*|*"To further debug"*|*"cluster-info dump"*|*"connection"*"refused"*)
+            cluster_id=""
+            ;;
+    esac
     [ -z "$cluster_id" ] && cluster_id=""
 
     # Cluster name - with multiple fallbacks
