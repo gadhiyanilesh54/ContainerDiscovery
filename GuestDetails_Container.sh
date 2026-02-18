@@ -1688,13 +1688,21 @@ discover_services() {
             enabled="unknown"
         fi
 
-        # Skip services that don't exist (not-found) or are inactive and not enabled
-        # Only include services that are: active, enabled, or have listening ports
-        if [ "$service_exists" = false ] && [ "$active" = "inactive" ] && [ "$enabled" = "disabled" ]; then
-            # Check if process is running (might not be a service)
+        # Skip services that are both inactive and not-found/disabled
+        # Only include services that are either:
+        # 1. Active (running)
+        # 2. Enabled (will start on boot)
+        # 3. Have a process running (not a systemd service but exists as a process)
+        if [ "$active" = "inactive" ] && [ "$enabled" = "not-found" ]; then
+            # Check if process is actually running (might not be a service)
             if ! pgrep -x "$service_name" >/dev/null 2>&1; then
                 continue
             fi
+        fi
+
+        # Also skip services that don't exist and are inactive
+        if [ "$service_exists" = false ] && [ "$active" = "inactive" ] && [ "$enabled" = "disabled" ]; then
+            continue
         fi
 
         # Get listening ports for the service
