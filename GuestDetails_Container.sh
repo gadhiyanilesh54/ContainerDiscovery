@@ -1122,9 +1122,142 @@ $config_registries"
         storage_root="$HOME/.local/share/containerd"
     fi
 
-    # Containers (empty for now to keep script manageable)
+    # Collect container details
     containers_json="[]"
+    if [ "$container_count" -gt 0 ]; then
+        container_list=""
+
+        # Iterate through all namespaces
+        for ns in $namespaces; do
+            # Get container details with ctr
+            if [ "$priv" = "root" ]; then
+                container_data=$(try_command "ctr -n $ns containers list 2>/dev/null | tail -n +2" || echo "")
+            elif [ "$priv" = "sudo" ]; then
+                container_data=$(try_command "sudo ctr -n $ns containers list 2>/dev/null | tail -n +2" || echo "")
+            else
+                container_data=$(try_command "ctr -n $ns containers list 2>/dev/null | tail -n +2" || echo "")
+            fi
+
+            if [ -n "$container_data" ]; then
+                while read -r line; do
+                    [ -z "$line" ] && continue
+                    container_id=$(echo "$line" | awk '{print $1}')
+                    [ -z "$container_id" ] && continue
+
+                    image=$(echo "$line" | awk '{print $2}')
+
+                    # Get container name from labels if available
+                    name="$container_id"
+
+                    # Check if task is running
+                    if [ "$priv" = "root" ]; then
+                        task_check=$(try_command "ctr -n $ns tasks list 2>/dev/null | grep -w $container_id" || echo "")
+                    elif [ "$priv" = "sudo" ]; then
+                        task_check=$(try_command "sudo ctr -n $ns tasks list 2>/dev/null | grep -w $container_id" || echo "")
+                    else
+                        task_check=$(try_command "ctr -n $ns tasks list 2>/dev/null | grep -w $container_id" || echo "")
+                    fi
+
+                    if [ -n "$task_check" ]; then
+                        state="running"
+                    else
+                        state="stopped"
+                    fi
+
+                    # Build container object
+                    container_obj=$(json_build_object \
+                        "container_id" "$container_id" \
+                        "name" "$name" \
+                        "image" "$image" \
+                        "state" "$state" \
+                        "namespace" "$ns" \
+                        "orchestrator_managed" "false" \
+                        "orchestrator_type" "" \
+                        "labels" "{}")
+
+                    if [ -z "$container_list" ]; then
+                        container_list="$container_obj"
+                    else
+                        container_list="$container_list,$container_obj"
+                    fi
+                done << EOF
+$container_data
+EOF
+            fi
+        done
+        [ -n "$container_list" ] && containers_json="[$container_list]"
+    fi
+
+    # Collect image details
     images_json="[]"
+    if [ "$image_count" -gt 0 ]; then
+        image_list=""
+
+        # Iterate through all namespaces
+        for ns in $namespaces; do
+            # Get image details with ctr
+            if [ "$priv" = "root" ]; then
+                image_data=$(try_command "ctr -n $ns images list 2>/dev/null | tail -n +2" || echo "")
+            elif [ "$priv" = "sudo" ]; then
+                image_data=$(try_command "sudo ctr -n $ns images list 2>/dev/null | tail -n +2" || echo "")
+            else
+                image_data=$(try_command "ctr -n $ns images list 2>/dev/null | tail -n +2" || echo "")
+            fi
+
+            if [ -n "$image_data" ]; then
+                while read -r line; do
+                    [ -z "$line" ] && continue
+                    image_name=$(echo "$line" | awk '{print $1}')
+                    [ -z "$image_name" ] && continue
+
+                    # Get size (column 4 is number, column 5 is unit, e.g., "295.3 MiB")
+                    size=$(echo "$line" | awk '{print $4" "$5}')
+
+                    # Parse repository and tag from image name
+                    repository=$(echo "$image_name" | sed 's/:.*$//')
+                    tag=$(echo "$image_name" | sed 's/.*://')
+                    [ "$tag" = "$repository" ] && tag="latest"
+
+                    # Convert size to MB
+                    size_mb="0"
+                    case "$size" in
+                        *KiB)
+                            size_num=$(echo "$size" | sed 's/ KiB//')
+                            size_mb=$(awk "BEGIN {printf \"%.2f\", $size_num / 1024}")
+                            ;;
+                        *MiB)
+                            size_num=$(echo "$size" | sed 's/ MiB//')
+                            size_mb="$size_num"
+                            ;;
+                        *GiB)
+                            size_num=$(echo "$size" | sed 's/ GiB//')
+                            size_mb=$(awk "BEGIN {printf \"%.2f\", $size_num * 1024}")
+                            ;;
+                        *)
+                            size_mb="0"
+                            ;;
+                    esac
+
+                    # Build image object
+                    image_obj=$(json_build_object \
+                        "image_id" "$image_name" \
+                        "repository" "$repository" \
+                        "tag" "$tag" \
+                        "size_mb" "$size_mb" \
+                        "created_at" "")
+
+                    if [ -z "$image_list" ]; then
+                        image_list="$image_obj"
+                    else
+                        image_list="$image_list,$image_obj"
+                    fi
+                done << EOF
+$image_data
+EOF
+            fi
+        done
+        [ -n "$image_list" ] && images_json="[$image_list]"
+    fi
 
     # Build final JSON
     CONTAINERD_JSON=$(json_build_object \
@@ -1560,9 +1693,130 @@ docker.io"
         storage_root="$HOME/.local/share/containers/storage"
     fi
 
-    # Containers and images
+    # Collect container details
     containers_json="[]"
+    if [ "$container_count" -gt 0 ]; then
+        container_list=""
+
+        # Get container details with crictl
+        if [ "$priv" = "root" ]; then
+            container_data=$(try_command "crictl ps -a --output json 2>/dev/null" || echo "")
+        elif [ "$priv" = "sudo" ]; then
+            container_data=$(try_command "sudo crictl ps -a --output json 2>/dev/null" || echo "")
+        else
+            container_data=$(try_command "crictl ps -a --output json 2>/dev/null" || echo "")
+        fi
+
+        if [ -n "$container_data" ]; then
+            # Parse JSON output from crictl (simple extraction)
+            container_ids=$(echo "$container_data" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+
+            if [ -n "$container_ids" ]; then
+                for container_id in $container_ids; do
+                    [ -z "$container_id" ] && continue
+
+                    # Get detailed info for each container
+                    if [ "$priv" = "root" ]; then
+                        container_info=$(try_command "crictl inspect $container_id 2>/dev/null" || echo "")
+                    elif [ "$priv" = "sudo" ]; then
+                        container_info=$(try_command "sudo crictl inspect $container_id 2>/dev/null" || echo "")
+                    else
+                        container_info=$(try_command "crictl inspect $container_id 2>/dev/null" || echo "")
+                    fi
+
+                    if [ -n "$container_info" ]; then
+                        name=$(echo "$container_info" | grep -o '"name":"[^"]*"' | head -n1 | cut -d'"' -f4)
+                        image=$(echo "$container_info" | grep -o '"image":"[^"]*"' | head -n1 | cut -d'"' -f4)
+                        state=$(echo "$container_info" | grep -o '"state":"[^"]*"' | head -n1 | cut -d'"' -f4 | tr '[:upper:]' '[:lower:]')
+
+                        [ -z "$name" ] && name="$container_id"
+                        [ -z "$state" ] && state="unknown"
+
+                        # Build container object
+                        container_obj=$(json_build_object \
+                            "container_id" "$container_id" \
+                            "name" "$name" \
+                            "image" "$image" \
+                            "state" "$state" \
+                            "namespace" "k8s.io" \
+                            "orchestrator_managed" "false" \
+                            "orchestrator_type" "" \
+                            "labels" "{}")
+
+                        if [ -z "$container_list" ]; then
+                            container_list="$container_obj"
+                        else
+                            container_list="$container_list,$container_obj"
+                        fi
+                    fi
+                done
+            fi
+        fi
+        [ -n "$container_list" ] && containers_json="[$container_list]"
+    fi
+
+    # Collect image details
     images_json="[]"
+    if [ "$image_count" -gt 0 ]; then
+        image_list=""
+
+        # Get image details with crictl
+        if [ "$priv" = "root" ]; then
+            image_data=$(try_command "crictl images --output json 2>/dev/null" || echo "")
+        elif [ "$priv" = "sudo" ]; then
+            image_data=$(try_command "sudo crictl images --output json 2>/dev/null" || echo "")
+        else
+            image_data=$(try_command "crictl images --output json 2>/dev/null" || echo "")
+        fi
+
+        if [ -n "$image_data" ]; then
+            # Parse JSON output from crictl (simple extraction)
+            # Extract image IDs
+            image_ids=$(echo "$image_data" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+
+            if [ -n "$image_ids" ]; then
+                for image_id in $image_ids; do
+                    [ -z "$image_id" ] && continue
+
+                    # Get repository tags and size
+                    image_info=$(echo "$image_data" | grep -A10 "\"id\":\"$image_id\"")
+
+                    repoTags=$(echo "$image_info" | grep -o '"repoTags":\["[^"]*"' | cut -d'"' -f4 | head -n1)
+                    size=$(echo "$image_info" | grep -o '"size":"[0-9]*"' | cut -d'"' -f4)
+
+                    if [ -n "$repoTags" ]; then
+                        repository=$(echo "$repoTags" | sed 's/:.*$//')
+                        tag=$(echo "$repoTags" | sed 's/.*://')
+                        [ "$tag" = "$repository" ] && tag="latest"
+                    else
+                        repository="<none>"
+                        tag="<none>"
+                    fi
+
+                    # Convert size to MB (size is in bytes)
+                    size_mb="0"
+                    if [ -n "$size" ] && [ "$size" -gt 0 ]; then
+                        size_mb=$(awk "BEGIN {printf \"%.2f\", $size / 1024 / 1024}")
+                    fi
+
+                    # Build image object
+                    image_obj=$(json_build_object \
+                        "image_id" "$image_id" \
+                        "repository" "$repository" \
+                        "tag" "$tag" \
+                        "size_mb" "$size_mb" \
+                        "created_at" "")
+
+                    if [ -z "$image_list" ]; then
+                        image_list="$image_obj"
+                    else
+                        image_list="$image_list,$image_obj"
+                    fi
+                done
+            fi
+        fi
+        [ -n "$image_list" ] && images_json="[$image_list]"
+    fi
 
     # Build final JSON
     CRIO_JSON=$(json_build_object \
@@ -1656,9 +1910,94 @@ docker.io
 quay.io"
     registries_json=$(json_build_array "$registries" false)
 
-    # Containers and images
+    # Collect container details
     containers_json="[]"
+    if [ "$container_count" -gt 0 ]; then
+        container_list=""
+
+        # Get container details with format: ID|Name|Image|State|CreatedAt
+        container_data=$(try_command "podman ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.CreatedAt}}' 2>/dev/null" || echo "")
+
+        if [ -n "$container_data" ]; then
+            while IFS='|' read -r container_id name image state created_at; do
+                [ -z "$container_id" ] && continue
+
+                # Convert state to lowercase
+                state_lower=$(echo "$state" | tr '[:upper:]' '[:lower:]')
+
+                # Build container object
+                container_obj=$(json_build_object \
+                    "container_id" "$container_id" \
+                    "name" "$name" \
+                    "image" "$image" \
+                    "state" "$state_lower" \
+                    "namespace" "" \
+                    "orchestrator_managed" "false" \
+                    "orchestrator_type" "" \
+                    "labels" "{}")
+
+                if [ -z "$container_list" ]; then
+                    container_list="$container_obj"
+                else
+                    container_list="$container_list,$container_obj"
+                fi
+            done << EOF
+$container_data
+EOF
+        fi
+        [ -n "$container_list" ] && containers_json="[$container_list]"
+    fi
+
+    # Collect image details
     images_json="[]"
+    if [ "$image_count" -gt 0 ]; then
+        image_list=""
+
+        # Get image details with format: ID|Repository|Tag|CreatedAt|Size
+        image_data=$(try_command "podman images --format '{{.ID}}|{{.Repository}}|{{.Tag}}|{{.CreatedAt}}|{{.Size}}' 2>/dev/null" || echo "")
+
+        if [ -n "$image_data" ]; then
+            while IFS='|' read -r image_id repository tag created_at size; do
+                [ -z "$image_id" ] && continue
+
+                # Convert size to MB (handle KB, MB, GB)
+                size_mb="0"
+                case "$size" in
+                    *KB)
+                        size_num=$(echo "$size" | sed 's/KB//')
+                        size_mb=$(awk "BEGIN {printf \"%.2f\", $size_num / 1024}")
+                        ;;
+                    *MB)
+                        size_mb=$(echo "$size" | sed 's/MB//')
+                        ;;
+                    *GB)
+                        size_num=$(echo "$size" | sed 's/GB//')
+                        size_mb=$(awk "BEGIN {printf \"%.2f\", $size_num * 1024}")
+                        ;;
+                    *)
+                        size_mb="0"
+                        ;;
+                esac
+
+                # Build image object
+                image_obj=$(json_build_object \
+                    "image_id" "$image_id" \
+                    "repository" "$repository" \
+                    "tag" "$tag" \
+                    "size_mb" "$size_mb" \
+                    "created_at" "$created_at")
+
+                if [ -z "$image_list" ]; then
+                    image_list="$image_obj"
+                else
+                    image_list="$image_list,$image_obj"
+                fi
+            done << EOF
+$image_data
+EOF
+        fi
+        [ -n "$image_list" ] && images_json="[$image_list]"
+    fi
 
     # Build final JSON
     PODMAN_JSON=$(json_build_object \
