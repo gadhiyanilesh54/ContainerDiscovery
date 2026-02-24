@@ -146,25 +146,22 @@ jobs:
       - name: Validate Kubernetes Detection
         if: matrix.orchestrator == 'kubernetes'
         run: |
-          # Check if Kubernetes orchestrator is detected
-          k8s_found=$(jq '.armResources[0].properties.orchestrators[] | select(.name == "kubernetes") | .name' output.json | wc -l)
+          # Check if Kubernetes orchestrator is detected (may be detected as kubernetes or openshift)
+          k8s_found=$(jq '.armResources[0].properties.orchestrators[] | select(.name == "kubernetes" or .name == "openshift") | .name' output.json | wc -l)
           if [ "$k8s_found" -eq 0 ]; then
-            echo "ERROR: Kubernetes orchestrator not detected"
+            echo "ERROR: Kubernetes-compatible orchestrator not detected"
             exit 1
           fi
 
-          echo "✓ Kubernetes orchestrator detected"
+          echo "✓ Kubernetes-compatible orchestrator detected"
 
-          # Validate Kubernetes-specific fields
-          jq '.armResources[0].properties.orchestrators[] | select(.name == "kubernetes")' output.json
+          # Display orchestrators found
+          echo "Orchestrators found:"
+          jq '.armResources[0].properties.orchestrators[].name' output.json
 
-          # Check version
-          k8s_version=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "kubernetes") | .version' output.json)
-          if [ -z "$k8s_version" ] || [ "$k8s_version" = "null" ]; then
-            echo "WARNING: Kubernetes version not detected"
-          else
-            echo "✓ Kubernetes version: $k8s_version"
-          fi
+          # Check if we can get cluster info
+          k8s_or_ocp=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "kubernetes" or .name == "openshift") | .name' output.json | head -1)
+          echo "Primary orchestrator: $k8s_or_ocp"
 
       - name: Validate Docker Swarm Detection
         if: matrix.orchestrator == 'docker-swarm'

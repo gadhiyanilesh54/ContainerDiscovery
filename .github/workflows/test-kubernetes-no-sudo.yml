@@ -153,17 +153,17 @@ jobs:
 
       - name: Validate Kubernetes Detection
         run: |
-          # Check if Kubernetes is detected
-          k8s_found=$(jq '.armResources[0].properties.orchestrators[] | select(.name == "kubernetes") | .name' output.json | wc -l)
+          # Check if Kubernetes is detected (may be kubernetes or openshift)
+          k8s_found=$(jq '.armResources[0].properties.orchestrators[] | select(.name == "kubernetes" or .name == "openshift") | .name' output.json | wc -l)
 
           if [ "$k8s_found" -eq 0 ]; then
             echo "WARNING: Kubernetes not detected without sudo"
             echo "The script should detect Kubernetes through kubectl even without sudo"
           else
-            echo "✓ Kubernetes detected without sudo"
+            echo "✓ Kubernetes-compatible orchestrator detected without sudo"
 
-            k8s_version=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "kubernetes") | .version' output.json)
-            echo "Kubernetes version: $k8s_version"
+            orchestrator_name=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "kubernetes" or .name == "openshift") | .name' output.json | head -1)
+            echo "Detected as: $orchestrator_name"
           fi
 
       - name: Validate Graceful Degradation

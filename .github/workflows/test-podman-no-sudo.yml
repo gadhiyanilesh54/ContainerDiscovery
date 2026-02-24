@@ -1,0 +1,137 @@
+name: Test Podman (Without Sudo)
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  test-podman-no-sudo:
+    name: Test Podman without Sudo Privileges (Rootless)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+
+      - name: Configure Rootless Podman
+        run: |
+          # Enable lingering for the user
+          sudo loginctl enable-linger $USER || true
+
+          # Verify Podman works in rootless mode
+          podman version
+          podman info
+
+      - name: Pull and Run Test Containers (Rootless)
+        run: |
+          # Pull test images as rootless user
+          podman pull docker.io/library/nginx:alpine
+          podman pull docker.io/library/busybox:latest
+
+          # List images
+          podman images
+
+          # Run some test containers
+          podman run -d --name nginx-rootless nginx:alpine
+          podman run -d --name busybox-rootless busybox:latest sleep 3600
+
+          # List running containers
+          podman ps -a
+
+      - name: Run Container Discovery Script without Sudo
+        run: |
+          chmod +x ./GuestDetails_Container.sh
+          ./GuestDetails_Container.sh
+
+      - name: Display Output
+        if: always()
+        run: |
+          echo "=== Output JSON ==="
+          if [ -f output.json ]; then
+            cat output.json | jq . || cat output.json
+          else
+            echo "ERROR: output.json not found"
+          fi
+
+          echo ""
+          echo "=== Debug Log ==="
+          if [ -f debug.txt ]; then
+            tail -100 debug.txt
+          else
+            echo "No debug.txt found"
+          fi
+
+          echo ""
+          echo "=== Error Log ==="
+          if [ -f error.txt ]; then
+            cat error.txt
+          else
+            echo "No error.txt found"
+          fi
+
+      - name: Validate JSON Structure
+        run: |
+          # Validate JSON syntax
+          jq empty output.json || { echo "ERROR: Invalid JSON"; exit 1; }
+          echo "✓ JSON is valid"
+
+      - name: Validate Podman Detection
+        run: |
+          # Check if Podman runtime is detected in rootless mode
+          podman_found=$(jq '.armResources[0].properties.container_runtimes[] | select(.name == "podman") | .name' output.json | wc -l)
+
+          if [ "$podman_found" -eq 0 ]; then
+            echo "WARNING: Podman runtime not detected in rootless mode"
+            echo "The script may need rootless user socket access"
+            echo "Detected runtimes:"
+            jq '.armResources[0].properties.container_runtimes[].name' output.json || echo "None"
+          else
+            echo "✓ Podman runtime detected in rootless mode"
+
+            # Validate rootless field
+            rootless=$(jq -r '.armResources[0].properties.container_runtimes[] | select(.name == "podman") | .rootless' output.json)
+            echo "Rootless mode: $rootless"
+
+            if [ "$rootless" = "true" ]; then
+              echo "✓ Correctly detected as rootless"
+            else
+              echo "NOTE: Not detected as rootless, may be running with elevated privileges"
+            fi
+
+            # Check container count
+            container_count=$(jq -r '.armResources[0].properties.container_runtimes[] | select(.name == "podman") | .container_count' output.json)
+            echo "Container count: $container_count"
+          fi
+
+      - name: Validate Graceful Degradation
+        run: |
+          echo "✓ Script completed without sudo"
+          echo "✓ JSON output is valid"
+
+          runtime_count=$(jq '.armResources[0].properties.container_runtimes | length' output.json)
+          echo "Total runtimes detected: $runtime_count"
+
+      - name: Upload Test Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: podman-no-sudo-test-results
+          path: |
+            output.json
+            debug.txt
+            error.txt
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          podman stop --all || true
+          podman rm --all || true

@@ -1,0 +1,111 @@
+name: Test CRI-O (Without Sudo)
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  test-crio-no-sudo:
+    name: Test CRI-O without Sudo Privileges
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install CRI-O
+        run: |
+          # Add CRI-O repository
+          OS=xUbuntu_22.04
+          VERSION=1.28
+
+          echo "deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/$OS/ /" | sudo tee /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list
+          echo "deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/$VERSION/$OS/ /" | sudo tee /etc/apt/sources.list.d/devel:kubic:libcontainers:stable:cri-o:$VERSION.list
+
+          curl -L https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/$OS/Release.key | sudo apt-key add -
+          curl -L https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/$VERSION/$OS/Release.key | sudo apt-key add -
+
+          sudo apt-get update
+          sudo apt-get install -y cri-o cri-o-runc cri-tools
+
+      - name: Configure and Start CRI-O
+        run: |
+          # Start CRI-O service
+          sudo systemctl daemon-reload
+          sudo systemctl enable crio
+          sudo systemctl start crio
+
+          # Verify CRI-O is running
+          sudo systemctl status crio
+
+      - name: Run Container Discovery Script without Sudo
+        run: |
+          chmod +x ./GuestDetails_Container.sh
+          ./GuestDetails_Container.sh
+
+      - name: Display Output
+        if: always()
+        run: |
+          echo "=== Output JSON ==="
+          if [ -f output.json ]; then
+            cat output.json | jq . || cat output.json
+          else
+            echo "ERROR: output.json not found"
+          fi
+
+          echo ""
+          echo "=== Debug Log ==="
+          if [ -f debug.txt ]; then
+            tail -100 debug.txt
+          else
+            echo "No debug.txt found"
+          fi
+
+          echo ""
+          echo "=== Error Log ==="
+          if [ -f error.txt ]; then
+            cat error.txt
+          else
+            echo "No error.txt found"
+          fi
+
+      - name: Validate JSON Structure
+        run: |
+          # Validate JSON syntax
+          jq empty output.json || { echo "ERROR: Invalid JSON"; exit 1; }
+          echo "✓ JSON is valid"
+
+      - name: Validate Graceful Degradation
+        run: |
+          echo "✓ Script completed without sudo"
+          echo "✓ JSON output is valid"
+
+          # Check if any runtimes were detected
+          runtime_count=$(jq '.armResources[0].properties.container_runtimes | length' output.json)
+          echo "Runtimes detected: $runtime_count"
+
+          if [ "$runtime_count" -eq 0 ]; then
+            echo "NOTE: No runtimes detected without sudo (expected for CRI-O without privileges)"
+          else
+            echo "Detected runtimes:"
+            jq '.armResources[0].properties.container_runtimes[].name' output.json
+          fi
+
+      - name: Upload Test Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crio-no-sudo-test-results
+          path: |
+            output.json
+            debug.txt
+            error.txt
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo systemctl stop crio || true
