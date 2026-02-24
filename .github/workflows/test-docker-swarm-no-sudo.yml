@@ -1,0 +1,229 @@
+name: Test Docker Swarm (Without Sudo)
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  test-docker-swarm-no-sudo:
+    name: Test Docker Swarm without Sudo Privileges
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Docker
+        run: |
+          # Ensure Docker is running
+          sudo systemctl start docker
+          sudo systemctl enable docker
+          docker version
+
+      - name: Initialize Docker Swarm
+        run: |
+          # Initialize Swarm mode
+          docker swarm init --advertise-addr 127.0.0.1
+
+          # Display Swarm info
+          docker info | grep -A 10 "Swarm:"
+          docker node ls
+
+      - name: Deploy Test Services
+        run: |
+          # Create test services
+          docker service create \
+            --name nginx-web \
+            --replicas 2 \
+            --publish published=8080,target=80 \
+            nginx:latest
+
+          docker service create \
+            --name redis-cache \
+            --replicas 1 \
+            redis:latest
+
+          # Wait for services
+          sleep 15
+
+          docker service ls
+          docker service ps nginx-web
+
+      - name: Create Standalone Containers
+        run: |
+          # Create standalone containers
+          docker run -d --name standalone-nginx nginx:latest
+          docker ps -a
+
+      - name: Setup User Permissions
+        run: |
+          # Note: In GitHub Actions, the runner user already has Docker access
+          # To simulate no-sudo, we just won't use sudo in the script execution
+          echo "Current user: $(whoami)"
+          echo "Docker group members:"
+          getent group docker || true
+
+          # Verify Docker access without sudo
+          docker info > /dev/null && echo "✓ Docker accessible without sudo"
+
+      - name: Run Container Discovery Script without Sudo
+        run: |
+          chmod +x ./GuestDetails_Container.sh
+          # Run without sudo - the script should handle this gracefully
+          ./GuestDetails_Container.sh
+
+      - name: Display Output
+        if: always()
+        run: |
+          echo "=== Output JSON ==="
+          if [ -f output.json ]; then
+            cat output.json | jq . || cat output.json
+          else
+            echo "ERROR: output.json not found"
+          fi
+
+          echo ""
+          echo "=== Debug Log ==="
+          if [ -f debug.txt ]; then
+            cat debug.txt
+          else
+            echo "No debug.txt found"
+          fi
+
+          echo ""
+          echo "=== Error Log ==="
+          if [ -f error.txt ]; then
+            cat error.txt
+          else
+            echo "No error.txt found"
+          fi
+
+      - name: Validate JSON Structure
+        run: |
+          # Validate JSON syntax
+          jq empty output.json || { echo "ERROR: Invalid JSON"; exit 1; }
+          echo "✓ JSON is valid"
+
+          # Validate basic structure
+          jq -e '.armResources[0].properties.schema_version' output.json || { echo "ERROR: Missing schema_version"; exit 1; }
+          jq -e '.armResources[0].properties.timestamp' output.json || { echo "ERROR: Missing timestamp"; exit 1; }
+
+          echo "✓ Basic structure is valid"
+
+      - name: Validate Host Information
+        run: |
+          hostname=$(jq -r '.armResources[0].properties.host_info.hostname' output.json)
+          os=$(jq -r '.armResources[0].properties.host_info.os' output.json)
+
+          echo "Hostname: $hostname"
+          echo "OS: $os"
+
+          if [ -z "$hostname" ] || [ "$hostname" = "null" ]; then
+            echo "ERROR: hostname not detected"
+            exit 1
+          fi
+
+          echo "✓ Host information detected without sudo"
+
+      - name: Validate Docker Runtime Detection
+        run: |
+          # Docker should be detectable even without sudo if user is in docker group
+          docker_found=$(jq '.armResources[0].properties.container_runtimes[] | select(.name == "docker") | .name' output.json | wc -l)
+
+          if [ "$docker_found" -eq 0 ]; then
+            echo "WARNING: Docker runtime not detected without sudo"
+            echo "Note: User might not have access to Docker socket"
+          else
+            echo "✓ Docker runtime detected without sudo"
+
+            docker_version=$(jq -r '.armResources[0].properties.container_runtimes[] | select(.name == "docker") | .version' output.json)
+            echo "Docker version: $docker_version"
+          fi
+
+      - name: Validate Docker Swarm Detection
+        run: |
+          # Check if Swarm is detected
+          swarm_found=$(jq '.armResources[0].properties.orchestrators[] | select(.name == "docker_swarm") | .name' output.json | wc -l)
+
+          if [ "$swarm_found" -eq 0 ]; then
+            echo "WARNING: Docker Swarm not detected without sudo"
+            echo "The script should detect Swarm if Docker is accessible"
+          else
+            echo "✓ Docker Swarm detected without sudo"
+
+            cluster_id=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "docker_swarm") | .cluster_id' output.json)
+            state=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "docker_swarm") | .state' output.json)
+
+            echo "Cluster ID: $cluster_id"
+            echo "State: $state"
+          fi
+
+      - name: Validate Graceful Degradation
+        run: |
+          echo "✓ Script completed without sudo"
+          echo "✓ JSON output is valid"
+
+          # The script should handle privilege limitations gracefully
+          # Some fields may be empty but structure should be valid
+
+          runtime_count=$(jq '.armResources[0].properties.container_runtimes | length' output.json)
+          orchestrator_count=$(jq '.armResources[0].properties.orchestrators | length' output.json)
+
+          echo "Runtimes detected: $runtime_count"
+          echo "Orchestrators detected: $orchestrator_count"
+
+      - name: Compare Privilege Levels
+        run: |
+          echo "=== Detection Summary (No Sudo) ==="
+          echo "Container Runtimes:"
+          jq '.armResources[0].properties.container_runtimes[].name' output.json || echo "None"
+
+          echo ""
+          echo "Orchestrators:"
+          jq '.armResources[0].properties.orchestrators[].name' output.json || echo "None"
+
+          echo ""
+          echo "Services:"
+          jq '.armResources[0].properties.services[].name' output.json || echo "None"
+
+          echo ""
+          echo "Note: Detection depends on user's access to Docker socket and commands"
+
+      - name: Validate Error Handling
+        run: |
+          # Check that the script doesn't fail catastrophically without sudo
+          if [ ! -f output.json ]; then
+            echo "ERROR: Script failed to produce output.json"
+            exit 1
+          fi
+
+          # Check exit code was recorded (script should complete even with limited access)
+          echo "✓ Script completed successfully without sudo"
+
+          # Check for privilege-related messages in error.txt
+          if [ -f error.txt ] && [ -s error.txt ]; then
+            echo "Errors encountered (expected for limited privileges):"
+            cat error.txt
+          fi
+
+      - name: Upload Test Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-swarm-no-sudo-test-results
+          path: |
+            output.json
+            debug.txt
+            error.txt
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Cleanup services and containers
+          docker service rm nginx-web redis-cache || true
+          docker rm -f standalone-nginx || true
+          docker swarm leave --force || true

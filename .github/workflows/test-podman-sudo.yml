@@ -1,0 +1,168 @@
+name: Test Podman (With Sudo)
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  test-podman-sudo:
+    name: Test Podman with Sudo Privileges
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+
+      - name: Verify Podman Installation
+        run: |
+          podman version
+          podman info
+
+      - name: Pull and Run Test Containers
+        run: |
+          # Pull test images
+          sudo podman pull docker.io/library/nginx:latest
+          sudo podman pull docker.io/library/redis:latest
+          sudo podman pull docker.io/library/busybox:latest
+
+          # List images
+          sudo podman images
+
+          # Run some test containers
+          sudo podman run -d --name nginx-test nginx:latest
+          sudo podman run -d --name redis-test redis:latest
+          sudo podman run -d --name busybox-test busybox:latest sleep 3600
+
+          # List running containers
+          sudo podman ps -a
+
+      - name: Run Container Discovery Script with Sudo
+        run: |
+          chmod +x ./GuestDetails_Container.sh
+          sudo ./GuestDetails_Container.sh
+
+      - name: Display Output
+        if: always()
+        run: |
+          echo "=== Output JSON ==="
+          if [ -f output.json ]; then
+            cat output.json | jq . || cat output.json
+          else
+            echo "ERROR: output.json not found"
+          fi
+
+          echo ""
+          echo "=== Debug Log ==="
+          if [ -f debug.txt ]; then
+            tail -100 debug.txt
+          else
+            echo "No debug.txt found"
+          fi
+
+          echo ""
+          echo "=== Error Log ==="
+          if [ -f error.txt ]; then
+            cat error.txt
+          else
+            echo "No error.txt found"
+          fi
+
+      - name: Validate JSON Structure
+        run: |
+          # Validate JSON syntax
+          jq empty output.json || { echo "ERROR: Invalid JSON"; exit 1; }
+          echo "✓ JSON is valid"
+
+      - name: Validate Podman Detection
+        run: |
+          # Check if Podman runtime is detected
+          podman_found=$(jq '.armResources[0].properties.container_runtimes[] | select(.name == "podman") | .name' output.json | wc -l)
+
+          if [ "$podman_found" -eq 0 ]; then
+            echo "ERROR: Podman runtime not detected"
+            echo "Detected runtimes:"
+            jq '.armResources[0].properties.container_runtimes[].name' output.json || echo "None"
+            exit 1
+          fi
+
+          echo "✓ Podman runtime detected"
+
+          # Validate Podman details
+          podman_version=$(jq -r '.armResources[0].properties.container_runtimes[] | select(.name == "podman") | .version' output.json)
+          podman_socket=$(jq -r '.armResources[0].properties.container_runtimes[] | select(.name == "podman") | .socket' output.json)
+          container_count=$(jq -r '.armResources[0].properties.container_runtimes[] | select(.name == "podman") | .container_count' output.json)
+          image_count=$(jq -r '.armResources[0].properties.container_runtimes[] | select(.name == "podman") | .image_count' output.json)
+          rootless=$(jq -r '.armResources[0].properties.container_runtimes[] | select(.name == "podman") | .rootless' output.json)
+
+          echo "Podman version: $podman_version"
+          echo "Podman socket: $podman_socket"
+          echo "Container count: $container_count"
+          echo "Image count: $image_count"
+          echo "Rootless: $rootless"
+
+          # Verify we have containers and images
+          if [ "$container_count" -eq 0 ]; then
+            echo "WARNING: No containers detected"
+          else
+            echo "✓ Containers detected: $container_count"
+          fi
+
+          if [ "$image_count" -eq 0 ]; then
+            echo "WARNING: No images detected"
+          else
+            echo "✓ Images detected: $image_count"
+          fi
+
+      - name: Validate Container Details
+        run: |
+          # Check if container details are populated
+          containers=$(jq '.armResources[0].properties.container_runtimes[] | select(.name == "podman") | .containers' output.json)
+
+          if [ "$containers" = "null" ] || [ "$containers" = "[]" ]; then
+            echo "WARNING: No container details found"
+          else
+            container_details_count=$(jq '.armResources[0].properties.container_runtimes[] | select(.name == "podman") | .containers | length' output.json)
+            echo "Container details count: $container_details_count"
+
+            if [ "$container_details_count" -gt 0 ]; then
+              echo "✓ Container details populated"
+            fi
+          fi
+
+      - name: Validate Services Detection
+        run: |
+          # Check if Podman service is detected
+          podman_svc=$(jq '.armResources[0].properties.services[] | select(.name == "podman") | .name' output.json | wc -l)
+          if [ "$podman_svc" -eq 0 ]; then
+            echo "NOTE: Podman service not detected (Podman doesn't always run as a service)"
+          else
+            echo "✓ Podman service detected"
+
+            podman_active=$(jq -r '.armResources[0].properties.services[] | select(.name == "podman") | .active' output.json)
+            echo "Podman service status: $podman_active"
+          fi
+
+      - name: Upload Test Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: podman-sudo-test-results
+          path: |
+            output.json
+            debug.txt
+            error.txt
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo podman stop --all || true
+          sudo podman rm --all || true

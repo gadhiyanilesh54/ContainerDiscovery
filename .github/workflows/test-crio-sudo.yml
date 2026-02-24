@@ -1,0 +1,231 @@
+name: Test CRI-O (With Sudo)
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  test-crio-sudo:
+    name: Test CRI-O with Sudo Privileges
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install CRI-O
+        run: |
+          # Install CRI-O using the official script method
+          # This is more reliable than manual repository setup
+
+          # Install dependencies
+          sudo apt-get update
+          sudo apt-get install -y apt-transport-https ca-certificates curl gnupg2
+
+          # Add Kubernetes repo (needed for cri-tools)
+          sudo mkdir -p /etc/apt/keyrings
+          curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | \
+            sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /" | \
+            sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+          # Install cri-tools first
+          sudo apt-get update
+          sudo apt-get install -y cri-tools
+
+          # Download and install CRI-O directly from GitHub releases
+          CRIO_VERSION=v1.28.0
+          wget https://github.com/cri-o/cri-o/releases/download/$CRIO_VERSION/crio.amd64.$CRIO_VERSION.tar.gz
+          sudo tar -C / -xzf crio.amd64.$CRIO_VERSION.tar.gz
+          rm crio.amd64.$CRIO_VERSION.tar.gz
+
+          # Download and install conmon
+          wget https://github.com/containers/conmon/releases/download/v2.1.10/conmon.amd64 -O conmon
+          sudo install -D -m 755 conmon /usr/local/bin/conmon
+          rm conmon
+
+          # Download and install runc
+          wget https://github.com/opencontainers/runc/releases/download/v1.1.12/runc.amd64
+          sudo install -D -m 755 runc.amd64 /usr/local/bin/runc
+          rm runc.amd64
+
+          # Download and install CNI plugins
+          CNI_VERSION=v1.3.0
+          wget https://github.com/containernetworking/plugins/releases/download/$CNI_VERSION/cni-plugins-linux-amd64-$CNI_VERSION.tgz
+          sudo mkdir -p /opt/cni/bin
+          sudo tar -C /opt/cni/bin -xzf cni-plugins-linux-amd64-$CNI_VERSION.tgz
+          rm cni-plugins-linux-amd64-$CNI_VERSION.tgz
+
+      - name: Configure and Start CRI-O
+        run: |
+          # Start CRI-O service
+          sudo systemctl daemon-reload
+          sudo systemctl enable crio
+          sudo systemctl start crio
+
+          # Verify CRI-O is running
+          sudo systemctl status crio
+
+          # Configure crictl
+          sudo sh -c 'cat > /etc/crictl.yaml << EOF
+          runtime-endpoint: unix:///var/run/crio/crio.sock
+          image-endpoint: unix:///var/run/crio/crio.sock
+          timeout: 10
+          EOF'
+
+          # Verify crictl works
+          sudo crictl version
+          sudo crictl info
+
+      - name: Pull and Run Test Containers
+        run: |
+          # Pull some test images
+          sudo crictl pull docker.io/library/nginx:latest
+          sudo crictl pull docker.io/library/redis:latest
+          sudo crictl pull docker.io/library/busybox:latest
+
+          # List images
+          sudo crictl images
+
+          # Create and run test pods/containers
+          # Create a pod sandbox
+          cat <<EOF | sudo tee /tmp/pod-config.json
+          {
+            "metadata": {
+              "name": "nginx-pod",
+              "namespace": "default",
+              "uid": "hdishd83djaidwnduwk28bcsb"
+            },
+            "log_directory": "/tmp",
+            "linux": {}
+          }
+          EOF
+
+          POD_ID=$(sudo crictl runp /tmp/pod-config.json)
+          echo "Created pod: $POD_ID"
+
+          # Create container config
+          cat <<EOF | sudo tee /tmp/container-config.json
+          {
+            "metadata": {
+              "name": "nginx-container"
+            },
+            "image": {
+              "image": "docker.io/library/nginx:latest"
+            },
+            "log_path": "nginx.log"
+          }
+          EOF
+
+          CONTAINER_ID=$(sudo crictl create $POD_ID /tmp/container-config.json /tmp/pod-config.json)
+          echo "Created container: $CONTAINER_ID"
+
+          sudo crictl start $CONTAINER_ID
+          echo "Started container: $CONTAINER_ID"
+
+          # List pods and containers
+          sudo crictl pods
+          sudo crictl ps -a
+
+      - name: Run Container Discovery Script with Sudo
+        run: |
+          chmod +x ./GuestDetails_Container.sh
+          sudo ./GuestDetails_Container.sh
+
+      - name: Display Output
+        if: always()
+        run: |
+          echo "=== Output JSON ==="
+          if [ -f output.json ]; then
+            cat output.json | jq . || cat output.json
+          else
+            echo "ERROR: output.json not found"
+          fi
+
+          echo ""
+          echo "=== Debug Log ==="
+          if [ -f debug.txt ]; then
+            tail -100 debug.txt
+          else
+            echo "No debug.txt found"
+          fi
+
+          echo ""
+          echo "=== Error Log ==="
+          if [ -f error.txt ]; then
+            cat error.txt
+          else
+            echo "No error.txt found"
+          fi
+
+      - name: Validate JSON Structure
+        run: |
+          # Validate JSON syntax
+          jq empty output.json || { echo "ERROR: Invalid JSON"; exit 1; }
+          echo "✓ JSON is valid"
+
+      - name: Validate CRI-O Detection
+        run: |
+          # Check if CRI-O runtime is detected
+          crio_found=$(jq '.armResources[0].properties.container_runtimes[] | select(.name == "crio") | .name' output.json | wc -l)
+
+          if [ "$crio_found" -eq 0 ]; then
+            echo "ERROR: CRI-O runtime not detected"
+            echo "Detected runtimes:"
+            jq '.armResources[0].properties.container_runtimes[].name' output.json || echo "None"
+            exit 1
+          fi
+
+          echo "✓ CRI-O runtime detected"
+
+          # Validate CRI-O details
+          crio_version=$(jq -r '.armResources[0].properties.container_runtimes[] | select(.name == "crio") | .version' output.json)
+          crio_socket=$(jq -r '.armResources[0].properties.container_runtimes[] | select(.name == "crio") | .socket' output.json)
+          container_count=$(jq -r '.armResources[0].properties.container_runtimes[] | select(.name == "crio") | .container_count' output.json)
+          image_count=$(jq -r '.armResources[0].properties.container_runtimes[] | select(.name == "crio") | .image_count' output.json)
+
+          echo "CRI-O version: $crio_version"
+          echo "CRI-O socket: $crio_socket"
+          echo "Container count: $container_count"
+          echo "Image count: $image_count"
+
+          # Verify we have some containers and images
+          if [ "$image_count" -eq 0 ]; then
+            echo "WARNING: No images detected"
+          else
+            echo "✓ Images detected: $image_count"
+          fi
+
+      - name: Validate Services Detection
+        run: |
+          # Check if CRI-O service is detected
+          crio_svc=$(jq '.armResources[0].properties.services[] | select(.name == "crio") | .name' output.json | wc -l)
+          if [ "$crio_svc" -eq 0 ]; then
+            echo "WARNING: CRI-O service not detected in services list"
+          else
+            echo "✓ CRI-O service detected"
+
+            crio_active=$(jq -r '.armResources[0].properties.services[] | select(.name == "crio") | .active' output.json)
+            echo "CRI-O service status: $crio_active"
+          fi
+
+      - name: Upload Test Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crio-sudo-test-results
+          path: |
+            output.json
+            debug.txt
+            error.txt
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo crictl stopp --all || true
+          sudo crictl rmp --all || true
+          sudo systemctl stop crio || true

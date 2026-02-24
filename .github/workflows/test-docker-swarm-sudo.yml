@@ -1,0 +1,319 @@
+name: Test Docker Swarm (With Sudo)
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  test-docker-swarm-sudo:
+    name: Test Docker Swarm with Sudo Privileges
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Docker
+        run: |
+          # Ensure Docker is running
+          sudo systemctl start docker
+          sudo systemctl enable docker
+          docker version
+
+      - name: Initialize Docker Swarm
+        run: |
+          # Initialize Swarm mode
+          docker swarm init --advertise-addr 127.0.0.1
+
+          # Display Swarm info
+          docker info | grep -A 10 "Swarm:"
+          docker node ls
+
+      - name: Deploy Test Services
+        run: |
+          # Create an overlay network
+          docker network create --driver overlay test-network
+
+          # Deploy nginx service
+          docker service create \
+            --name nginx-web \
+            --replicas 3 \
+            --publish published=8080,target=80 \
+            --network test-network \
+            nginx:latest
+
+          # Deploy redis service
+          docker service create \
+            --name redis-cache \
+            --replicas 2 \
+            --network test-network \
+            redis:latest
+
+          # Deploy a simple alpine service
+          docker service create \
+            --name worker \
+            --replicas 2 \
+            alpine:latest sleep 3600
+
+          # Wait for services to be running
+          echo "Waiting for services to start..."
+          sleep 20
+
+          # Display service status
+          docker service ls
+          docker service ps nginx-web
+          docker service ps redis-cache
+          docker service ps worker
+
+      - name: Create Standalone Containers
+        run: |
+          # Create some standalone containers (not managed by Swarm)
+          docker run -d --name standalone-postgres -e POSTGRES_PASSWORD=test postgres:latest
+          docker run -d --name standalone-mongo mongo:latest
+
+          # Display all containers
+          docker ps -a
+
+      - name: Verify Docker Swarm State
+        run: |
+          echo "=== Swarm Status ==="
+          docker info | grep -A 20 "Swarm:"
+
+          echo ""
+          echo "=== Node Information ==="
+          docker node ls
+
+          echo ""
+          echo "=== Service Information ==="
+          docker service ls
+
+          echo ""
+          echo "=== Network Information ==="
+          docker network ls
+
+          echo ""
+          echo "=== All Containers ==="
+          docker ps -a
+
+      - name: Run Container Discovery Script with Sudo
+        run: |
+          chmod +x ./GuestDetails_Container.sh
+          sudo ./GuestDetails_Container.sh
+
+      - name: Display Output
+        if: always()
+        run: |
+          echo "=== Output JSON ==="
+          if [ -f output.json ]; then
+            cat output.json | jq . || cat output.json
+          else
+            echo "ERROR: output.json not found"
+          fi
+
+          echo ""
+          echo "=== Debug Log ==="
+          if [ -f debug.txt ]; then
+            cat debug.txt
+          else
+            echo "No debug.txt found"
+          fi
+
+          echo ""
+          echo "=== Error Log ==="
+          if [ -f error.txt ]; then
+            cat error.txt
+          else
+            echo "No error.txt found"
+          fi
+
+      - name: Validate JSON Structure
+        run: |
+          # Validate JSON syntax
+          jq empty output.json || { echo "ERROR: Invalid JSON"; exit 1; }
+          echo "✓ JSON is valid"
+
+          # Validate schema version
+          schema_version=$(jq -r '.armResources[0].properties.schema_version' output.json)
+          echo "Schema version: $schema_version"
+
+          # Validate timestamp
+          timestamp=$(jq -r '.armResources[0].properties.timestamp' output.json)
+          echo "Timestamp: $timestamp"
+
+      - name: Validate Host Information
+        run: |
+          hostname=$(jq -r '.armResources[0].properties.host_info.hostname' output.json)
+          os=$(jq -r '.armResources[0].properties.host_info.os' output.json)
+          kernel=$(jq -r '.armResources[0].properties.host_info.kernel' output.json)
+
+          echo "Hostname: $hostname"
+          echo "OS: $os"
+          echo "Kernel: $kernel"
+
+          if [ -z "$hostname" ] || [ "$hostname" = "null" ]; then
+            echo "ERROR: hostname not detected"
+            exit 1
+          fi
+
+          echo "✓ Host information detected"
+
+      - name: Validate Docker Runtime Detection
+        run: |
+          # Check for Docker runtime
+          docker_found=$(jq '.armResources[0].properties.container_runtimes[] | select(.name == "docker") | .name' output.json | wc -l)
+          if [ "$docker_found" -eq 0 ]; then
+            echo "ERROR: Docker runtime not detected"
+            exit 1
+          fi
+
+          echo "✓ Docker runtime detected"
+
+          # Validate Docker details
+          docker_version=$(jq -r '.armResources[0].properties.container_runtimes[] | select(.name == "docker") | .version' output.json)
+          docker_socket=$(jq -r '.armResources[0].properties.container_runtimes[] | select(.name == "docker") | .socket' output.json)
+          container_count=$(jq -r '.armResources[0].properties.container_runtimes[] | select(.name == "docker") | .container_count' output.json)
+          image_count=$(jq -r '.armResources[0].properties.container_runtimes[] | select(.name == "docker") | .image_count' output.json)
+
+          echo "Docker version: $docker_version"
+          echo "Docker socket: $docker_socket"
+          echo "Container count: $container_count"
+          echo "Image count: $image_count"
+
+          if [ -z "$docker_version" ] || [ "$docker_version" = "null" ]; then
+            echo "ERROR: Docker version not detected"
+            exit 1
+          fi
+
+      - name: Validate Docker Swarm Detection
+        run: |
+          # Check if Docker Swarm orchestrator is detected
+          swarm_found=$(jq '.armResources[0].properties.orchestrators[] | select(.name == "docker_swarm") | .name' output.json | wc -l)
+          if [ "$swarm_found" -eq 0 ]; then
+            echo "ERROR: Docker Swarm orchestrator not detected"
+            exit 1
+          fi
+
+          echo "✓ Docker Swarm orchestrator detected"
+
+          # Validate Swarm details
+          swarm_version=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "docker_swarm") | .version' output.json)
+          cluster_id=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "docker_swarm") | .cluster_id' output.json)
+          state=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "docker_swarm") | .state' output.json)
+          node_role=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "docker_swarm") | .current_node.role' output.json)
+
+          echo "Swarm version: $swarm_version"
+          echo "Cluster ID: $cluster_id"
+          echo "State: $state"
+          echo "Node role: $node_role"
+
+          if [ -z "$cluster_id" ] || [ "$cluster_id" = "null" ]; then
+            echo "ERROR: Swarm cluster ID not detected"
+            exit 1
+          fi
+
+          if [ "$state" != "active" ]; then
+            echo "WARNING: Swarm state is not 'active': $state"
+          fi
+
+          if [ "$node_role" != "manager" ]; then
+            echo "WARNING: Node role is not 'manager': $node_role"
+          fi
+
+      - name: Validate Swarm Nodes
+        run: |
+          # Validate node information
+          total_nodes=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "docker_swarm") | .nodes.total_count' output.json)
+          master_count=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "docker_swarm") | .nodes.master_count' output.json)
+
+          echo "Total nodes: $total_nodes"
+          echo "Master nodes: $master_count"
+
+          if [ "$total_nodes" -eq 0 ]; then
+            echo "ERROR: No Swarm nodes detected"
+            exit 1
+          fi
+
+          echo "✓ Swarm nodes detected"
+
+      - name: Validate Swarm Workloads
+        run: |
+          # Check workloads/services
+          swarm_workloads=$(jq '.armResources[0].properties.orchestrators[] | select(.name == "docker_swarm") | .workloads' output.json)
+
+          if [ "$swarm_workloads" = "null" ]; then
+            echo "WARNING: Swarm workloads section not found"
+          else
+            service_count=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "docker_swarm") | .workloads.service_count' output.json)
+            total_containers=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "docker_swarm") | .workloads.total_container_count' output.json)
+
+            echo "Service count: $service_count"
+            echo "Total containers: $total_containers"
+
+            if [ "$service_count" -eq 0 ]; then
+              echo "WARNING: No Swarm services detected"
+            else
+              echo "✓ Swarm services detected"
+            fi
+          fi
+
+      - name: Validate Container Details
+        run: |
+          # Check if container details are populated
+          containers=$(jq '.armResources[0].properties.container_runtimes[] | select(.name == "docker") | .containers' output.json)
+
+          if [ "$containers" = "null" ] || [ "$containers" = "[]" ]; then
+            echo "WARNING: No container details found"
+          else
+            container_details_count=$(jq '.armResources[0].properties.container_runtimes[] | select(.name == "docker") | .containers | length' output.json)
+            echo "Container details count: $container_details_count"
+
+            # Check for orchestrator-managed containers
+            orchestrator_managed=$(jq '[.armResources[0].properties.container_runtimes[] | select(.name == "docker") | .containers[] | select(.orchestrator_managed == true)] | length' output.json)
+            echo "Orchestrator-managed containers: $orchestrator_managed"
+
+            if [ "$orchestrator_managed" -gt 0 ]; then
+              echo "✓ Orchestrator-managed containers detected"
+            fi
+          fi
+
+      - name: Validate Services Detection
+        run: |
+          # Check if Docker service is detected
+          docker_svc=$(jq '.armResources[0].properties.services[] | select(.name == "docker") | .name' output.json | wc -l)
+          if [ "$docker_svc" -eq 0 ]; then
+            echo "WARNING: Docker service not detected"
+          else
+            echo "✓ Docker service detected"
+
+            docker_active=$(jq -r '.armResources[0].properties.services[] | select(.name == "docker") | .active' output.json)
+            docker_enabled=$(jq -r '.armResources[0].properties.services[] | select(.name == "docker") | .enabled' output.json)
+
+            echo "Docker service active: $docker_active"
+            echo "Docker service enabled: $docker_enabled"
+          fi
+
+      - name: Upload Test Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-swarm-sudo-test-results
+          path: |
+            output.json
+            debug.txt
+            error.txt
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Remove services
+          docker service rm nginx-web redis-cache worker || true
+
+          # Remove standalone containers
+          docker rm -f standalone-postgres standalone-mongo || true
+
+          # Leave swarm
+          docker swarm leave --force || true

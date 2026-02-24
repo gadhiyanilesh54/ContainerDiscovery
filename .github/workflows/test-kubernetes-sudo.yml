@@ -1,0 +1,270 @@
+name: Test Kubernetes (With Sudo)
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  test-kubernetes-sudo:
+    name: Test Kubernetes with Sudo Privileges
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Kubernetes Environment
+        run: |
+          # Install kind
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+          # Install kubectl
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+          # Install crictl for CRI testing
+          VERSION="v1.28.0"
+          wget https://github.com/kubernetes-sigs/cri-tools/releases/download/$VERSION/crictl-$VERSION-linux-amd64.tar.gz
+          sudo tar zxvf crictl-$VERSION-linux-amd64.tar.gz -C /usr/local/bin
+          rm -f crictl-$VERSION-linux-amd64.tar.gz
+
+          # Configure crictl to use containerd
+          sudo sh -c 'cat > /etc/crictl.yaml << EOF
+          runtime-endpoint: unix:///run/containerd/containerd.sock
+          image-endpoint: unix:///run/containerd/containerd.sock
+          timeout: 10
+          EOF'
+
+      - name: Create Kubernetes Cluster
+        run: |
+          # Create kind cluster with specific config
+          cat <<EOF | kind create cluster --name k8s-test --config=-
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+          - role: control-plane
+            extraPortMappings:
+            - containerPort: 30000
+              hostPort: 30000
+              protocol: TCP
+          EOF
+
+          # Wait for cluster to be ready
+          kubectl wait --for=condition=Ready nodes --all --timeout=300s
+
+          # Display cluster info
+          kubectl cluster-info
+          kubectl get nodes -o wide
+          kubectl get pods -A
+
+      - name: Deploy Test Workloads
+        run: |
+          # Deploy nginx deployment
+          kubectl create deployment nginx --image=nginx:latest --replicas=2
+          kubectl expose deployment nginx --port=80 --type=NodePort
+
+          # Deploy redis deployment
+          kubectl create deployment redis --image=redis:latest
+          kubectl expose deployment redis --port=6379 --type=ClusterIP
+
+          # Create a namespace for testing
+          kubectl create namespace test-namespace
+
+          # Deploy a pod in the test namespace
+          kubectl run test-pod --image=busybox --namespace=test-namespace -- sleep 3600
+
+          # Wait for deployments to be ready
+          kubectl wait --for=condition=available deployment/nginx --timeout=120s
+          kubectl wait --for=condition=available deployment/redis --timeout=120s
+
+          # Display workload status
+          kubectl get all -A
+
+      - name: Verify Container Runtimes
+        run: |
+          echo "=== Checking containerd ==="
+          sudo systemctl status containerd || true
+          sudo ctr version || true
+          sudo ctr namespaces list || true
+
+          echo "=== Checking Docker ==="
+          sudo systemctl status docker || true
+          docker version || true
+
+          echo "=== Checking crictl ==="
+          sudo crictl version || true
+          sudo crictl ps || true
+
+      - name: Run Container Discovery Script with Sudo
+        run: |
+          chmod +x ./GuestDetails_Container.sh
+          sudo ./GuestDetails_Container.sh
+
+      - name: Display Output
+        if: always()
+        run: |
+          echo "=== Output JSON ==="
+          if [ -f output.json ]; then
+            cat output.json | jq . || cat output.json
+          else
+            echo "ERROR: output.json not found"
+          fi
+
+          echo ""
+          echo "=== Debug Log ==="
+          if [ -f debug.txt ]; then
+            cat debug.txt
+          else
+            echo "No debug.txt found"
+          fi
+
+          echo ""
+          echo "=== Error Log ==="
+          if [ -f error.txt ]; then
+            cat error.txt
+          else
+            echo "No error.txt found"
+          fi
+
+      - name: Validate JSON Structure
+        run: |
+          # Validate JSON syntax
+          jq empty output.json || { echo "ERROR: Invalid JSON"; exit 1; }
+          echo "✓ JSON is valid"
+
+          # Validate schema version
+          schema_version=$(jq -r '.armResources[0].properties.schema_version' output.json)
+          echo "Schema version: $schema_version"
+
+          # Validate timestamp
+          timestamp=$(jq -r '.armResources[0].properties.timestamp' output.json)
+          echo "Timestamp: $timestamp"
+
+      - name: Validate Host Information
+        run: |
+          # Check host_info fields
+          hostname=$(jq -r '.armResources[0].properties.host_info.hostname' output.json)
+          os=$(jq -r '.armResources[0].properties.host_info.os' output.json)
+          kernel=$(jq -r '.armResources[0].properties.host_info.kernel' output.json)
+
+          echo "Hostname: $hostname"
+          echo "OS: $os"
+          echo "Kernel: $kernel"
+
+          if [ -z "$hostname" ] || [ "$hostname" = "null" ]; then
+            echo "ERROR: hostname not detected"
+            exit 1
+          fi
+
+      - name: Validate Container Runtimes
+        run: |
+          # Get container runtimes
+          runtime_count=$(jq '.armResources[0].properties.container_runtimes | length' output.json)
+          echo "Detected $runtime_count container runtime(s)"
+
+          if [ "$runtime_count" -eq 0 ]; then
+            echo "ERROR: No container runtimes detected"
+            exit 1
+          fi
+
+          # Display all detected runtimes
+          echo "Detected runtimes:"
+          jq '.armResources[0].properties.container_runtimes[].name' output.json
+
+          # Check for Docker or containerd (kind uses containerd, but script may report Docker)
+          docker_found=$(jq '.armResources[0].properties.container_runtimes[] | select(.name == "docker") | .name' output.json | wc -l)
+          containerd_found=$(jq '.armResources[0].properties.container_runtimes[] | select(.name == "containerd") | .name' output.json | wc -l)
+
+          if [ "$docker_found" -eq 0 ] && [ "$containerd_found" -eq 0 ]; then
+            echo "ERROR: Neither Docker nor containerd runtime detected"
+            exit 1
+          fi
+
+          if [ "$docker_found" -gt 0 ]; then
+            echo "✓ Docker runtime detected (kind uses containerd backend)"
+          fi
+
+          if [ "$containerd_found" -gt 0 ]; then
+            echo "✓ containerd runtime detected"
+          fi
+
+      - name: Validate Kubernetes Detection
+        run: |
+          # Check if Kubernetes orchestrator is detected (may be kubernetes or openshift)
+          k8s_found=$(jq '.armResources[0].properties.orchestrators[] | select(.name == "kubernetes" or .name == "openshift") | .name' output.json | wc -l)
+          if [ "$k8s_found" -eq 0 ]; then
+            echo "ERROR: Kubernetes-compatible orchestrator not detected"
+            exit 1
+          fi
+
+          echo "✓ Kubernetes-compatible orchestrator detected"
+
+          # Display all orchestrators
+          echo "All orchestrators detected:"
+          jq '.armResources[0].properties.orchestrators[].name' output.json
+
+          # Get the first kubernetes-compatible orchestrator
+          orchestrator_name=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "kubernetes" or .name == "openshift") | .name' output.json | head -1)
+          echo "Using orchestrator: $orchestrator_name"
+
+          # Validate details
+          cluster_id=$(jq -r ".armResources[0].properties.orchestrators[] | select(.name == \"$orchestrator_name\") | .cluster_id" output.json)
+          node_role=$(jq -r ".armResources[0].properties.orchestrators[] | select(.name == \"$orchestrator_name\") | .current_node.role" output.json)
+          total_nodes=$(jq -r ".armResources[0].properties.orchestrators[] | select(.name == \"$orchestrator_name\") | .nodes.total_count" output.json)
+
+          echo "Cluster ID: $cluster_id"
+          echo "Node role: $node_role"
+          echo "Total nodes: $total_nodes"
+
+      - name: Validate Kubernetes Workloads
+        run: |
+          # Check workloads section
+          k8s_workloads=$(jq '.armResources[0].properties.orchestrators[] | select(.name == "kubernetes") | .workloads' output.json)
+
+          if [ "$k8s_workloads" = "null" ]; then
+            echo "WARNING: Kubernetes workloads section not found"
+          else
+            total_containers=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "kubernetes") | .workloads.total_container_count' output.json)
+            echo "Total containers in Kubernetes: $total_containers"
+          fi
+
+      - name: Validate Services Detection
+        run: |
+          # Check if kubelet service is detected
+          kubelet_found=$(jq '.armResources[0].properties.services[] | select(.name == "kubelet") | .name' output.json | wc -l)
+          if [ "$kubelet_found" -eq 0 ]; then
+            echo "WARNING: kubelet service not detected"
+          else
+            echo "✓ kubelet service detected"
+
+            kubelet_active=$(jq -r '.armResources[0].properties.services[] | select(.name == "kubelet") | .active' output.json)
+            echo "kubelet status: $kubelet_active"
+          fi
+
+          # Check containerd service
+          containerd_svc=$(jq '.armResources[0].properties.services[] | select(.name == "containerd") | .name' output.json | wc -l)
+          if [ "$containerd_svc" -gt 0 ]; then
+            echo "✓ containerd service detected"
+          fi
+
+      - name: Upload Test Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubernetes-sudo-test-results
+          path: |
+            output.json
+            debug.txt
+            error.txt
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kind delete cluster --name k8s-test || true

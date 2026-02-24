@@ -1,0 +1,220 @@
+name: Comprehensive Container Discovery Tests
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  test-matrix:
+    name: Test ${{ matrix.orchestrator }} (${{ matrix.privilege }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        orchestrator: [kubernetes, docker-swarm]
+        privilege: [sudo, no-sudo]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker
+        run: |
+          sudo systemctl start docker
+          sudo systemctl enable docker
+          docker version
+
+      - name: Setup Kubernetes (kind)
+        if: matrix.orchestrator == 'kubernetes'
+        run: |
+          # Install kind
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+          # Install kubectl
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+          # Install crictl for CRI testing
+          VERSION="v1.28.0"
+          wget https://github.com/kubernetes-sigs/cri-tools/releases/download/$VERSION/crictl-$VERSION-linux-amd64.tar.gz
+          sudo tar zxvf crictl-$VERSION-linux-amd64.tar.gz -C /usr/local/bin
+          rm -f crictl-$VERSION-linux-amd64.tar.gz
+
+          # Create kind cluster
+          kind create cluster --name test-cluster --wait 5m
+
+          # Verify cluster
+          kubectl cluster-info
+          kubectl get nodes
+          kubectl get pods -A
+
+          # Deploy sample workload
+          kubectl create deployment nginx --image=nginx:latest
+          kubectl expose deployment nginx --port=80 --type=NodePort
+          kubectl wait --for=condition=ready pod -l app=nginx --timeout=120s
+
+      - name: Setup Docker Swarm
+        if: matrix.orchestrator == 'docker-swarm'
+        run: |
+          # Initialize Docker Swarm
+          docker swarm init
+
+          # Deploy a sample service
+          docker service create --name nginx-test --replicas 2 --publish 8080:80 nginx:latest
+
+          # Wait for service to be ready
+          sleep 10
+          docker service ls
+          docker service ps nginx-test
+
+      - name: Run Container Discovery Script (with sudo)
+        if: matrix.privilege == 'sudo'
+        run: |
+          chmod +x ./GuestDetails_Container.sh
+          sudo ./GuestDetails_Container.sh
+
+          # Display outputs
+          echo "=== Output JSON ==="
+          cat output.json | jq . || cat output.json
+
+          echo "=== Debug Log ==="
+          cat debug.txt || echo "No debug.txt found"
+
+          echo "=== Error Log ==="
+          cat error.txt || echo "No error.txt found"
+
+      - name: Run Container Discovery Script (without sudo)
+        if: matrix.privilege == 'no-sudo'
+        run: |
+          chmod +x ./GuestDetails_Container.sh
+          ./GuestDetails_Container.sh
+
+          # Display outputs
+          echo "=== Output JSON ==="
+          cat output.json | jq . || cat output.json
+
+          echo "=== Debug Log ==="
+          cat debug.txt || echo "No debug.txt found"
+
+          echo "=== Error Log ==="
+          cat error.txt || echo "No error.txt found"
+
+      - name: Validate JSON Output
+        run: |
+          # Check if output.json exists
+          if [ ! -f output.json ]; then
+            echo "ERROR: output.json not found"
+            exit 1
+          fi
+
+          # Validate JSON syntax
+          jq empty output.json || { echo "ERROR: Invalid JSON"; exit 1; }
+
+          # Check for required top-level fields
+          jq -e '.armResources' output.json || { echo "ERROR: Missing armResources field"; exit 1; }
+          jq -e '.armResources[0].properties.schema_version' output.json || { echo "ERROR: Missing schema_version"; exit 1; }
+          jq -e '.armResources[0].properties.timestamp' output.json || { echo "ERROR: Missing timestamp"; exit 1; }
+          jq -e '.armResources[0].properties.host_info' output.json || { echo "ERROR: Missing host_info"; exit 1; }
+
+          echo "✓ JSON structure is valid"
+
+      - name: Validate Container Runtimes Detection
+        run: |
+          # Check that at least one container runtime is detected
+          runtime_count=$(jq '.armResources[0].properties.container_runtimes | length' output.json)
+          if [ "$runtime_count" -eq 0 ]; then
+            echo "WARNING: No container runtimes detected"
+          else
+            echo "✓ Detected $runtime_count container runtime(s)"
+            jq '.armResources[0].properties.container_runtimes[].name' output.json
+          fi
+
+          # Check for Docker runtime
+          docker_found=$(jq '.armResources[0].properties.container_runtimes[] | select(.name == "docker") | .name' output.json | wc -l)
+          if [ "$docker_found" -eq 0 ]; then
+            echo "WARNING: Docker runtime not detected"
+          else
+            echo "✓ Docker runtime detected"
+          fi
+
+      - name: Validate Kubernetes Detection
+        if: matrix.orchestrator == 'kubernetes'
+        run: |
+          # Check if Kubernetes orchestrator is detected (may be detected as kubernetes or openshift)
+          k8s_found=$(jq '.armResources[0].properties.orchestrators[] | select(.name == "kubernetes" or .name == "openshift") | .name' output.json | wc -l)
+          if [ "$k8s_found" -eq 0 ]; then
+            echo "ERROR: Kubernetes-compatible orchestrator not detected"
+            exit 1
+          fi
+
+          echo "✓ Kubernetes-compatible orchestrator detected"
+
+          # Display orchestrators found
+          echo "Orchestrators found:"
+          jq '.armResources[0].properties.orchestrators[].name' output.json
+
+          # Check if we can get cluster info
+          k8s_or_ocp=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "kubernetes" or .name == "openshift") | .name' output.json | head -1)
+          echo "Primary orchestrator: $k8s_or_ocp"
+
+      - name: Validate Docker Swarm Detection
+        if: matrix.orchestrator == 'docker-swarm'
+        run: |
+          # Check if Docker Swarm orchestrator is detected
+          swarm_found=$(jq '.armResources[0].properties.orchestrators[] | select(.name == "docker_swarm") | .name' output.json | wc -l)
+          if [ "$swarm_found" -eq 0 ]; then
+            echo "ERROR: Docker Swarm orchestrator not detected"
+            exit 1
+          fi
+
+          echo "✓ Docker Swarm orchestrator detected"
+
+          # Validate Swarm-specific fields
+          jq '.armResources[0].properties.orchestrators[] | select(.name == "docker_swarm")' output.json
+
+          # Check cluster ID
+          swarm_cluster_id=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "docker_swarm") | .cluster_id' output.json)
+          if [ -z "$swarm_cluster_id" ] || [ "$swarm_cluster_id" = "null" ]; then
+            echo "WARNING: Docker Swarm cluster ID not detected"
+          else
+            echo "✓ Docker Swarm cluster ID: $swarm_cluster_id"
+          fi
+
+      - name: Validate Services Detection
+        run: |
+          # Check if services are detected
+          service_count=$(jq '.armResources[0].properties.services | length' output.json)
+          if [ "$service_count" -eq 0 ]; then
+            echo "WARNING: No services detected"
+          else
+            echo "✓ Detected $service_count service(s)"
+            jq '.armResources[0].properties.services[].name' output.json
+          fi
+
+      - name: Upload Test Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.orchestrator }}-${{ matrix.privilege }}
+          path: |
+            output.json
+            debug.txt
+            error.txt
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          if [ "${{ matrix.orchestrator }}" = "kubernetes" ]; then
+            kind delete cluster --name test-cluster || true
+          fi
+          if [ "${{ matrix.orchestrator }}" = "docker-swarm" ]; then
+            docker service rm nginx-test || true
+            docker swarm leave --force || true
+          fi

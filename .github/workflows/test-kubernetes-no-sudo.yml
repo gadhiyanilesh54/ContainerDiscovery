@@ -1,0 +1,211 @@
+name: Test Kubernetes (Without Sudo)
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  test-kubernetes-no-sudo:
+    name: Test Kubernetes without Sudo Privileges
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Kubernetes Environment
+        run: |
+          # Install kind
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+          # Install kubectl
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+          # Install crictl
+          VERSION="v1.28.0"
+          wget https://github.com/kubernetes-sigs/cri-tools/releases/download/$VERSION/crictl-$VERSION-linux-amd64.tar.gz
+          sudo tar zxvf crictl-$VERSION-linux-amd64.tar.gz -C /usr/local/bin
+          rm -f crictl-$VERSION-linux-amd64.tar.gz
+
+      - name: Create Kubernetes Cluster
+        run: |
+          # Create kind cluster
+          kind create cluster --name k8s-test --wait 5m
+
+          # Wait for cluster to be ready
+          kubectl wait --for=condition=Ready nodes --all --timeout=300s
+
+          # Display cluster info
+          kubectl cluster-info
+          kubectl get nodes -o wide
+          kubectl get pods -A
+
+      - name: Deploy Test Workloads
+        run: |
+          # Deploy sample workloads
+          kubectl create deployment nginx --image=nginx:latest --replicas=2
+          kubectl expose deployment nginx --port=80 --type=NodePort
+
+          kubectl create deployment redis --image=redis:latest
+          kubectl expose deployment redis --port=6379 --type=ClusterIP
+
+          # Wait for deployments
+          kubectl wait --for=condition=available deployment/nginx --timeout=120s
+          kubectl wait --for=condition=available deployment/redis --timeout=120s
+
+          # Display workloads
+          kubectl get all
+
+      - name: Setup Non-Sudo User
+        run: |
+          # Create a test user (though we're still running as the runner user)
+          # This simulates a user without sudo privileges
+          # The script should still be able to gather some information
+
+          # Ensure the script is executable
+          chmod +x ./GuestDetails_Container.sh
+
+          # Verify we can't use sudo
+          sudo -n true 2>/dev/null && echo "WARNING: sudo available without password" || echo "✓ sudo requires password (simulating no-sudo)"
+
+      - name: Run Container Discovery Script without Sudo
+        run: |
+          # Run without sudo
+          ./GuestDetails_Container.sh
+
+      - name: Display Output
+        if: always()
+        run: |
+          echo "=== Output JSON ==="
+          if [ -f output.json ]; then
+            cat output.json | jq . || cat output.json
+          else
+            echo "ERROR: output.json not found"
+          fi
+
+          echo ""
+          echo "=== Debug Log ==="
+          if [ -f debug.txt ]; then
+            cat debug.txt
+          else
+            echo "No debug.txt found"
+          fi
+
+          echo ""
+          echo "=== Error Log ==="
+          if [ -f error.txt ]; then
+            cat error.txt
+          else
+            echo "No error.txt found"
+          fi
+
+      - name: Validate JSON Structure
+        run: |
+          # Validate JSON syntax
+          jq empty output.json || { echo "ERROR: Invalid JSON"; exit 1; }
+          echo "✓ JSON is valid"
+
+          # Validate basic structure
+          jq -e '.armResources[0].properties.schema_version' output.json || { echo "ERROR: Missing schema_version"; exit 1; }
+          jq -e '.armResources[0].properties.timestamp' output.json || { echo "ERROR: Missing timestamp"; exit 1; }
+          jq -e '.armResources[0].properties.host_info' output.json || { echo "ERROR: Missing host_info"; exit 1; }
+
+          echo "✓ Basic structure is valid"
+
+      - name: Validate Host Information
+        run: |
+          # Host info should be available without sudo
+          hostname=$(jq -r '.armResources[0].properties.host_info.hostname' output.json)
+          os=$(jq -r '.armResources[0].properties.host_info.os' output.json)
+          kernel=$(jq -r '.armResources[0].properties.host_info.kernel' output.json)
+
+          echo "Hostname: $hostname"
+          echo "OS: $os"
+          echo "Kernel: $kernel"
+
+          if [ -z "$hostname" ] || [ "$hostname" = "null" ]; then
+            echo "ERROR: hostname not detected"
+            exit 1
+          fi
+
+          echo "✓ Host information detected without sudo"
+
+      - name: Validate Container Runtimes Detection
+        run: |
+          # Check what runtimes were detected
+          runtime_count=$(jq '.armResources[0].properties.container_runtimes | length' output.json)
+          echo "Detected $runtime_count container runtime(s)"
+
+          if [ "$runtime_count" -eq 0 ]; then
+            echo "WARNING: No container runtimes detected without sudo"
+            echo "This is expected if the user doesn't have access to runtime sockets"
+          else
+            echo "✓ Some runtimes detected without sudo"
+            jq '.armResources[0].properties.container_runtimes[].name' output.json
+          fi
+
+      - name: Validate Kubernetes Detection
+        run: |
+          # Check if Kubernetes is detected (may be kubernetes or openshift)
+          k8s_found=$(jq '.armResources[0].properties.orchestrators[] | select(.name == "kubernetes" or .name == "openshift") | .name' output.json | wc -l)
+
+          if [ "$k8s_found" -eq 0 ]; then
+            echo "WARNING: Kubernetes not detected without sudo"
+            echo "The script should detect Kubernetes through kubectl even without sudo"
+          else
+            echo "✓ Kubernetes-compatible orchestrator detected without sudo"
+
+            orchestrator_name=$(jq -r '.armResources[0].properties.orchestrators[] | select(.name == "kubernetes" or .name == "openshift") | .name' output.json | head -1)
+            echo "Detected as: $orchestrator_name"
+          fi
+
+      - name: Validate Graceful Degradation
+        run: |
+          # The script should not crash and should produce valid JSON even without sudo
+          echo "✓ Script completed without sudo access"
+          echo "✓ JSON output is valid"
+
+          # Check error log for expected privilege warnings
+          if [ -f error.txt ]; then
+            echo "Checking for expected privilege warnings..."
+            cat error.txt
+          fi
+
+      - name: Compare with Sudo Results
+        run: |
+          # Note: In a real scenario, we'd compare this with sudo results
+          # For now, just document what we detected
+          echo "=== Detection Summary (No Sudo) ==="
+          echo "Container Runtimes:"
+          jq '.armResources[0].properties.container_runtimes[].name' output.json || echo "None"
+
+          echo ""
+          echo "Orchestrators:"
+          jq '.armResources[0].properties.orchestrators[].name' output.json || echo "None"
+
+          echo ""
+          echo "Services:"
+          jq '.armResources[0].properties.services[].name' output.json || echo "None"
+
+      - name: Upload Test Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubernetes-no-sudo-test-results
+          path: |
+            output.json
+            debug.txt
+            error.txt
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kind delete cluster --name k8s-test || true
