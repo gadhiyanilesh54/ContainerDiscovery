@@ -2,7 +2,7 @@
 
 ## Objective
 
-Write a **production-grade POSIX-compatible shell script** (`GuestDetails_Container.sh`) that discovers container runtimes and container orchestrators on a Linux host and outputs the results as a **single JSON object** conforming to the attached normalized schema and update README.md
+Write a **production-grade POSIX-compatible shell script** (`GuestDetails_Container.sh`) that discovers container runtimes and container orchestrators on a Linux host and outputs the results as a **single JSON object** conforming to the attached schema_new.json normalized schema and schema_reference_new.md for values references.
 
 ---
 
@@ -63,8 +63,8 @@ For each piece of information, attempt discovery in this priority order:
 - output.json, error.txt and debug.txt should be generated at the same location of GuestDetails_Container.sh
 
 ### Schema Compliance
-- Follow the attached `schema.json` for structure
-- Follow the attached `schema_reference.md` for all possible values
+- Follow the attached `schema_new.json` for structure
+- Follow the attached `schema_reference_new.md` for all possible values
 - Every field in the schema **must be present** in the output (use defaults for missing data)
 - `platform_specific` — only populate the matching orchestrator key; set others to `null`
 
@@ -130,7 +130,6 @@ Check for each runtime in this order:
 | `version` | `containerd --version` | Parse from package manager |
 | `namespaces` | `ctr namespaces list` | `crictl info` |
 | `container_count` | `ctr -n k8s.io containers list \| wc -l` | `crictl ps -a \| wc -l` |
-| `running_container_count` | `crictl ps \| wc -l` | Parse `ctr tasks list` |
 | `image_count` | `ctr -n k8s.io images list \| wc -l` | `crictl images \| wc -l` |
 | `storage_driver` | Parse `/etc/containerd/config.toml` | `containerd config dump` |
 | `cgroup_driver` | Parse config for `SystemdCgroup` | Default `systemd` |
@@ -141,7 +140,6 @@ Check for each runtime in this order:
 |-------|---------|----------|
 | `version` | `docker version --format '{{.Server.Version}}'` | `dockerd --version` |
 | `container_count` | `docker info --format '{{.Containers}}'` | `curl --unix-socket /var/run/docker.sock http://localhost/info` |
-| `running_container_count` | `docker info --format '{{.ContainersRunning}}'` | Socket API |
 | `image_count` | `docker info --format '{{.Images}}'` | Socket API |
 | `storage_driver` | `docker info --format '{{.Driver}}'` | Socket API |
 | `cgroup_driver` | `docker info --format '{{.CgroupDriver}}'` | Socket API |
@@ -154,7 +152,6 @@ Check for each runtime in this order:
 | `container_count` | `crictl ps -a \| wc -l` | Process inspection |
 | `storage_driver` | `crio config \| grep storage_driver` | Parse `/etc/crio/crio.conf` |
 | `cgroup_driver` | `crio config \| grep cgroup_manager` | Parse `/etc/crio/crio.conf` |
-| `registries` | Parse `/etc/containers/registries.conf` | `crio config` |
 | `resource_usage` | `ps -p $(pgrep crio) -o %cpu,rss` | `/proc/$(pgrep crio)/stat` |
 
 **Podman:**
@@ -164,12 +161,11 @@ Check for each runtime in this order:
 | `rootless` | `podman info --format '{{.Host.Security.Rootless}}'` | Check if running as non-root |
 | `container_count` | `podman ps -a --format '{{.ID}}' \| wc -l` | `podman info` |
 | `storage_driver` | `podman info --format '{{.Store.GraphDriverName}}'` | Parse `/etc/containers/storage.conf` |
-| `registries` | Parse `/etc/containers/registries.conf` | `podman info` |
 | `resource_usage` | `ps -p $(pgrep podman) -o %cpu,rss` | Conmon process inspection |
 
 #### 4c. Container details (for each running container)
 
-Collect for each container: `container_id`, `name`, `image`, `image_id`, `state`, `created_at`, `started_at`, `labels`, `ports`, `resource_usage` (with cpu request/limit in millicores, memory request/limit in MB), `network_mode`, `restart_policy`, `orchestrator_managed`, `orchestrator_ref`
+Collect for each container: `container_id`, `name`, `image`, `image_id`, `state`, `created_at`, `ports`, `resource_usage` (with cpu request/limit in millicores, memory request/limit in MB), `network_mode`, `restart_policy`, `orchestrator_managed`, `orchestrator_ref`
 
 Detect `orchestrator_managed` by checking labels:
 - Docker Swarm: `com.docker.swarm.service.name` label present
@@ -196,11 +192,6 @@ Detect `orchestrator_managed` by checking labels:
 | `cluster_name` | `kubectl config current-context` | Parse kubeconfig |
 | `current_node.role` | `kubectl get node $(hostname) -o jsonpath='{.metadata.labels}'` | Check for `node-role.kubernetes.io/control-plane` |
 | `nodes` | `kubectl get nodes -o json` | — |
-| `workloads` | `kubectl get pods,services,deployments,daemonsets,statefulsets --all-namespaces` | — |
-| `cluster_components.api_server` | `kubectl get componentstatuses` | `kubectl get pods -n kube-system` |
-| `cluster_components.cni_plugin` | Detect by checking pods in kube-system (calico, flannel, cilium, etc.) | Check `/etc/cni/net.d/` |
-| `cluster_components.ingress_controller` | `kubectl get pods --all-namespaces \| grep ingress` | Check ingress class |
-| `cluster_components.csi_drivers` | `kubectl get csidrivers` | — |
 | `distribution` | Detect by checking: k3s (`/var/lib/rancher/k3s`), rke2 (`/var/lib/rancher/rke2`), microk8s (`snap list microk8s`), kubeadm (`which kubeadm`) | Node labels/annotations |
 
 #### 5c. Docker Swarm detection
@@ -296,7 +287,7 @@ Fallback: `service <name> status` or check `/etc/init.d/<name>`
 3. If a command fails, log the error and continue with the next fallback
 4. If all fallbacks fail for a field, use the default value and add an entry to `debug.txt`
 5. If a critical section fails entirely (e.g., cannot detect any runtime), add to `error.txt`
-6. The script must **always produce valid JSON output**, even if everything fails
+6. The script must **always produce valid JSON output** output.json, even if everything fails
 
 ---
 
@@ -314,7 +305,7 @@ Fallback: `service <name> status` or check `/etc/init.d/<name>`
 
 ## Attached Files
 
-1. **`schema.json`** — The exact JSON structure the output must follow
-2. **`schema_reference.md`** — All possible enum values for every field
+1. **`schema_new.json`** — The exact JSON structure the output must follow
+2. **`schema_reference_new.md`** — All possible enum values for every field
 
 Please generate the complete shell script.

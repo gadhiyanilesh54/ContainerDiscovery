@@ -1,3505 +1,4099 @@
-#!/usr/bin/env sh
+#!/bin/sh
 # GuestDetails_Container.sh — Container & Orchestrator Discovery Script
 # Schema Version: 1.0.0
-# Description: Production-grade POSIX-compatible shell script to discover container runtimes
-#              and orchestrators on Linux hosts with graceful privilege degradation
+# POSIX-compatible shell script for Linux hosts
+# Discovers container runtimes and orchestrators, outputs JSON conforming to schema.json
 
-set +e  # Never exit on error - graceful degradation
-
-# Configuration
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# --------------------------------------------------------------------------
+# Global variables
+# --------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || SCRIPT_DIR="$(pwd)"
 OUTPUT_FILE="${SCRIPT_DIR}/output.json"
-ERROR_FILE="${SCRIPT_DIR}/error.txt"
 DEBUG_FILE="${SCRIPT_DIR}/debug.txt"
-TIMEOUT_CMD="timeout"
-DEFAULT_TIMEOUT=10
-
-# Initialize log files
-: > "$ERROR_FILE"
-: > "$DEBUG_FILE"
-
-# Exit code
+ERROR_FILE="${SCRIPT_DIR}/error.txt"
+SCHEMA_VERSION="1.0.0"
+TIMESTAMP=""
+HAS_JQ=false
+HAS_TIMEOUT=false
+HAS_SUDO=false
+IS_ROOT=false
+CMD_TIMEOUT=10
 EXIT_CODE=0
 
-# Global variables for discovered data
-PRIVILEGE_LEVEL=""
-RUNTIMES_DETECTED=""
-ORCHESTRATORS_DETECTED=""
-SEEN_CONTAINERS=""
+# --------------------------------------------------------------------------
+# 1. Utility Functions
+# --------------------------------------------------------------------------
 
-#==============================================================================
-# Utility Functions
-#==============================================================================
+init_files() {
+    : > "$DEBUG_FILE"
+    : > "$ERROR_FILE"
+    : > "$OUTPUT_FILE"
+    TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%SZ")
+}
 
-# Logging functions
 log_info() {
-    echo "[INFO] $*" >&2
-    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [INFO] $*" >> "$DEBUG_FILE"
+    echo "[INFO]  $(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null) $*" >> "$DEBUG_FILE"
+    echo "[INFO]  $*" >&2
 }
 
 log_warn() {
-    echo "[WARN] $*" >&2
-    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [WARN] $*" >> "$DEBUG_FILE"
+    echo "[WARN]  $(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null) $*" >> "$DEBUG_FILE"
+    echo "[WARN]  $*" >&2
 }
 
 log_error() {
+    echo "[ERROR] $(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null) $*" >> "$ERROR_FILE"
+    echo "[ERROR] $(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null) $*" >> "$DEBUG_FILE"
     echo "[ERROR] $*" >&2
-    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [ERROR] $*" >> "$ERROR_FILE"
-    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [ERROR] $*" >> "$DEBUG_FILE"
-    EXIT_CODE=1
 }
 
-log_debug() {
-    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [DEBUG] $*" >> "$DEBUG_FILE"
-}
-
-# Safe command execution with timeout
+# Execute a command with timeout; return output or empty string
+# Usage: result=$(try_command "description" command arg1 arg2 ...)
 try_command() {
-    cmd="$1"
-    timeout_val="${2:-$DEFAULT_TIMEOUT}"
-
-    log_debug "Executing: $cmd"
-
-    if command -v timeout >/dev/null 2>&1; then
-        result=$(timeout "$timeout_val" sh -c "$cmd" 2>/dev/null)
+    _desc="$1"; shift
+    log_info "Attempting: $_desc -> $*"
+    if $HAS_TIMEOUT; then
+        _out=$(timeout "$CMD_TIMEOUT" "$@" 2>/dev/null)
     else
-        result=$(sh -c "$cmd" 2>/dev/null)
+        _out=$("$@" 2>/dev/null)
     fi
+    _rc=$?
+    if [ $_rc -ne 0 ]; then
+        log_warn "Failed ($_rc): $_desc"
+        echo ""
+        return 1
+    fi
+    echo "$_out"
+    return 0
+}
 
-    if [ $? -eq 0 ] && [ -n "$result" ]; then
-        echo "$result"
-        return 0
+# Execute a command string via sh -c with timeout
+try_command_str() {
+    _desc="$1"; shift
+    _cmd="$*"
+    log_info "Attempting: $_desc -> $_cmd"
+    if $HAS_TIMEOUT; then
+        _out=$(timeout "$CMD_TIMEOUT" sh -c "$_cmd" 2>/dev/null)
     else
-        log_debug "Command failed or returned empty: $cmd"
+        _out=$(sh -c "$_cmd" 2>/dev/null)
+    fi
+    _rc=$?
+    if [ $_rc -ne 0 ]; then
+        log_warn "Failed ($_rc): $_desc"
+        echo ""
+        return 1
+    fi
+    echo "$_out"
+    return 0
+}
+
+# Try with sudo if available
+try_sudo_command() {
+    _desc="$1"; shift
+    if $IS_ROOT; then
+        try_command "$_desc" "$@"
+        return $?
+    elif $HAS_SUDO; then
+        try_command "$_desc (sudo)" sudo "$@"
+        return $?
+    else
+        log_warn "No privilege for: $_desc"
+        echo ""
         return 1
     fi
 }
 
-# Check if running with privileges
-check_privilege() {
-    if [ -n "$PRIVILEGE_LEVEL" ]; then
-        echo "$PRIVILEGE_LEVEL"
-        return
-    fi
-
-    if [ "$(id -u)" = "0" ]; then
-        PRIVILEGE_LEVEL="root"
-    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-        PRIVILEGE_LEVEL="sudo"
+try_sudo_command_str() {
+    _desc="$1"; shift
+    _cmd="$*"
+    if $IS_ROOT; then
+        try_command_str "$_desc" "$_cmd"
+        return $?
+    elif $HAS_SUDO; then
+        try_command_str "$_desc (sudo)" "sudo sh -c '$_cmd'"
+        return $?
     else
-        PRIVILEGE_LEVEL="none"
-    fi
-
-    echo "$PRIVILEGE_LEVEL"
-}
-
-# Execute command with privilege fallback
-try_privileged_command() {
-    cmd="$1"
-    fallback_cmd="$2"
-
-    priv_level=$(check_privilege)
-
-    # Try privileged first
-    if [ "$priv_level" = "root" ]; then
-        result=$(try_command "$cmd")
-    elif [ "$priv_level" = "sudo" ]; then
-        result=$(try_command "sudo $cmd")
-    fi
-
-    # Fallback to unprivileged
-    if [ -z "$result" ] && [ -n "$fallback_cmd" ]; then
-        log_debug "Privileged command failed, trying fallback: $fallback_cmd"
-        result=$(try_command "$fallback_cmd")
-    fi
-
-    echo "$result"
-}
-
-# Check if command exists
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-# Get PID of process
-get_pid() {
-    process_name="$1"
-    pid=$(pgrep -o "$process_name" 2>/dev/null | head -n 1)
-    echo "$pid"
-}
-
-# Get process CPU and memory usage
-get_process_cpu_mem() {
-    pid="$1"
-
-    if [ -z "$pid" ] || [ "$pid" = "0" ]; then
-        echo "0.0 0.0"
-        return
-    fi
-
-    if [ -f "/proc/$pid/stat" ]; then
-        # Read from /proc for more reliable data
-        cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ')
-        mem_kb=$(ps -p "$pid" -o rss= 2>/dev/null | tr -d ' ')
-
-        if [ -n "$cpu" ] && [ -n "$mem_kb" ]; then
-            mem_mb=$(echo "scale=2; $mem_kb / 1024" | bc 2>/dev/null || echo "$((mem_kb / 1024))")
-            echo "$cpu $mem_mb"
-            return
-        fi
-    fi
-
-    echo "0.0 0.0"
-}
-
-# Escape string for JSON
-json_escape() {
-    if [ -z "$1" ]; then
+        log_warn "No privilege for: $_desc"
         echo ""
-        return
+        return 1
     fi
-    # Escape backslashes, quotes, newlines, tabs
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n\r' | sed 's/	/\\t/g'
 }
 
-# Build JSON object from key-value pairs
-json_build_object() {
-    result="{"
-    first=true
+check_privilege() {
+    if [ "$(id -u 2>/dev/null)" = "0" ]; then
+        IS_ROOT=true
+        HAS_SUDO=true
+        log_info "Running as root"
+    elif sudo -n true 2>/dev/null; then
+        HAS_SUDO=true
+        log_info "sudo available (passwordless)"
+    else
+        log_info "No root/sudo — will use unprivileged fallbacks"
+    fi
 
-    while [ $# -gt 0 ]; do
-        key="$1"
-        value="$2"
-        shift 2
+    # Check for jq
+    if command -v jq >/dev/null 2>&1; then
+        HAS_JQ=true
+        log_info "jq is available"
+    else
+        log_info "jq not found — using string concatenation for JSON"
+    fi
 
-        if [ "$first" = true ]; then
-            first=false
-        else
-            result="$result,"
-        fi
-
-        # Check if value is already JSON (starts with { [ or is boolean)
-        case "$value" in
-            \{*|\[*)
-                result="$result\"$key\":$value"
-                ;;
-            true|false|null)
-                result="$result\"$key\":$value"
-                ;;
-            "")
-                # Empty string
-                result="$result\"$key\":\"\""
-                ;;
-            *[!0-9.]*)
-                # String value (contains non-numeric characters)
-                result="$result\"$key\":\"$(json_escape "$value")\""
-                ;;
-            *.*.*)
-                # Version string (multiple dots like 1.2.3)
-                result="$result\"$key\":\"$value\""
-                ;;
-            *.*[0-9])
-                # Likely a version or float - check if it has more than one dot
-                dot_count=$(echo "$value" | tr -cd '.' | wc -c)
-                if [ "$dot_count" -gt 1 ]; then
-                    # Version string
-                    result="$result\"$key\":\"$value\""
-                else
-                    # Float number
-                    result="$result\"$key\":$value"
-                fi
-                ;;
-            *)
-                # Integer number
-                result="$result\"$key\":$value"
-                ;;
-        esac
-    done
-
-    result="$result}"
-    echo "$result"
+    # Check for timeout
+    if command -v timeout >/dev/null 2>&1; then
+        HAS_TIMEOUT=true
+        log_info "timeout command available"
+    else
+        log_info "timeout command not found — commands may hang"
+    fi
 }
 
-# Build JSON array from newline-separated values
-json_build_array() {
-    input="$1"
-    is_json_objects="${2:-false}"
+# Try a command, then retry with sudo if it fails
+# Usage: _result=$(docker_try "description" "command string")
+docker_try() {
+    _dt_desc="$1"; _dt_cmd="$2"
+    _dt_out=$(try_command_str "$_dt_desc" "$_dt_cmd") || _dt_out=""
+    if [ -z "$_dt_out" ]; then
+        _dt_out=$(try_sudo_command_str "$_dt_desc (sudo)" "$_dt_cmd") || _dt_out=""
+    fi
+    echo "$_dt_out"
+}
 
-    if [ -z "$input" ]; then
+# Escape a string for safe JSON embedding
+safe_json_string() {
+    _s="$1"
+    # Escape backslash, double-quote, control chars
+    printf '%s' "$_s" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' | tr '\n' ' ' | sed 's/[[:cntrl:]]//g'
+}
+
+# Convert newline-separated values to a JSON array of strings
+to_json_array() {
+    _input="$1"
+    if [ -z "$_input" ]; then
         echo "[]"
         return
     fi
-
-    result="["
-    first=true
-
-    # Use here-string to avoid subshell issue with pipe
-    while IFS= read -r line; do
-        if [ -n "$line" ]; then
-            if [ "$first" = false ]; then
-                result="$result,"
-            fi
-
-            if [ "$is_json_objects" = "true" ]; then
-                result="$result$line"
-            else
-                result="$result\"$(json_escape "$line")\""
-            fi
-            first=false
+    _arr="["
+    _first=true
+    echo "$_input" | while IFS= read -r _line; do
+        _line=$(safe_json_string "$_line")
+        if [ -z "$_line" ]; then continue; fi
+        if $_first; then
+            _arr="${_arr}\"${_line}\""
+            _first=false
+        else
+            _arr="${_arr},\"${_line}\""
         fi
-    done <<EOF
-$input
-EOF
-
-    result="$result]"
-    echo "$result"
+        # We need to output the final result, so we use a trick
+        echo "$_arr"
+    done | tail -1 | sed 's/$/]/'
 }
 
-# Get listening ports for a process/service
-get_listening_ports() {
-    service_name="$1"
-    ports_json="["
-    first=true
-    port_lines=""
+# Safer to_json_array using temp variable approach
+build_json_array() {
+    _input="$1"
+    if [ -z "$_input" ]; then
+        echo "[]"
+        return
+    fi
+    _result="["
+    _first=true
+    _oldIFS="$IFS"
+    IFS='
+'
+    for _line in $_input; do
+        _line=$(safe_json_string "$_line")
+        if [ -z "$_line" ]; then continue; fi
+        if $_first; then
+            _result="${_result}\"${_line}\""
+            _first=false
+        else
+            _result="${_result},\"${_line}\""
+        fi
+    done
+    IFS="$_oldIFS"
+    echo "${_result}]"
+}
 
-    log_debug "get_listening_ports: discovering ports for service '$service_name'"
+# Get numeric value or default
+num_or_default() {
+    _val="$1"
+    _def="${2:-0}"
+    case "$_val" in
+        ''|*[!0-9.]*) echo "$_def" ;;
+        *) echo "$_val" ;;
+    esac
+}
 
-    # Step 1: Collect all PIDs related to this service
-    all_pids=""
+# --------------------------------------------------------------------------
+# 2. Discovery Modules
+# --------------------------------------------------------------------------
 
-    # Method A: Get MainPID from systemd (most reliable for services)
-    if command_exists systemctl; then
-        main_pid=$(systemctl show -p MainPID "$service_name" 2>/dev/null | cut -d= -f2)
-        if [ -n "$main_pid" ] && [ "$main_pid" != "0" ]; then
-            all_pids="$main_pid"
-            # Also get child processes
-            if command_exists pgrep; then
-                child_pids=$(pgrep -P "$main_pid" 2>/dev/null | tr '\n' ' ')
-                all_pids="$all_pids $child_pids"
-            fi
-            log_debug "  systemctl MainPID=$main_pid, children: $child_pids"
+# ========================
+# 2.1 Host Info
+# ========================
+discover_host_info() {
+    log_info "=== Discovering host info ==="
+
+    # hostname
+    _hostname=$(try_command "hostname" hostname) || _hostname=""
+    if [ -z "$_hostname" ]; then
+        _hostname=$(try_command "hostname from /etc/hostname" cat /etc/hostname) || _hostname=""
+    fi
+    _hostname=$(safe_json_string "$_hostname")
+
+    # fqdn
+    _fqdn=$(try_command "fqdn" hostname -f) || _fqdn=""
+    if [ -z "$_fqdn" ]; then
+        _fqdn="$_hostname"
+    fi
+    _fqdn=$(safe_json_string "$_fqdn")
+
+    # os
+    _os=""
+    if [ -f /etc/os-release ]; then
+        _os=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")
+    fi
+    if [ -z "$_os" ]; then
+        _os=$(try_command "os via uname" uname -o) || _os=""
+    fi
+    _os=$(safe_json_string "$_os")
+
+    # kernel
+    _kernel=$(try_command "kernel" uname -r) || _kernel=""
+    _kernel=$(safe_json_string "$_kernel")
+
+    # arch
+    _arch=$(try_command "arch" uname -m) || _arch=""
+    _arch=$(safe_json_string "$_arch")
+
+    # cpu_cores
+    _cpu_cores=$(try_command "cpu_cores via nproc" nproc) || _cpu_cores=""
+    if [ -z "$_cpu_cores" ]; then
+        _cpu_cores=$(try_command_str "cpu_cores from /proc/cpuinfo" "grep -c '^processor' /proc/cpuinfo") || _cpu_cores="0"
+    fi
+    _cpu_cores=$(num_or_default "$_cpu_cores" 0)
+
+    # cpu_model
+    _cpu_model=$(try_command_str "cpu_model" "grep 'model name' /proc/cpuinfo | head -1 | sed 's/.*: //'") || _cpu_model=""
+    if [ -z "$_cpu_model" ]; then
+        _cpu_model=$(try_command_str "cpu_model via lscpu" "lscpu | grep 'Model name' | sed 's/.*: *//'") || _cpu_model=""
+    fi
+    _cpu_model=$(safe_json_string "$_cpu_model")
+
+    # memory_total_mb
+    _mem_kb=$(try_command_str "memory" "grep MemTotal /proc/meminfo | awk '{print \$2}'") || _mem_kb=""
+    if [ -n "$_mem_kb" ]; then
+        _memory_total_mb=$(( _mem_kb / 1024 ))
+    else
+        _memory_total_mb=$(try_command_str "memory via free" "free -m | awk '/^Mem:/{print \$2}'") || _memory_total_mb="0"
+    fi
+    _memory_total_mb=$(num_or_default "$_memory_total_mb" 0)
+
+    # disks
+    _disks_json="[]"
+    _disks_raw=$(try_command_str "disks via lsblk" "lsblk -dno NAME,SIZE 2>/dev/null | grep -v '^loop'") || _disks_raw=""
+    if [ -z "$_disks_raw" ]; then
+        _disks_raw=$(try_sudo_command_str "disks via fdisk" "fdisk -l 2>/dev/null | grep '^Disk /dev/' | grep -v loop | sed 's/Disk \/dev\///' | sed 's/:.*//' | while read d; do sz=\$(fdisk -l /dev/\$d 2>/dev/null | head -1 | awk '{print \$3}'); echo \"\$d \${sz}G\"; done") || _disks_raw=""
+    fi
+    if [ -n "$_disks_raw" ]; then
+        _disks_json="[$(echo "$_disks_raw" | awk '{
+            name=$1;
+            size_raw=$2;
+            gsub(/[^0-9.]/, "", size_raw);
+            size=size_raw+0;
+            if ($2 ~ /T/) size=size*1024;
+            else if ($2 ~ /M/) size=size/1024;
+            else if ($2 ~ /K/) size=size/1048576;
+            if (NR>1) printf ",";
+            printf "{\"name\":\"%s\",\"size_gb\":%d}", name, size;
+        }')]"
+    fi
+
+    HOST_INFO_JSON=$(cat <<HOSTEOF
+{
+      "hostname": "${_hostname}",
+      "fqdn": "${_fqdn}",
+      "os": "${_os}",
+      "kernel": "${_kernel}",
+      "arch": "${_arch}",
+      "cpu_cores": ${_cpu_cores},
+      "cpu_model": "${_cpu_model}",
+      "memory_total_mb": ${_memory_total_mb},
+      "disks": ${_disks_json}
+    }
+HOSTEOF
+)
+    log_info "Host info discovery complete"
+}
+
+# ========================
+# 2.2 Hypervisor
+# ========================
+discover_hypervisor() {
+    log_info "=== Discovering hypervisor ==="
+    _virt_type=""
+    _virt_version=""
+
+    # Method 1: systemd-detect-virt
+    _raw=$(try_command "systemd-detect-virt" systemd-detect-virt) || _raw=""
+    if [ -n "$_raw" ] && [ "$_raw" != "none" ]; then
+        _virt_type="$_raw"
+    fi
+
+    # Method 2: dmidecode
+    if [ -z "$_virt_type" ]; then
+        _raw=$(try_sudo_command "dmidecode manufacturer" dmidecode -s system-manufacturer) || _raw=""
+        if [ -n "$_raw" ]; then
+            _virt_type="$_raw"
         fi
     fi
 
-    # Method B: Map service name to known daemon process names and pgrep them
-    daemon_names="$service_name"
-    case "$service_name" in
-        docker)     daemon_names="docker dockerd docker-proxy" ;;
-        containerd) daemon_names="containerd containerd-shim containerd-shim-runc-v2" ;;
-        podman)     daemon_names="podman conmon" ;;
-        crio)       daemon_names="crio conmon" ;;
-        kubelet)    daemon_names="kubelet kube-proxy" ;;
+    # Method 3: sys_vendor
+    if [ -z "$_virt_type" ]; then
+        _raw=$(try_command "sys_vendor" cat /sys/class/dmi/id/sys_vendor) || _raw=""
+        if [ -n "$_raw" ]; then
+            _virt_type="$_raw"
+        fi
+    fi
+
+    # Method 4: virt-what
+    if [ -z "$_virt_type" ]; then
+        _raw=$(try_sudo_command "virt-what" virt-what) || _raw=""
+        if [ -n "$_raw" ]; then
+            _virt_type=$(echo "$_raw" | head -1)
+        fi
+    fi
+
+    # Method 5: dmesg
+    if [ -z "$_virt_type" ]; then
+        _raw=$(try_sudo_command_str "dmesg hypervisor" "dmesg | grep -i hypervisor | head -1") || _raw=""
+        if [ -n "$_raw" ]; then
+            _virt_type="$_raw"
+        fi
+    fi
+
+    # Method 6: /proc/cpuinfo hypervisor flag
+    if [ -z "$_virt_type" ]; then
+        _raw=$(try_command_str "cpuinfo hypervisor" "grep -q hypervisor /proc/cpuinfo && echo hypervisor") || _raw=""
+        if [ -n "$_raw" ]; then
+            _virt_type="hypervisor"
+        fi
+    fi
+
+    # Map to enum
+    _mapped_type="unknown"
+    case "$(echo "$_virt_type" | tr '[:upper:]' '[:lower:]')" in
+        *vmware*|*vmw*)       _mapped_type="vmware" ;;
+        *hyperv*|*microsoft*) _mapped_type="hyperv" ;;
+        *kvm*|*qemu*)         _mapped_type="kvm" ;;
+        *xen*)                _mapped_type="xen" ;;
+        *virtualbox*|*oracle*|*vbox*) _mapped_type="virtualbox" ;;
+        *nutanix*|*ahv*)      _mapped_type="nutanix" ;;
+        *none*|*physical*)    _mapped_type="physical" ;;
+        *hypervisor*)         _mapped_type="unknown" ;;
+        "")                   _mapped_type="unknown" ;;
+        *)                    _mapped_type="unknown" ;;
     esac
 
-    if command_exists pgrep; then
-        for dname in $daemon_names; do
-            dpids=$(pgrep -x "$dname" 2>/dev/null | tr '\n' ' ')
-            all_pids="$all_pids $dpids"
-        done
-    fi
-    if command_exists pidof; then
-        for dname in $daemon_names; do
-            dpids=$(pidof "$dname" 2>/dev/null | tr ' ' ' ')
-            all_pids="$all_pids $dpids"
-        done
-    fi
+    # Try to get version — multi-fallback per hypervisor type
+    _virt_version=""
 
-    # Method C: Broader pattern match (e.g. "dockerd" contains "docker")
-    if command_exists pgrep; then
-        fpids=$(pgrep -f "^${service_name}" 2>/dev/null | tr '\n' ' ')
-        all_pids="$all_pids $fpids"
-    fi
-
-    # Deduplicate PIDs
-    all_pids=$(echo "$all_pids" | tr ' ' '\n' | grep -v '^$' | grep -v '^0$' | sort -un | tr '\n' ' ')
-    log_debug "  all PIDs for '$service_name': $all_pids"
-
-    # Build grep patterns from daemon names and PIDs
-    grep_pattern=""
-    for dn in $daemon_names; do
-        if [ -z "$grep_pattern" ]; then
-            grep_pattern="$dn"
-        else
-            grep_pattern="$grep_pattern\\|$dn"
+    if [ "$_mapped_type" = "vmware" ]; then
+        # Fallback 1: vmware-toolbox-cmd (VMware Tools reports ESXi host version — most reliable)
+        if [ -z "$_virt_version" ]; then
+            _virt_version=$(try_command_str "vmware tools stat" "vmware-toolbox-cmd stat hostversion 2>/dev/null") || _virt_version=""
         fi
-    done
-    for pid in $all_pids; do
-        grep_pattern="$grep_pattern\\|pid=$pid\\|,$pid,"
-    done
-
-    # Step 2: Dynamic port discovery — try ss (both TCP and UDP)
-    # Always try with sudo first if available for better results
-    priv=$(check_privilege)
-
-    if command_exists ss; then
-        if [ "$priv" = "root" ]; then
-            tcp_ports=$(ss -tlnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
-            udp_ports=$(ss -ulnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
-        elif [ "$priv" = "sudo" ]; then
-            tcp_ports=$(sudo ss -tlnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
-            udp_ports=$(sudo ss -ulnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
-        else
-            tcp_ports=$(ss -tlnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
-            udp_ports=$(ss -ulnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+        # Fallback 2: vmtoolsd --cmd 'info-get guestinfo.hypervisor.version'
+        if [ -z "$_virt_version" ]; then
+            _virt_version=$(try_command_str "vmtoolsd hypervisor version" "vmtoolsd --cmd 'info-get guestinfo.hypervisor.version' 2>/dev/null") || _virt_version=""
         fi
-        port_lines=$(printf '%s\n%s' "$tcp_ports" "$udp_ports" | grep -v '^$' | sort -un)
-        log_debug "  ss found ports: $port_lines"
-    fi
-
-    # Step 3: Fallback to netstat with sudo
-    if [ -z "$port_lines" ] && command_exists netstat; then
-        if [ "$priv" = "root" ]; then
-            tcp_ports=$(netstat -tlnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
-            udp_ports=$(netstat -ulnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
-        elif [ "$priv" = "sudo" ]; then
-            tcp_ports=$(sudo netstat -tlnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
-            udp_ports=$(sudo netstat -ulnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
-        else
-            tcp_ports=$(netstat -tlnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
-            udp_ports=$(netstat -ulnp 2>/dev/null | grep -i "$grep_pattern" | awk '{print $4}' | sed 's/.*://g' | sort -u)
+        # Fallback 3: vmware-rpctool 'info-get guestinfo.hypervisor.version'
+        if [ -z "$_virt_version" ]; then
+            _virt_version=$(try_command_str "vmware rpctool version" "vmware-rpctool 'info-get guestinfo.hypervisor.version' 2>/dev/null") || _virt_version=""
         fi
-        port_lines=$(printf '%s\n%s' "$tcp_ports" "$udp_ports" | grep -v '^$' | sort -un)
-        log_debug "  netstat found ports: $port_lines"
-    fi
-
-    # Step 4: Fallback to lsof with sudo
-    if [ -z "$port_lines" ] && command_exists lsof; then
-        if [ "$priv" = "root" ]; then
-            port_lines=$(lsof -i -P -n 2>/dev/null | grep -i "$grep_pattern" | grep LISTEN | awk '{print $9}' | sed 's/.*://g' | sort -u)
-        elif [ "$priv" = "sudo" ]; then
-            port_lines=$(sudo lsof -i -P -n 2>/dev/null | grep -i "$grep_pattern" | grep LISTEN | awk '{print $9}' | sed 's/.*://g' | sort -u)
-        else
-            port_lines=$(lsof -i -P -n 2>/dev/null | grep -i "$grep_pattern" | grep LISTEN | awk '{print $9}' | sed 's/.*://g' | sort -u)
+        # Fallback 4: vmtoolsd --cmd 'info-get guestinfo.vmware.ESX.version'
+        if [ -z "$_virt_version" ]; then
+            _virt_version=$(try_command_str "vmtoolsd esx version" "vmtoolsd --cmd 'info-get guestinfo.vmware.ESX.version' 2>/dev/null") || _virt_version=""
         fi
-        log_debug "  lsof found ports: $port_lines"
-    fi
-
-    # Step 5: PID-based /proc/net/tcp fallback
-    if [ -z "$port_lines" ] && [ -n "$all_pids" ]; then
-        proc_ports=""
-        for pid in $all_pids; do
-            fd_dir="/proc/$pid/fd"
-            socket_inodes=""
-
-            # Access /proc with sudo if needed
-            if [ -d "$fd_dir" ]; then
-                if [ "$priv" = "root" ]; then
-                    socket_inodes=$(ls -l "$fd_dir" 2>/dev/null | grep 'socket:\[' | sed 's/.*socket:\[\([0-9]*\)\]/\1/')
-                elif [ "$priv" = "sudo" ]; then
-                    socket_inodes=$(sudo ls -l "$fd_dir" 2>/dev/null | grep 'socket:\[' | sed 's/.*socket:\[\([0-9]*\)\]/\1/')
-                else
-                    socket_inodes=$(ls -l "$fd_dir" 2>/dev/null | grep 'socket:\[' | sed 's/.*socket:\[\([0-9]*\)\]/\1/')
-                fi
-
-                if [ -n "$socket_inodes" ]; then
-                    for net_file in /proc/net/tcp /proc/net/tcp6; do
-                        [ -f "$net_file" ] || continue
-                        while IFS= read -r line; do
-                            echo "$line" | grep -q "local_address" && continue
-                            state=$(echo "$line" | awk '{print $4}')
-                            [ "$state" = "0A" ] || continue  # 0A = LISTEN
-                            inode=$(echo "$line" | awk '{print $10}')
-                            if echo "$socket_inodes" | grep -qw "$inode"; then
-                                hex_port=$(echo "$line" | awk '{print $2}' | sed 's/.*://')
-                                dec_port=$(printf '%d' "0x$hex_port" 2>/dev/null)
-                                [ -n "$dec_port" ] && [ "$dec_port" -gt 0 ] 2>/dev/null && proc_ports="$proc_ports $dec_port"
-                            fi
-                        done < "$net_file"
-                    done
-                fi
+        # Fallback 5: VMware Tools version (open-vm-tools) — indicates Guest Tools version
+        if [ -z "$_virt_version" ]; then
+            _vmtools_ver=$(try_command_str "vmware tools version" "vmware-toolbox-cmd -v 2>/dev/null") || _vmtools_ver=""
+            if [ -n "$_vmtools_ver" ]; then
+                _virt_version="$_vmtools_ver"
             fi
-        done
-        port_lines=$(echo "$proc_ports" | tr ' ' '\n' | grep -v '^$' | sort -un)
-        log_debug "  /proc/net fallback found ports: $port_lines"
-    fi
-
-    # Step 6: Parse config files for configured listen addresses
-    if [ -z "$port_lines" ]; then
-        config_ports=""
-        case "$service_name" in
-            docker)
-                # Check Docker daemon.json for TCP hosts
-                for cfg in /etc/docker/daemon.json; do
-                    if [ -f "$cfg" ]; then
-                        cfg_ports=$(grep -o 'tcp://[^"]*' "$cfg" 2>/dev/null | sed 's/.*://g')
-                        config_ports="$config_ports $cfg_ports"
-                    fi
-                done
-                # Check systemd override for -H tcp://...
-                if command_exists systemctl; then
-                    exec_line=$(systemctl cat docker.service 2>/dev/null | grep 'ExecStart=' | tail -1)
-                    if [ -n "$exec_line" ]; then
-                        cfg_ports=$(echo "$exec_line" | grep -o 'tcp://[^ ]*' | sed 's/.*://g')
-                        config_ports="$config_ports $cfg_ports"
-                    fi
-                fi
-                ;;
-            kubelet)
-                # Check kubelet config for port settings
-                for cfg in /var/lib/kubelet/config.yaml /etc/kubernetes/kubelet-config.yaml; do
-                    if [ -f "$cfg" ]; then
-                        port_val=$(grep '^port:' "$cfg" 2>/dev/null | awk '{print $2}')
-                        [ -n "$port_val" ] && config_ports="$config_ports $port_val"
-                        healthz_port=$(grep 'healthzPort:' "$cfg" 2>/dev/null | awk '{print $2}')
-                        [ -n "$healthz_port" ] && config_ports="$config_ports $healthz_port"
-                    fi
-                done
-                ;;
-            containerd)
-                # Check containerd config for TCP gRPC listeners
-                for cfg in /etc/containerd/config.toml; do
-                    if [ -f "$cfg" ]; then
-                        cfg_ports=$(grep -A5 '\[grpc\]' "$cfg" 2>/dev/null | grep 'address' | grep -o '[0-9]*\.[0-9]*\.[0-9]*\.[0-9]*:[0-9]*' | sed 's/.*://')
-                        [ -n "$cfg_ports" ] && config_ports="$config_ports $cfg_ports"
-                    fi
-                done
-                ;;
-        esac
-
-        # Verify config-discovered ports are actually listening
-        if [ -n "$config_ports" ]; then
-            verified=""
-            for cp in $config_ports; do
-                case "$cp" in ''|*[!0-9]*) continue ;; esac
-                if command_exists ss; then
-                    if ss -tln 2>/dev/null | grep -q ":${cp} "; then
-                        verified="$verified $cp"
-                    fi
-                elif command_exists netstat; then
-                    if netstat -tln 2>/dev/null | grep -q ":${cp} "; then
-                        verified="$verified $cp"
-                    fi
-                fi
-            done
-            port_lines=$(echo "$verified" | tr ' ' '\n' | grep -v '^$' | sort -un)
-            log_debug "  config file ports (verified): $port_lines"
         fi
-    fi
-
-    # Step 7: Well-known port fallback — if service is active, check if known ports are open
-    if [ -z "$port_lines" ]; then
-        wellknown_ports=""
-        case "$service_name" in
-            docker)     wellknown_ports="2375 2376" ;;
-            kubelet)    wellknown_ports="10250 10248 10255" ;;
-            containerd) wellknown_ports="2379" ;;  # containerd metrics/debug
-            crio)       wellknown_ports="10010" ;;  # CRI-O stream port
-        esac
-
-        if [ -n "$wellknown_ports" ]; then
-            verified=""
-            for wkp in $wellknown_ports; do
-                port_open=false
-                if command_exists ss; then
-                    ss -tln 2>/dev/null | grep -q ":${wkp} " && port_open=true
-                elif command_exists netstat; then
-                    netstat -tln 2>/dev/null | grep -q ":${wkp} " && port_open=true
-                fi
-                # Also try /proc/net/tcp if ss/netstat didn't work
-                if [ "$port_open" = false ] && [ -f /proc/net/tcp ]; then
-                    hex_port=$(printf '%04X' "$wkp" 2>/dev/null)
-                    if [ -n "$hex_port" ]; then
-                        if grep -qi ":${hex_port} " /proc/net/tcp 2>/dev/null || grep -qi ":${hex_port} " /proc/net/tcp6 2>/dev/null; then
-                            port_open=true
-                        fi
-                    fi
-                fi
-                if [ "$port_open" = true ]; then
-                    verified="$verified $wkp"
-                fi
-            done
-            port_lines=$(echo "$verified" | tr ' ' '\n' | grep -v '^$' | sort -un)
-            log_debug "  well-known port fallback (verified): $port_lines"
-        fi
-    fi
-
-    # Step 8: Last resort — scan all listening ports and match by PID in /proc
-    if [ -z "$port_lines" ] && [ -n "$all_pids" ] && [ -f /proc/net/tcp ]; then
-        proc_ports=""
-        # Build a set of all socket inodes for our PIDs
-        all_inodes=""
-        for pid in $all_pids; do
-            fd_dir="/proc/$pid/fd"
-            if [ -d "$fd_dir" ]; then
-                if [ "$priv" = "root" ]; then
-                    inodes=$(ls -l "$fd_dir" 2>/dev/null | grep 'socket:\[' | sed 's/.*socket:\[\([0-9]*\)\]/\1/' | tr '\n' ' ')
-                elif [ "$priv" = "sudo" ]; then
-                    inodes=$(sudo ls -l "$fd_dir" 2>/dev/null | grep 'socket:\[' | sed 's/.*socket:\[\([0-9]*\)\]/\1/' | tr '\n' ' ')
-                else
-                    inodes=$(ls -l "$fd_dir" 2>/dev/null | grep 'socket:\[' | sed 's/.*socket:\[\([0-9]*\)\]/\1/' | tr '\n' ' ')
-                fi
-                all_inodes="$all_inodes $inodes"
-            fi
-        done
-        if [ -n "$all_inodes" ]; then
-            for net_file in /proc/net/tcp /proc/net/tcp6; do
-                [ -f "$net_file" ] || continue
-                while IFS= read -r line; do
-                    echo "$line" | grep -q "local_address" && continue
-                    state=$(echo "$line" | awk '{print $4}')
-                    [ "$state" = "0A" ] || continue
-                    inode=$(echo "$line" | awk '{print $10}')
-                    for si in $all_inodes; do
-                        if [ "$inode" = "$si" ]; then
-                            hex_port=$(echo "$line" | awk '{print $2}' | sed 's/.*://')
-                            dec_port=$(printf '%d' "0x$hex_port" 2>/dev/null)
-                            [ -n "$dec_port" ] && [ "$dec_port" -gt 0 ] 2>/dev/null && proc_ports="$proc_ports $dec_port"
-                            break
-                        fi
-                    done
-                done < "$net_file"
-            done
-        fi
-        port_lines=$(echo "$proc_ports" | tr ' ' '\n' | grep -v '^$' | sort -un)
-        log_debug "  /proc inode scan found ports: $port_lines"
-    fi
-
-    log_debug "  final ports for '$service_name': $port_lines"
-
-    # Build JSON array of port objects matching schema: [{"port":N,"protocol":"tcp"}]
-    if [ -n "$port_lines" ]; then
-        for port in $port_lines; do
-            # Validate port is a number
-            case "$port" in
-                ''|*[!0-9]*) continue ;;
+        # Fallback 6: dmidecode system-product-name (e.g. "VMware7,1" → extract HW version "7.1")
+        if [ -z "$_virt_version" ]; then
+            _raw_product=$(try_sudo_command_str "vmware product name" "dmidecode -s system-product-name 2>/dev/null") || _raw_product=""
+            case "$_raw_product" in
+                VMware[0-9]*)
+                    # "VMware7,1" → "7.1"
+                    _hw_ver=$(echo "$_raw_product" | sed 's/^VMware//;s/,/./g')
+                    _virt_version="$_hw_ver"
+                    ;;
             esac
-
-            if [ "$first" = false ]; then
-                ports_json="$ports_json,"
+        fi
+        # Fallback 7: /sys/class/dmi/id/product_name (same logic as above)
+        if [ -z "$_virt_version" ]; then
+            _raw_product=$(try_command_str "vmware product from sysfs" "cat /sys/class/dmi/id/product_name 2>/dev/null") || _raw_product=""
+            case "$_raw_product" in
+                VMware[0-9]*)
+                    _hw_ver=$(echo "$_raw_product" | sed 's/^VMware//;s/,/./g')
+                    _virt_version="$_hw_ver"
+                    ;;
+            esac
+        fi
+        # Fallback 8: dmidecode system-version (may contain actual version info)
+        if [ -z "$_virt_version" ]; then
+            _sys_ver=$(try_sudo_command_str "vmware system version" "dmidecode -s system-version 2>/dev/null") || _sys_ver=""
+            if [ -n "$_sys_ver" ] && [ "$_sys_ver" != "None" ] && [ "$_sys_ver" != "Not Specified" ]; then
+                _virt_version="$_sys_ver"
             fi
-            ports_json="${ports_json}{\"port\":${port},\"protocol\":\"tcp\"}"
-            first=false
-        done
-    fi
-
-    echo "$ports_json]"
-}
-
-# Check if container ID has been seen
-is_container_seen() {
-    cid="$1"
-
-    if echo "$SEEN_CONTAINERS" | grep -q "^$cid$"; then
-        return 0  # Already seen
-    else
-        SEEN_CONTAINERS="$SEEN_CONTAINERS
-$cid"
-        return 1  # New container
-    fi
-}
-
-#==============================================================================
-# Host Discovery Functions
-#==============================================================================
-
-discover_host_info() {
-    log_info "Discovering host information..."
-
-    # Hostname
-    HOSTNAME=$(try_command "hostname" || try_command "cat /etc/hostname" || echo "unknown")
-
-    # FQDN
-    FQDN=$(try_command "hostname -f" || echo "$HOSTNAME")
-
-    # OS
-    if [ -f /etc/os-release ]; then
-        OS=$(grep "^PRETTY_NAME=" /etc/os-release | cut -d'"' -f2)
-        [ -z "$OS" ] && OS=$(grep "^NAME=" /etc/os-release | cut -d'"' -f2)
-    else
-        OS=$(try_command "uname -o" || echo "Unknown Linux")
-    fi
-
-    # Kernel
-    KERNEL=$(try_command "uname -r" || echo "unknown")
-
-    # Architecture
-    ARCH=$(try_command "uname -m" || echo "unknown")
-
-    # CPU cores
-    CPU_CORES=$(try_command "nproc" || try_command "grep -c ^processor /proc/cpuinfo" || echo "0")
-
-    # CPU model
-    CPU_MODEL=$(try_command "grep 'model name' /proc/cpuinfo | head -n1 | cut -d':' -f2 | sed 's/^[ \t]*//'")
-    if [ -z "$CPU_MODEL" ]; then
-        CPU_MODEL=$(try_command "lscpu | grep 'Model name' | cut -d':' -f2 | sed 's/^[ \t]*//'")
-    fi
-    [ -z "$CPU_MODEL" ] && CPU_MODEL="Unknown"
-
-    # Memory total in MB
-    if [ -f /proc/meminfo ]; then
-        MEMORY_KB=$(grep "MemTotal:" /proc/meminfo | awk '{print $2}')
-        MEMORY_TOTAL_MB=$((MEMORY_KB / 1024))
-    else
-        MEMORY_TOTAL_MB=$(try_command "free -m | grep Mem | awk '{print \$2}'" || echo "0")
-    fi
-
-    # Disks
-    DISKS_JSON=$(discover_disks)
-
-    # Build host_info JSON
-    HOST_INFO_JSON=$(json_build_object \
-        "hostname" "$HOSTNAME" \
-        "fqdn" "$FQDN" \
-        "os" "$OS" \
-        "kernel" "$KERNEL" \
-        "arch" "$ARCH" \
-        "cpu_cores" "$CPU_CORES" \
-        "cpu_model" "$CPU_MODEL" \
-        "memory_total_mb" "$MEMORY_TOTAL_MB" \
-        "disks" "$DISKS_JSON")
-
-    log_info "Host info discovered: $HOSTNAME ($OS, $ARCH)"
-}
-
-discover_disks() {
-    if ! command_exists lsblk; then
-        # Fallback to using fdisk or other methods
-        if command_exists fdisk; then
-            disk_list=$(try_privileged_command "fdisk -l 2>/dev/null | grep '^Disk /dev/' | grep -v 'loop'" "")
         fi
-        if [ -z "$disk_list" ]; then
-            echo "[]"
-            return
-        fi
-    else
-        disk_list=$(lsblk -dno NAME,SIZE 2>/dev/null | grep -v "^loop" | grep -v "^sr")
-    fi
-
-    if [ -z "$disk_list" ]; then
-        echo "[]"
-        return
-    fi
-
-    disks_json="["
-    first=true
-
-    # Use a while loop with process substitution to avoid subshell
-    while IFS= read -r line; do
-        if [ -n "$line" ]; then
-            # Handle both lsblk and fdisk output
-            if echo "$line" | grep -q "^Disk /dev/"; then
-                # fdisk format: "Disk /dev/sda: 100 GiB, ..."
-                name=$(echo "$line" | sed 's|^Disk /dev/\([^:]*\):.*|\1|')
-                size=$(echo "$line" | sed 's|^Disk /dev/[^:]*: \([^ ]*\) \([^ ]*\).*|\1 \2|')
-                size_value=$(echo "$size" | awk '{print $1}')
-                size_unit=$(echo "$size" | awk '{print $2}' | tr '[:lower:]' '[:upper:]')
-
-                # Convert to GB
-                if [ "$size_unit" = "TIB" ] || [ "$size_unit" = "TB" ] || [ "$size_unit" = "T" ]; then
-                    size_gb=$(echo "scale=2; $size_value * 1024" | bc 2>/dev/null || echo "$size_value")
-                elif [ "$size_unit" = "MIB" ] || [ "$size_unit" = "MB" ] || [ "$size_unit" = "M" ]; then
-                    size_gb=$(echo "scale=2; $size_value / 1024" | bc 2>/dev/null || echo "0")
-                elif [ "$size_unit" = "GIB" ] || [ "$size_unit" = "GB" ] || [ "$size_unit" = "G" ]; then
-                    size_gb="$size_value"
-                else
-                    # Assume bytes, convert to GB
-                    size_gb=$(echo "scale=2; $size_value / 1073741824" | bc 2>/dev/null || echo "0")
-                fi
-            else
-                # lsblk format: "sda 100G"
-                name=$(echo "$line" | awk '{print $1}')
-                size=$(echo "$line" | awk '{print $2}')
-                # Extract numeric part
-                size_num=$(echo "$size" | sed 's/[^0-9.]//g')
-
-                # Convert to GB
-                if echo "$size" | grep -qi "T"; then
-                    size_gb=$(echo "scale=2; $size_num * 1024" | bc 2>/dev/null || echo "$size_num")
-                elif echo "$size" | grep -qi "M"; then
-                    size_gb=$(echo "scale=2; $size_num / 1024" | bc 2>/dev/null || echo "0")
-                else
-                    size_gb="$size_num"
-                fi
+        # Fallback 9: /sys/class/dmi/id/product_version
+        if [ -z "$_virt_version" ]; then
+            _prod_ver=$(try_command_str "vmware product version sysfs" "cat /sys/class/dmi/id/product_version 2>/dev/null") || _prod_ver=""
+            if [ -n "$_prod_ver" ] && [ "$_prod_ver" != "None" ] && [ "$_prod_ver" != "Not Specified" ]; then
+                _virt_version="$_prod_ver"
             fi
-
-            if [ "$first" = false ]; then
-                disks_json="$disks_json,"
+        fi
+        # Fallback 10: dmidecode bios-version (e.g. "6.00")
+        if [ -z "$_virt_version" ]; then
+            _bios_ver=$(try_sudo_command_str "vmware bios version" "dmidecode -s bios-version 2>/dev/null") || _bios_ver=""
+            if [ -n "$_bios_ver" ]; then
+                _virt_version="$_bios_ver"
             fi
-            disks_json="$disks_json$(json_build_object "name" "$name" "size_gb" "${size_gb:-0}")"
-            first=false
         fi
-    done <<EOF
-$disk_list
-EOF
+        # Fallback 11: /sys/class/dmi/id/bios_version
+        if [ -z "$_virt_version" ]; then
+            _bios_ver=$(try_command_str "vmware bios from sysfs" "cat /sys/class/dmi/id/bios_version 2>/dev/null") || _bios_ver=""
+            if [ -n "$_bios_ver" ]; then
+                _virt_version="$_bios_ver"
+            fi
+        fi
+        # Fallback 12: dmesg for VMware version string
+        if [ -z "$_virt_version" ]; then
+            _virt_version=$(try_sudo_command_str "vmware dmesg version" "dmesg 2>/dev/null | grep -i 'vmware' | grep -ioE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1") || _virt_version=""
+        fi
 
-    disks_json="$disks_json]"
-    echo "$disks_json"
+    elif [ "$_mapped_type" = "hyperv" ]; then
+        # Fallback 1: /sys/class/dmi/id/bios_version
+        _virt_version=$(try_command_str "hyperv bios version" "cat /sys/class/dmi/id/bios_version 2>/dev/null") || _virt_version=""
+        # Fallback 2: dmidecode bios-version
+        if [ -z "$_virt_version" ]; then
+            _virt_version=$(try_sudo_command_str "hyperv dmidecode bios" "dmidecode -s bios-version 2>/dev/null") || _virt_version=""
+        fi
+        # Fallback 3: /sys/class/dmi/id/product_name (e.g. "Virtual Machine 7.0")
+        if [ -z "$_virt_version" ]; then
+            _virt_version=$(try_command_str "hyperv product name" "cat /sys/class/dmi/id/product_name 2>/dev/null") || _virt_version=""
+        fi
+        # Fallback 4: dmidecode system-product-name
+        if [ -z "$_virt_version" ]; then
+            _virt_version=$(try_sudo_command_str "hyperv product dmidecode" "dmidecode -s system-product-name 2>/dev/null") || _virt_version=""
+        fi
+        # Fallback 5: /var/lib/hyperv/.kvp_pool_3 (Hyper-V KVP daemon data)
+        if [ -z "$_virt_version" ]; then
+            _virt_version=$(try_command_str "hyperv kvp version" "strings /var/lib/hyperv/.kvp_pool_3 2>/dev/null | grep -A1 HostingSystemOsMajor | tail -1") || _virt_version=""
+            if [ -n "$_virt_version" ]; then
+                _minor=$(try_command_str "hyperv kvp minor" "strings /var/lib/hyperv/.kvp_pool_3 2>/dev/null | grep -A1 HostingSystemOsMinor | tail -1") || _minor=""
+                [ -n "$_minor" ] && _virt_version="${_virt_version}.${_minor}"
+                _build=$(try_command_str "hyperv kvp build" "strings /var/lib/hyperv/.kvp_pool_3 2>/dev/null | grep -A1 HostingSystemOsBuildNumber | tail -1") || _build=""
+                [ -n "$_build" ] && _virt_version="${_virt_version}.${_build}"
+            fi
+        fi
+        # Fallback 6: dmesg
+        if [ -z "$_virt_version" ]; then
+            _virt_version=$(try_sudo_command_str "hyperv dmesg" "dmesg 2>/dev/null | grep -i 'hyper-v\|hyperv' | grep -ioE '[0-9]+\.[0-9]+' | head -1") || _virt_version=""
+        fi
+
+    elif [ "$_mapped_type" = "kvm" ]; then
+        # Fallback 1: /sys/class/dmi/id/product_name (e.g. "KVM", "RHEV Hypervisor", "Standard PC")
+        _virt_version=$(try_command_str "kvm product name" "cat /sys/class/dmi/id/product_name 2>/dev/null") || _virt_version=""
+        # Fallback 2: /sys/class/dmi/id/product_version
+        if [ -z "$_virt_version" ] || [ "$_virt_version" = "KVM" ] || [ "$_virt_version" = "Standard PC (i440FX + PIIX, 1996)" ] || [ "$_virt_version" = "Standard PC (Q35 + ICH9, 2009)" ]; then
+            _raw_ver=$(try_command_str "kvm product version" "cat /sys/class/dmi/id/product_version 2>/dev/null") || _raw_ver=""
+            if [ -n "$_raw_ver" ] && [ "$_raw_ver" != "None" ] && [ "$_raw_ver" != "Not Specified" ]; then
+                _virt_version="$_raw_ver"
+            fi
+        fi
+        # Fallback 3: dmidecode system-version
+        if [ -z "$_virt_version" ] || [ "$_virt_version" = "KVM" ]; then
+            _raw_ver=$(try_sudo_command_str "kvm dmidecode version" "dmidecode -s system-version 2>/dev/null") || _raw_ver=""
+            if [ -n "$_raw_ver" ] && [ "$_raw_ver" != "None" ] && [ "$_raw_ver" != "Not Specified" ]; then
+                _virt_version="$_raw_ver"
+            fi
+        fi
+        # Fallback 4: QEMU version from dmidecode bios-version (e.g. "1.5.3")
+        if [ -z "$_virt_version" ] || [ "$_virt_version" = "KVM" ]; then
+            _bios_ver=$(try_sudo_command_str "kvm bios version" "dmidecode -s bios-version 2>/dev/null") || _bios_ver=""
+            if [ -n "$_bios_ver" ]; then
+                _virt_version="$_bios_ver"
+            fi
+        fi
+        # Fallback 5: /sys/class/dmi/id/bios_version
+        if [ -z "$_virt_version" ] || [ "$_virt_version" = "KVM" ]; then
+            _bios_ver=$(try_command_str "kvm bios sysfs" "cat /sys/class/dmi/id/bios_version 2>/dev/null") || _bios_ver=""
+            if [ -n "$_bios_ver" ]; then
+                _virt_version="$_bios_ver"
+            fi
+        fi
+        # Fallback 6: libvirtd version
+        if [ -z "$_virt_version" ] || [ "$_virt_version" = "KVM" ]; then
+            _lv=$(try_command_str "libvirtd version" "libvirtd --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'") || _lv=""
+            [ -n "$_lv" ] && _virt_version="$_lv"
+        fi
+
+    elif [ "$_mapped_type" = "xen" ]; then
+        # Fallback 1: xl info
+        _virt_version=$(try_sudo_command_str "xen version xl" "xl info 2>/dev/null | grep 'xen_version' | awk '{print \$3}'") || _virt_version=""
+        # Fallback 2: /sys/hypervisor/version/major and minor
+        if [ -z "$_virt_version" ]; then
+            _xmajor=$(try_command_str "xen major" "cat /sys/hypervisor/version/major 2>/dev/null") || _xmajor=""
+            _xminor=$(try_command_str "xen minor" "cat /sys/hypervisor/version/minor 2>/dev/null") || _xminor=""
+            _xextra=$(try_command_str "xen extra" "cat /sys/hypervisor/version/extra 2>/dev/null") || _xextra=""
+            if [ -n "$_xmajor" ]; then
+                _virt_version="${_xmajor}.${_xminor:-0}${_xextra}"
+            fi
+        fi
+        # Fallback 3: xm info
+        if [ -z "$_virt_version" ]; then
+            _virt_version=$(try_sudo_command_str "xen version xm" "xm info 2>/dev/null | grep 'xen_version' | awk '{print \$3}'") || _virt_version=""
+        fi
+        # Fallback 4: xenstore-read
+        if [ -z "$_virt_version" ]; then
+            _virt_version=$(try_command_str "xen xenstore" "xenstore-read /mh/version 2>/dev/null") || _virt_version=""
+        fi
+        # Fallback 5: dmidecode bios-version
+        if [ -z "$_virt_version" ]; then
+            _virt_version=$(try_sudo_command_str "xen dmidecode" "dmidecode -s bios-version 2>/dev/null") || _virt_version=""
+        fi
+        # Fallback 6: dmesg
+        if [ -z "$_virt_version" ]; then
+            _virt_version=$(try_sudo_command_str "xen dmesg" "dmesg 2>/dev/null | grep -i 'xen version' | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1") || _virt_version=""
+        fi
+
+    elif [ "$_mapped_type" = "virtualbox" ]; then
+        # Fallback 1: dmidecode system-product-name (e.g. "VirtualBox")
+        _virt_version=$(try_sudo_command_str "vbox product" "dmidecode -s system-product-name 2>/dev/null") || _virt_version=""
+        # Fallback 2: /sys/class/dmi/id/product_name
+        if [ -z "$_virt_version" ] || [ "$_virt_version" = "VirtualBox" ]; then
+            _raw_ver=$(try_command_str "vbox product sysfs" "cat /sys/class/dmi/id/product_name 2>/dev/null") || _raw_ver=""
+        fi
+        # Fallback 3: dmidecode system-version (often has VBox version)
+        if [ -z "$_virt_version" ] || [ "$_virt_version" = "VirtualBox" ]; then
+            _raw_ver=$(try_sudo_command_str "vbox system version" "dmidecode -s system-version 2>/dev/null") || _raw_ver=""
+            if [ -n "$_raw_ver" ] && [ "$_raw_ver" != "Not Specified" ]; then
+                _virt_version="$_raw_ver"
+            fi
+        fi
+        # Fallback 4: /sys/class/dmi/id/product_version
+        if [ -z "$_virt_version" ] || [ "$_virt_version" = "VirtualBox" ]; then
+            _raw_ver=$(try_command_str "vbox product version sysfs" "cat /sys/class/dmi/id/product_version 2>/dev/null") || _raw_ver=""
+            if [ -n "$_raw_ver" ] && [ "$_raw_ver" != "None" ]; then
+                _virt_version="$_raw_ver"
+            fi
+        fi
+        # Fallback 5: dmidecode bios-version (e.g. "VirtualBox")
+        if [ -z "$_virt_version" ] || [ "$_virt_version" = "VirtualBox" ]; then
+            _virt_version=$(try_sudo_command_str "vbox bios version" "dmidecode -s bios-version 2>/dev/null") || _virt_version=""
+        fi
+        # Fallback 6: /sys/class/dmi/id/bios_version
+        if [ -z "$_virt_version" ] || [ "$_virt_version" = "VirtualBox" ]; then
+            _virt_version=$(try_command_str "vbox bios sysfs" "cat /sys/class/dmi/id/bios_version 2>/dev/null") || _virt_version=""
+        fi
+        # Fallback 7: VBoxControl (GA inside guest)
+        if [ -z "$_virt_version" ] || [ "$_virt_version" = "VirtualBox" ]; then
+            _virt_version=$(try_command_str "vboxcontrol version" "VBoxControl --version 2>/dev/null | head -1") || _virt_version=""
+        fi
+
+    elif [ "$_mapped_type" = "nutanix" ]; then
+        # Fallback 1: dmidecode system-version
+        _virt_version=$(try_sudo_command_str "nutanix system version" "dmidecode -s system-version 2>/dev/null") || _virt_version=""
+        if [ -z "$_virt_version" ] || [ "$_virt_version" = "Not Specified" ]; then
+            _virt_version=""
+        fi
+        # Fallback 2: /sys/class/dmi/id/product_version
+        if [ -z "$_virt_version" ]; then
+            _virt_version=$(try_command_str "nutanix product version sysfs" "cat /sys/class/dmi/id/product_version 2>/dev/null") || _virt_version=""
+            [ "$_virt_version" = "None" ] && _virt_version=""
+        fi
+        # Fallback 3: dmidecode system-product-name
+        if [ -z "$_virt_version" ]; then
+            _virt_version=$(try_sudo_command_str "nutanix product" "dmidecode -s system-product-name 2>/dev/null") || _virt_version=""
+        fi
+        # Fallback 4: /sys/class/dmi/id/product_name
+        if [ -z "$_virt_version" ]; then
+            _virt_version=$(try_command_str "nutanix product sysfs" "cat /sys/class/dmi/id/product_name 2>/dev/null") || _virt_version=""
+        fi
+        # Fallback 5: dmidecode bios-version
+        if [ -z "$_virt_version" ]; then
+            _virt_version=$(try_sudo_command_str "nutanix bios" "dmidecode -s bios-version 2>/dev/null") || _virt_version=""
+        fi
+    fi
+    _virt_version=$(safe_json_string "$_virt_version")
+
+    HYPERVISOR_JSON=$(cat <<HVEOF
+{
+      "type": "${_mapped_type}",
+      "version": "${_virt_version}"
+    }
+HVEOF
+)
+    log_info "Hypervisor discovery complete: ${_mapped_type}"
 }
 
-discover_hypervisor() {
-    log_info "Discovering hypervisor..."
-
-    HYPERVISOR_TYPE="unknown"
-    HYPERVISOR_VERSION=""
-
-    # Try systemd-detect-virt
-    if command_exists systemd-detect-virt; then
-        virt=$(try_command "systemd-detect-virt")
-        case "$virt" in
-            vmware) HYPERVISOR_TYPE="vmware" ;;
-            microsoft) HYPERVISOR_TYPE="hyperv" ;;
-            kvm) HYPERVISOR_TYPE="kvm" ;;
-            xen) HYPERVISOR_TYPE="xen" ;;
-            oracle) HYPERVISOR_TYPE="virtualbox" ;;
-            none) HYPERVISOR_TYPE="physical" ;;
-        esac
-    fi
-
-    # Try dmidecode
-    if [ "$HYPERVISOR_TYPE" = "unknown" ] && command_exists dmidecode; then
-        vendor=$(try_privileged_command "dmidecode -s system-manufacturer" "" | tr '[:upper:]' '[:lower:]')
-        case "$vendor" in
-            *vmware*) HYPERVISOR_TYPE="vmware" ;;
-            *microsoft*) HYPERVISOR_TYPE="hyperv" ;;
-            *qemu*|*kvm*) HYPERVISOR_TYPE="kvm" ;;
-            *xen*) HYPERVISOR_TYPE="xen" ;;
-            *virtualbox*) HYPERVISOR_TYPE="virtualbox" ;;
-            *nutanix*) HYPERVISOR_TYPE="nutanix" ;;
-        esac
-    fi
-
-    # Try /sys/class/dmi/id/sys_vendor
-    if [ "$HYPERVISOR_TYPE" = "unknown" ] && [ -f /sys/class/dmi/id/sys_vendor ]; then
-        vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null | tr '[:upper:]' '[:lower:]')
-        case "$vendor" in
-            *vmware*) HYPERVISOR_TYPE="vmware" ;;
-            *microsoft*) HYPERVISOR_TYPE="hyperv" ;;
-            *qemu*|*kvm*) HYPERVISOR_TYPE="kvm" ;;
-            *xen*) HYPERVISOR_TYPE="xen" ;;
-            *virtualbox*) HYPERVISOR_TYPE="virtualbox" ;;
-            *nutanix*) HYPERVISOR_TYPE="nutanix" ;;
-        esac
-    fi
-
-    # Check /proc/cpuinfo for hypervisor flag
-    if [ "$HYPERVISOR_TYPE" = "unknown" ] && [ -f /proc/cpuinfo ]; then
-        if grep -q "^flags.*hypervisor" /proc/cpuinfo 2>/dev/null; then
-            HYPERVISOR_TYPE="unknown"
-        else
-            HYPERVISOR_TYPE="physical"
-        fi
-    fi
-
-    # Try to get version for VMware
-    if [ "$HYPERVISOR_TYPE" = "vmware" ] && command_exists vmware-toolbox-cmd; then
-        HYPERVISOR_VERSION=$(try_command "vmware-toolbox-cmd -v")
-    fi
-
-    HYPERVISOR_JSON=$(json_build_object \
-        "type" "$HYPERVISOR_TYPE" \
-        "version" "$HYPERVISOR_VERSION")
-
-    log_info "Hypervisor detected: $HYPERVISOR_TYPE"
-}
+# ========================
+# 2.2b Network discovery
+# ========================
+NETWORK_JSON="{}"
 
 discover_network() {
-    log_info "Discovering network information..."
+    log_info "=== Discovering Network ==="
 
-    # IP addresses
-    IP_ADDRESSES_JSON=$(discover_ip_addresses)
+    # ---- IP Addresses ----
+    _ip_json="[]"
+    _ip_raw=""
 
-    # Default gateway
-    DEFAULT_GATEWAY=$(try_command "ip route | grep default | awk '{print \$3}' | head -n1")
-    if [ -z "$DEFAULT_GATEWAY" ]; then
-        DEFAULT_GATEWAY=$(try_command "route -n | grep '^0.0.0.0' | awk '{print \$2}' | head -n1")
-    fi
-    [ -z "$DEFAULT_GATEWAY" ] && DEFAULT_GATEWAY=""
-
-    # DNS servers
-    DNS_SERVERS_JSON=$(discover_dns_servers)
-
-    NETWORK_JSON=$(json_build_object \
-        "ip_addresses" "$IP_ADDRESSES_JSON" \
-        "default_gateway" "\"$DEFAULT_GATEWAY\"" \
-        "dns_servers" "$DNS_SERVERS_JSON")
-
-    log_info "Network discovery completed"
-}
-
-discover_ip_addresses() {
-    ip_json="["
-    first=true
-    seen_ipv6=""
-
-    if command_exists ip; then
-        # Parse text output - use heredoc to avoid subshell
-        current_iface=""
-        ip_output=$(ip addr show 2>/dev/null)
-
-        while IFS= read -r line; do
-            # Check for interface line
-            if echo "$line" | grep -q "^[0-9]*:"; then
-                current_iface=$(echo "$line" | awk '{print $2}' | tr -d ':')
-            fi
-
-            # Check for inet lines
-            if echo "$line" | grep -q "inet "; then
-                addr=$(echo "$line" | grep -o "inet [0-9.]*" | awk '{print $2}')
-                if [ -n "$addr" ] && [ "$addr" != "127.0.0.1" ]; then
-                    if [ "$first" = false ]; then
-                        ip_json="$ip_json,"
-                    fi
-                    ip_json="$ip_json$(json_build_object "address" "$addr" "version" "ipv4" "interface" "$current_iface")"
-                    first=false
-                fi
-            elif echo "$line" | grep -q "inet6 "; then
-                addr=$(echo "$line" | grep -o "inet6 [0-9a-fA-F:]*" | awk '{print $2}')
-                if [ -n "$addr" ] && [ "$addr" != "::1" ]; then
-                    # Check if this IPv6 address was already seen to avoid duplicates
-                    addr_found=false
-                    for seen_addr in $seen_ipv6; do
-                        if [ "$seen_addr" = "$addr" ]; then
-                            addr_found=true
-                            log_debug "Skipping duplicate IPv6 address $addr on $current_iface"
-                            break
-                        fi
-                    done
-
-                    if [ "$addr_found" = "false" ]; then
-                        if [ "$first" = false ]; then
-                            ip_json="$ip_json,"
-                        fi
-                        ip_json="$ip_json$(json_build_object "address" "$addr" "version" "ipv6" "interface" "$current_iface")"
-                        first=false
-                        seen_ipv6="$seen_ipv6 $addr"
-                    fi
-                fi
-            fi
-        done <<EOF
-$ip_output
-EOF
+    # Method 1: ip -j addr show (JSON output from iproute2)
+    _ip_raw=$(try_command_str "ip addr json" "ip -j addr show 2>/dev/null") || _ip_raw=""
+    if [ -z "$_ip_raw" ] && ($HAS_SUDO || $IS_ROOT); then
+        _ip_raw=$(try_sudo_command_str "ip addr json (sudo)" "ip -j addr show 2>/dev/null") || _ip_raw=""
     fi
 
-    ip_json="$ip_json]"
-    echo "$ip_json"
-}
-
-discover_dns_servers() {
-    dns_json="["
-    first=true
-
-    # Try resolvectl
-    if command_exists resolvectl; then
-        dns_list=$(resolvectl status 2>/dev/null | grep "DNS Servers:" | awk '{for(i=3;i<=NF;i++) print $i}')
+    if [ -n "$_ip_raw" ] && $HAS_JQ; then
+        _ip_json=$(echo "$_ip_raw" | jq -c '[
+            .[]? |
+            select(.ifname != "lo") |
+            .ifname as $iface |
+            .addr_info[]? |
+            select(.family == "inet" or .family == "inet6") |
+            {
+                address: .local,
+                version: (if .family == "inet" then "ipv4" else "ipv6" end),
+                interface: $iface
+            }
+        ]' 2>/dev/null) || _ip_json="[]"
     fi
 
-    # Fallback to /etc/resolv.conf
-    if [ -z "$dns_list" ] && [ -f /etc/resolv.conf ]; then
-        dns_list=$(grep "^nameserver" /etc/resolv.conf | awk '{print $2}')
-    fi
-
-    if [ -n "$dns_list" ]; then
-        while IFS= read -r dns; do
-            if [ -n "$dns" ]; then
-                if [ "$first" = false ]; then
-                    dns_json="$dns_json,"
-                fi
-                dns_json="$dns_json\"$dns\""
-                first=false
-            fi
-        done <<EOF
-$dns_list
-EOF
-    fi
-
-    dns_json="$dns_json]"
-    echo "$dns_json"
-}
-
-#==============================================================================
-# Container Runtime Detection and Discovery
-#==============================================================================
-
-detect_container_runtimes() {
-    log_info "Detecting container runtimes..."
-
-    RUNTIMES_DETECTED=""
-
-    # Check for containerd
-    if command_exists containerd || systemctl is-active containerd >/dev/null 2>&1 || [ -S /run/containerd/containerd.sock ]; then
-        RUNTIMES_DETECTED="$RUNTIMES_DETECTED containerd"
-        log_info "containerd detected"
-        discover_containerd
-    fi
-
-    # Check for Docker
-    if command_exists dockerd || command_exists docker || systemctl is-active docker >/dev/null 2>&1 || [ -S /var/run/docker.sock ]; then
-        RUNTIMES_DETECTED="$RUNTIMES_DETECTED docker"
-        log_info "Docker detected"
-        discover_docker
-    fi
-
-    # Check for CRI-O
-    if command_exists crio || systemctl is-active crio >/dev/null 2>&1 || [ -S /var/run/crio/crio.sock ]; then
-        RUNTIMES_DETECTED="$RUNTIMES_DETECTED crio"
-        log_info "CRI-O detected"
-        discover_crio
-    fi
-
-    # Check for Podman
-    if command_exists podman || systemctl is-active podman >/dev/null 2>&1 || [ -S /run/podman/podman.sock ] || [ -S /run/user/$(id -u)/podman/podman.sock ]; then
-        RUNTIMES_DETECTED="$RUNTIMES_DETECTED podman"
-        log_info "Podman detected"
-        discover_podman
-    fi
-
-    RUNTIMES_DETECTED=$(echo "$RUNTIMES_DETECTED" | sed 's/^[ \t]*//')
-}
-
-discover_containerd() {
-    log_info "Discovering containerd..."
-
-    # Version
-    version=$(try_command "containerd --version 2>/dev/null | awk '{print \$3}' | sed 's/^v//'")
-    [ -z "$version" ] && version=$(try_command "ctr version 2>/dev/null | grep 'Version:' | head -n1 | awk '{print \$2}'")
-    [ -z "$version" ] && version=""
-
-    # Socket
-    socket="/run/containerd/containerd.sock"
-    [ ! -S "$socket" ] && socket=""
-
-    # Storage root
-    storage_root="/var/lib/containerd"
-
-    # Namespaces - try multiple methods with sudo
-    namespaces=""
-    priv=$(check_privilege)
-
-    # Method 1: Try with privilege
-    if [ "$priv" = "root" ]; then
-        namespaces=$(try_command "ctr namespaces list -q")
-    elif [ "$priv" = "sudo" ]; then
-        namespaces=$(try_command "sudo ctr namespaces list -q")
-    fi
-
-    # Method 2: Fallback - check directories with privilege
-    if [ -z "$namespaces" ]; then
-        if [ "$priv" = "root" ]; then
-            if [ -d "/var/lib/containerd/io.containerd.grpc.v1.namespaces" ]; then
-                namespaces=$(ls /var/lib/containerd/io.containerd.grpc.v1.namespaces 2>/dev/null)
-            fi
-        elif [ "$priv" = "sudo" ]; then
-            namespaces=$(try_command "sudo ls /var/lib/containerd/io.containerd.grpc.v1.namespaces 2>/dev/null")
+    # Method 2: ip addr show (parse text output)
+    if [ "$_ip_json" = "[]" ]; then
+        _ip_text=$(try_command_str "ip addr text" "ip addr show 2>/dev/null") || _ip_text=""
+        if [ -z "$_ip_text" ] && ($HAS_SUDO || $IS_ROOT); then
+            _ip_text=$(try_sudo_command_str "ip addr text (sudo)" "ip addr show 2>/dev/null") || _ip_text=""
         fi
-    fi
-
-    # Method 3: Try crictl if available
-    if [ -z "$namespaces" ] && command_exists crictl; then
-        # crictl uses k8s.io namespace by default
-        if try_command "crictl ps -a -q 2>/dev/null | head -n1" >/dev/null 2>&1; then
-            namespaces="k8s.io"
-        fi
-    fi
-
-    namespaces_json=$(json_build_array "$namespaces" false)
-
-    # Container counts - use sudo for ctr commands
-    container_count=0
-    running_count=0
-
-    if [ -n "$namespaces" ]; then
-        for ns in $namespaces; do
-            if [ "$priv" = "root" ]; then
-                ns_containers=$(try_command "ctr -n $ns containers list -q 2>/dev/null | wc -l" || echo "0")
-                ns_running=$(try_command "ctr -n $ns tasks list -q 2>/dev/null | wc -l" || echo "0")
-            elif [ "$priv" = "sudo" ]; then
-                ns_containers=$(try_command "sudo ctr -n $ns containers list -q 2>/dev/null | wc -l" || echo "0")
-                ns_running=$(try_command "sudo ctr -n $ns tasks list -q 2>/dev/null | wc -l" || echo "0")
-            else
-                ns_containers=$(try_command "ctr -n $ns containers list -q 2>/dev/null | wc -l" || echo "0")
-                ns_running=$(try_command "ctr -n $ns tasks list -q 2>/dev/null | wc -l" || echo "0")
-            fi
-            container_count=$((container_count + ns_containers))
-            running_count=$((running_count + ns_running))
-        done
-    fi
-
-    # Fallback to crictl with sudo
-    if [ "$container_count" -eq 0 ] && command_exists crictl; then
-        # Set runtime endpoint for crictl
-        export CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
-        if [ "$priv" = "root" ]; then
-            container_count=$(try_command "crictl ps -a -q 2>/dev/null | wc -l" || echo "0")
-            running_count=$(try_command "crictl ps -q 2>/dev/null | wc -l" || echo "0")
-        elif [ "$priv" = "sudo" ]; then
-            container_count=$(try_command "sudo crictl ps -a -q 2>/dev/null | wc -l" || echo "0")
-            running_count=$(try_command "sudo crictl ps -q 2>/dev/null | wc -l" || echo "0")
-        else
-            container_count=$(try_command "crictl ps -a -q 2>/dev/null | wc -l" || echo "0")
-            running_count=$(try_command "crictl ps -q 2>/dev/null | wc -l" || echo "0")
-        fi
-    fi
-
-    # Image count - use sudo for ctr commands
-    image_count=0
-    if [ -n "$namespaces" ]; then
-        for ns in $namespaces; do
-            if [ "$priv" = "root" ]; then
-                ns_images=$(try_command "ctr -n $ns images list -q 2>/dev/null | wc -l" || echo "0")
-            elif [ "$priv" = "sudo" ]; then
-                ns_images=$(try_command "sudo ctr -n $ns images list -q 2>/dev/null | wc -l" || echo "0")
-            else
-                ns_images=$(try_command "ctr -n $ns images list -q 2>/dev/null | wc -l" || echo "0")
-            fi
-            image_count=$((image_count + ns_images))
-        done
-    fi
-
-    # Fallback to crictl with sudo
-    if [ "$image_count" -eq 0 ] && command_exists crictl; then
-        if [ "$priv" = "root" ]; then
-            image_count=$(try_command "crictl images -q 2>/dev/null | wc -l" || echo "0")
-        elif [ "$priv" = "sudo" ]; then
-            image_count=$(try_command "sudo crictl images -q 2>/dev/null | wc -l" || echo "0")
-        else
-            image_count=$(try_command "crictl images -q 2>/dev/null | wc -l" || echo "0")
-        fi
-    fi
-
-    # Storage driver
-    storage_driver="overlayfs"
-    if [ -f /etc/containerd/config.toml ]; then
-        if [ "$priv" = "root" ]; then
-            snap=$(grep snapshotter /etc/containerd/config.toml 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
-        elif [ "$priv" = "sudo" ]; then
-            snap=$(try_command "sudo cat /etc/containerd/config.toml 2>/dev/null | grep snapshotter | head -n1 | awk '{print \$3}' | tr -d '\"'")
-        else
-            snap=$(grep snapshotter /etc/containerd/config.toml 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
-        fi
-        [ -n "$snap" ] && storage_driver="$snap"
-    fi
-
-    # Cgroup driver
-    cgroup_driver="systemd"
-    if [ -f /etc/containerd/config.toml ]; then
-        if [ "$priv" = "root" ]; then
-            systemd_cgroup=$(grep SystemdCgroup /etc/containerd/config.toml 2>/dev/null | head -n1 | awk '{print $3}')
-        elif [ "$priv" = "sudo" ]; then
-            systemd_cgroup=$(try_command "sudo cat /etc/containerd/config.toml 2>/dev/null | grep SystemdCgroup | head -n1 | awk '{print \$3}'")
-        else
-            systemd_cgroup=$(grep SystemdCgroup /etc/containerd/config.toml 2>/dev/null | head -n1 | awk '{print $3}')
-        fi
-        if [ "$systemd_cgroup" = "false" ]; then
-            cgroup_driver="cgroupfs"
-        fi
-    fi
-
-    # Resource usage
-    pid=$(get_pid "containerd")
-    cpu_mem=$(get_process_cpu_mem "$pid")
-    cpu_cores=$(echo "$cpu_mem" | awk '{print $1}')
-    memory_mb=$(echo "$cpu_mem" | awk '{print $2}')
-
-    resource_usage_json=$(json_build_object \
-        "cpu_cores" "${cpu_cores:-0}" \
-        "memory_mb" "${memory_mb:-0}")
-
-    # Registries - always provide default registries for Kubernetes/containerd
-    registries="registry.k8s.io
-docker.io"
-
-    # Try to extract additional registries from config
-    if [ -f /etc/containerd/config.toml ]; then
-        config_registries=$(grep -A5 'plugins."io.containerd.grpc.v1.cri".registry.mirrors' /etc/containerd/config.toml 2>/dev/null | grep '\[' | sed 's/.*"\(.*\)".*/\1/' | grep -v '^\[')
-        if [ -n "$config_registries" ]; then
-            registries="$registries
-$config_registries"
-        fi
-    fi
-    registries_json=$(json_build_array "$registries" false)
-
-    # Rootless detection for containerd
-    rootless="false"
-    current_uid=$(id -u)
-    # Containerd is rootless if socket is in user directory or if running as non-root with user-specific socket
-    if [ "$current_uid" != "0" ] && [ -S "$HOME/.local/share/containerd/containerd.sock" ]; then
-        rootless="true"
-        socket="$HOME/.local/share/containerd/containerd.sock"
-        storage_root="$HOME/.local/share/containerd"
-    elif [ "$current_uid" != "0" ] && [ -S "/run/user/$current_uid/containerd/containerd.sock" ]; then
-        rootless="true"
-        socket="/run/user/$current_uid/containerd/containerd.sock"
-        storage_root="$HOME/.local/share/containerd"
-    fi
-
-    # Collect container details
-    containers_json="[]"
-    if [ "$container_count" -gt 0 ]; then
-        container_list=""
-
-        # Iterate through all namespaces
-        for ns in $namespaces; do
-            # Get container details with ctr
-            if [ "$priv" = "root" ]; then
-                container_data=$(try_command "ctr -n $ns containers list 2>/dev/null | tail -n +2" || echo "")
-            elif [ "$priv" = "sudo" ]; then
-                container_data=$(try_command "sudo ctr -n $ns containers list 2>/dev/null | tail -n +2" || echo "")
-            else
-                container_data=$(try_command "ctr -n $ns containers list 2>/dev/null | tail -n +2" || echo "")
-            fi
-
-            if [ -n "$container_data" ]; then
-                while read -r line; do
-                    [ -z "$line" ] && continue
-                    container_id=$(echo "$line" | awk '{print $1}')
-                    [ -z "$container_id" ] && continue
-
-                    image=$(echo "$line" | awk '{print $2}')
-
-                    # Get container name from labels if available
-                    name="$container_id"
-
-                    # Check if task is running
-                    if [ "$priv" = "root" ]; then
-                        task_check=$(try_command "ctr -n $ns tasks list 2>/dev/null | grep -w $container_id" || echo "")
-                    elif [ "$priv" = "sudo" ]; then
-                        task_check=$(try_command "sudo ctr -n $ns tasks list 2>/dev/null | grep -w $container_id" || echo "")
-                    else
-                        task_check=$(try_command "ctr -n $ns tasks list 2>/dev/null | grep -w $container_id" || echo "")
-                    fi
-
-                    if [ -n "$task_check" ]; then
-                        state="running"
-                    else
-                        state="stopped"
-                    fi
-
-                    # Build container object
-                    container_obj=$(json_build_object \
-                        "container_id" "$container_id" \
-                        "name" "$name" \
-                        "image" "$image" \
-                        "state" "$state" \
-                        "namespace" "$ns" \
-                        "orchestrator_managed" "false" \
-                        "orchestrator_type" "" \
-                        "labels" "{}")
-
-                    if [ -z "$container_list" ]; then
-                        container_list="$container_obj"
-                    else
-                        container_list="$container_list,$container_obj"
-                    fi
-                done << EOF
-$container_data
-EOF
-            fi
-        done
-        [ -n "$container_list" ] && containers_json="[$container_list]"
-    fi
-
-    # Collect image details
-    images_json="[]"
-    if [ "$image_count" -gt 0 ]; then
-        image_list=""
-
-        # Iterate through all namespaces
-        for ns in $namespaces; do
-            # Get image details with ctr
-            if [ "$priv" = "root" ]; then
-                image_data=$(try_command "ctr -n $ns images list 2>/dev/null | tail -n +2" || echo "")
-            elif [ "$priv" = "sudo" ]; then
-                image_data=$(try_command "sudo ctr -n $ns images list 2>/dev/null | tail -n +2" || echo "")
-            else
-                image_data=$(try_command "ctr -n $ns images list 2>/dev/null | tail -n +2" || echo "")
-            fi
-
-            if [ -n "$image_data" ]; then
-                while read -r line; do
-                    [ -z "$line" ] && continue
-                    image_name=$(echo "$line" | awk '{print $1}')
-                    [ -z "$image_name" ] && continue
-
-                    # Get size (column 4 is number, column 5 is unit, e.g., "295.3 MiB")
-                    size=$(echo "$line" | awk '{print $4" "$5}')
-
-                    # Parse repository and tag from image name
-                    repository=$(echo "$image_name" | sed 's/:.*$//')
-                    tag=$(echo "$image_name" | sed 's/.*://')
-                    [ "$tag" = "$repository" ] && tag="latest"
-
-                    # Convert size to MB
-                    size_mb="0"
-                    case "$size" in
-                        *KiB)
-                            size_num=$(echo "$size" | sed 's/ KiB//')
-                            size_mb=$(awk "BEGIN {printf \"%.2f\", $size_num / 1024}")
-                            ;;
-                        *MiB)
-                            size_num=$(echo "$size" | sed 's/ MiB//')
-                            size_mb="$size_num"
-                            ;;
-                        *GiB)
-                            size_num=$(echo "$size" | sed 's/ GiB//')
-                            size_mb=$(awk "BEGIN {printf \"%.2f\", $size_num * 1024}")
-                            ;;
-                        *)
-                            size_mb="0"
-                            ;;
-                    esac
-
-                    # Build image object
-                    image_obj=$(json_build_object \
-                        "image_id" "$image_name" \
-                        "repository" "$repository" \
-                        "tag" "$tag" \
-                        "size_mb" "$size_mb" \
-                        "created_at" "")
-
-                    if [ -z "$image_list" ]; then
-                        image_list="$image_obj"
-                    else
-                        image_list="$image_list,$image_obj"
-                    fi
-                done << EOF
-$image_data
-EOF
-            fi
-        done
-        [ -n "$image_list" ] && images_json="[$image_list]"
-    fi
-
-    # Build final JSON
-    CONTAINERD_JSON=$(json_build_object \
-        "name" "containerd" \
-        "runtime_type" "containerd" \
-        "version" "$version" \
-        "socket" "$socket" \
-        "storage_driver" "$storage_driver" \
-        "storage_root" "$storage_root" \
-        "rootless" "$rootless" \
-        "cgroup_driver" "$cgroup_driver" \
-        "namespaces" "$namespaces_json" \
-        "image_count" "$image_count" \
-        "container_count" "$container_count" \
-        "running_container_count" "$running_count" \
-        "paused_container_count" "0" \
-        "stopped_container_count" "$((container_count - running_count))" \
-        "client_version" "$version" \
-        "server_version" "$version" \
-        "crictl_version" "$(try_command 'crictl --version 2>/dev/null | awk \"{print \\\$3}\"')" \
-        "resource_usage" "$resource_usage_json" \
-        "registries" "$registries_json" \
-        "containers" "$containers_json" \
-        "images" "$images_json")
-
-    log_info "containerd discovery completed: $container_count containers, $running_count running"
-}
-
-discover_docker() {
-    log_info "Discovering Docker..."
-
-    # Version
-    version=$(try_command "docker version --format '{{.Server.Version}}' 2>/dev/null")
-    [ -z "$version" ] && version=$(try_command "dockerd --version 2>/dev/null | awk '{print \$3}' | tr -d ','")
-    [ -z "$version" ] && version=""
-
-    # Socket
-    socket="/var/run/docker.sock"
-    [ ! -S "$socket" ] && socket=""
-
-    # Storage root
-    storage_root="/var/lib/docker"
-
-    # Try docker info with sudo
-    container_count=0
-    running_count=0
-    image_count=0
-    storage_driver="overlay2"
-    cgroup_driver="cgroupfs"
-
-    priv=$(check_privilege)
-    docker_info=""
-
-    if [ "$priv" = "root" ]; then
-        docker_info=$(try_command "docker info --format json")
-    elif [ "$priv" = "sudo" ]; then
-        docker_info=$(try_command "sudo docker info --format json")
-    else
-        docker_info=$(try_command "docker info --format json")
-    fi
-
-    if [ -n "$docker_info" ]; then
-        container_count=$(echo "$docker_info" | grep -o '"Containers":[0-9]*' | cut -d: -f2 | head -n1)
-        running_count=$(echo "$docker_info" | grep -o '"ContainersRunning":[0-9]*' | cut -d: -f2 | head -n1)
-        stopped_count=$(echo "$docker_info" | grep -o '"ContainersStopped":[0-9]*' | cut -d: -f2 | head -n1)
-        paused_count=$(echo "$docker_info" | grep -o '"ContainersPaused":[0-9]*' | cut -d: -f2 | head -n1)
-        image_count=$(echo "$docker_info" | grep -o '"Images":[0-9]*' | cut -d: -f2 | head -n1)
-        storage_driver=$(echo "$docker_info" | grep -o '"Driver":"[^"]*"' | cut -d\" -f4 | head -n1)
-        cgroup_driver=$(echo "$docker_info" | grep -o '"CgroupDriver":"[^"]*"' | cut -d\" -f4 | head -n1)
-    fi
-
-    # Fallback to docker ps with sudo
-    if [ "$container_count" = "0" ] || [ -z "$container_count" ]; then
-        if [ "$priv" = "root" ]; then
-            container_count=$(try_command "docker ps -aq 2>/dev/null | wc -l" || echo "0")
-            running_count=$(try_command "docker ps -q 2>/dev/null | wc -l" || echo "0")
-        elif [ "$priv" = "sudo" ]; then
-            container_count=$(try_command "sudo docker ps -aq 2>/dev/null | wc -l" || echo "0")
-            running_count=$(try_command "sudo docker ps -q 2>/dev/null | wc -l" || echo "0")
-        else
-            container_count=$(try_command "docker ps -aq 2>/dev/null | wc -l" || echo "0")
-            running_count=$(try_command "docker ps -q 2>/dev/null | wc -l" || echo "0")
-        fi
-    fi
-
-    if [ "$image_count" = "0" ] || [ -z "$image_count" ]; then
-        if [ "$priv" = "root" ]; then
-            image_count=$(try_command "docker images -q 2>/dev/null | wc -l" || echo "0")
-        elif [ "$priv" = "sudo" ]; then
-            image_count=$(try_command "sudo docker images -q 2>/dev/null | wc -l" || echo "0")
-        else
-            image_count=$(try_command "docker images -q 2>/dev/null | wc -l" || echo "0")
-        fi
-    fi
-
-    # Defaults
-    [ -z "$container_count" ] && container_count=0
-    [ -z "$running_count" ] && running_count=0
-    [ -z "$stopped_count" ] && stopped_count=0
-    [ -z "$paused_count" ] && paused_count=0
-    [ -z "$image_count" ] && image_count=0
-    [ -z "$storage_driver" ] && storage_driver="overlay2"
-    [ -z "$cgroup_driver" ] && cgroup_driver="cgroupfs"
-
-    # Resource usage
-    pid=$(get_pid "dockerd")
-    cpu_mem=$(get_process_cpu_mem "$pid")
-    cpu_cores=$(echo "$cpu_mem" | awk '{print $1}')
-    memory_mb=$(echo "$cpu_mem" | awk '{print $2}')
-
-    resource_usage_json=$(json_build_object \
-        "cpu_cores" "${cpu_cores:-0}" \
-        "memory_mb" "${memory_mb:-0}")
-
-    # Registries - always provide default Docker registry
-    registries="docker.io"
-
-    # Try to extract additional registries from daemon.json
-    if [ -f /etc/docker/daemon.json ]; then
-        config_registries=$(grep -o '"registry-mirrors"[^]]*' /etc/docker/daemon.json 2>/dev/null | grep -o 'https\?://[^"]*' | sed 's|https\?://||')
-        if [ -n "$config_registries" ]; then
-            registries="$registries
-$config_registries"
-        fi
-    fi
-    registries_json=$(json_build_array "$registries" false)
-
-    # Collect container details
-    containers_json="[]"
-    if [ "$container_count" -gt 0 ]; then
-        container_list=""
-
-        # Get container details with format: ID|Name|Image|State|CreatedAt|Labels
-        if [ "$priv" = "root" ]; then
-            container_data=$(try_command "docker ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.CreatedAt}}|{{.Labels}}' 2>/dev/null" || echo "")
-        elif [ "$priv" = "sudo" ]; then
-            container_data=$(try_command "sudo docker ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.CreatedAt}}|{{.Labels}}' 2>/dev/null" || echo "")
-        else
-            container_data=$(try_command "docker ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.CreatedAt}}|{{.Labels}}' 2>/dev/null" || echo "")
-        fi
-
-        if [ -n "$container_data" ]; then
-            while IFS='|' read -r container_id name image state created_at labels; do
-                [ -z "$container_id" ] && continue
-
-                # Convert state to lowercase
-                state_lower=$(echo "$state" | tr '[:upper:]' '[:lower:]')
-
-                # Parse labels into JSON object (POSIX-compliant)
-                labels_json="{}"
-                if [ -n "$labels" ]; then
-                    # Labels come in format: key1=value1,key2=value2
-                    # Build a simple JSON object
-                    label_pairs=""
-                    # Replace commas with newlines for POSIX-compliant parsing
-                    label_list=$(echo "$labels" | tr ',' '\n')
-                    while IFS= read -r label; do
-                        if [ -n "$label" ]; then
-                            label_key=$(echo "$label" | cut -d= -f1)
-                            label_value=$(echo "$label" | cut -d= -f2-)
-                            if [ -z "$label_pairs" ]; then
-                                label_pairs="\"$label_key\":\"$(json_escape "$label_value")\""
-                            else
-                                label_pairs="$label_pairs,\"$label_key\":\"$(json_escape "$label_value")\""
+        if [ -n "$_ip_text" ]; then
+            _ip_entries=""
+            _cur_iface=""
+            _oldIFS="$IFS"
+            IFS="
+"
+            for _line in $(echo "$_ip_text"); do
+                case "$_line" in
+                    [0-9]*:*)
+                        _cur_iface=$(echo "$_line" | sed 's/^[0-9]*: *//;s/:.*//' | sed 's/@.*//')
+                        ;;
+                esac
+                case "$_line" in
+                    *"inet "*)
+                        if [ "$_cur_iface" != "lo" ] && [ -n "$_cur_iface" ]; then
+                            _addr=$(echo "$_line" | awk '{print $2}' | cut -d/ -f1)
+                            if [ -n "$_addr" ]; then
+                                [ -n "$_ip_entries" ] && _ip_entries="${_ip_entries},"
+                                _ip_entries="${_ip_entries}{\"address\":\"${_addr}\",\"version\":\"ipv4\",\"interface\":\"${_cur_iface}\"}"
                             fi
                         fi
-                    done <<EOF
-$label_list
-EOF
-                    [ -n "$label_pairs" ] && labels_json="{$label_pairs}"
-                fi
-
-                # Determine if orchestrator managed (check for swarm labels)
-                orchestrator_managed="false"
-                orchestrator_type=""
-                service_name=""
-                task_id=""
-
-                case "$labels" in
-                    *com.docker.swarm.service.name=*)
-                        orchestrator_managed="true"
-                        orchestrator_type="docker-swarm"
-                        service_name=$(echo "$labels" | grep -o 'com.docker.swarm.service.name=[^,]*' | cut -d= -f2)
-                        task_id=$(echo "$labels" | grep -o 'com.docker.swarm.task.id=[^,]*' | cut -d= -f2)
                         ;;
-                    *io.kubernetes.pod.name=*)
-                        orchestrator_managed="true"
-                        orchestrator_type="kubernetes"
+                    *"inet6 "*)
+                        if [ "$_cur_iface" != "lo" ] && [ -n "$_cur_iface" ]; then
+                            _addr=$(echo "$_line" | awk '{print $2}' | cut -d/ -f1)
+                            if [ -n "$_addr" ]; then
+                                [ -n "$_ip_entries" ] && _ip_entries="${_ip_entries},"
+                                _ip_entries="${_ip_entries}{\"address\":\"${_addr}\",\"version\":\"ipv6\",\"interface\":\"${_cur_iface}\"}"
+                            fi
+                        fi
                         ;;
                 esac
-
-                orchestrator_ref_json=$(json_build_object \
-                    "type" "$orchestrator_type" \
-                    "service_name" "$service_name" \
-                    "task_id" "$task_id" \
-                    "pod_name" "" \
-                    "namespace" "")
-
-                # Get image ID
-                if [ "$priv" = "root" ]; then
-                    image_id=$(try_command "docker inspect --format '{{.Image}}' $container_id 2>/dev/null" || echo "")
-                elif [ "$priv" = "sudo" ]; then
-                    image_id=$(try_command "sudo docker inspect --format '{{.Image}}' $container_id 2>/dev/null" || echo "")
-                else
-                    image_id=$(try_command "docker inspect --format '{{.Image}}' $container_id 2>/dev/null" || echo "")
-                fi
-                [ -z "$image_id" ] && image_id=""
-
-                # Build resource usage (empty for now as detailed stats require more API calls)
-                cpu_usage_json=$(json_build_object \
-                    "usage_cores" "0" \
-                    "request_millicores" "0" \
-                    "limit_millicores" "0")
-
-                memory_usage_json=$(json_build_object \
-                    "usage_mb" "0" \
-                    "request_mb" "0" \
-                    "limit_mb" "0")
-
-                resource_usage_json=$(json_build_object \
-                    "cpu" "$cpu_usage_json" \
-                    "memory" "$memory_usage_json")
-
-                # Build container object
-                container_obj=$(json_build_object \
-                    "container_id" "$container_id" \
-                    "name" "$name" \
-                    "image" "$image" \
-                    "image_id" "$image_id" \
-                    "state" "$state_lower" \
-                    "created_at" "$created_at" \
-                    "labels" "$labels_json" \
-                    "ports" "[]" \
-                    "resource_usage" "$resource_usage_json" \
-                    "network_mode" "" \
-                    "restart_policy" "" \
-                    "orchestrator_managed" "$orchestrator_managed" \
-                    "orchestrator_ref" "$orchestrator_ref_json")
-
-                if [ -z "$container_list" ]; then
-                    container_list="$container_obj"
-                else
-                    container_list="$container_list,$container_obj"
-                fi
-            done << EOF
-$container_data
-EOF
-            [ -n "$container_list" ] && containers_json="[$container_list]"
+            done
+            IFS="$_oldIFS"
+            [ -n "$_ip_entries" ] && _ip_json="[${_ip_entries}]"
         fi
     fi
 
-    # Collect image details
-    images_json="[]"
-    if [ "$image_count" -gt 0 ]; then
-        image_list=""
-
-        # Get image details with format: ID|Repository|Tag|CreatedAt|Size
-        if [ "$priv" = "root" ]; then
-            image_data=$(try_command "docker images --format '{{.ID}}|{{.Repository}}|{{.Tag}}|{{.CreatedAt}}|{{.Size}}' 2>/dev/null" || echo "")
-        elif [ "$priv" = "sudo" ]; then
-            image_data=$(try_command "sudo docker images --format '{{.ID}}|{{.Repository}}|{{.Tag}}|{{.CreatedAt}}|{{.Size}}' 2>/dev/null" || echo "")
-        else
-            image_data=$(try_command "docker images --format '{{.ID}}|{{.Repository}}|{{.Tag}}|{{.CreatedAt}}|{{.Size}}' 2>/dev/null" || echo "")
+    # Method 3: ifconfig fallback
+    if [ "$_ip_json" = "[]" ]; then
+        _ifc_text=$(try_command_str "ifconfig" "ifconfig -a 2>/dev/null") || _ifc_text=""
+        if [ -z "$_ifc_text" ] && ($HAS_SUDO || $IS_ROOT); then
+            _ifc_text=$(try_sudo_command_str "ifconfig (sudo)" "ifconfig -a 2>/dev/null") || _ifc_text=""
         fi
-
-        if [ -n "$image_data" ]; then
-            while IFS='|' read -r image_id repository tag created_at size; do
-                [ -z "$image_id" ] && continue
-
-                # Convert size to MB (handle KB, MB, GB)
-                size_mb="0"
-                case "$size" in
-                    *KB)
-                        size_num=$(echo "$size" | sed 's/KB//')
-                        size_mb=$(awk "BEGIN {printf \"%.2f\", $size_num / 1024}")
-                        ;;
-                    *MB)
-                        size_mb=$(echo "$size" | sed 's/MB//')
-                        ;;
-                    *GB)
-                        size_num=$(echo "$size" | sed 's/GB//')
-                        size_mb=$(awk "BEGIN {printf \"%.2f\", $size_num * 1024}")
-                        ;;
-                    *)
-                        size_mb="0"
+        if [ -n "$_ifc_text" ]; then
+            _ip_entries=""
+            _cur_iface=""
+            _oldIFS="$IFS"
+            IFS="
+"
+            for _line in $(echo "$_ifc_text"); do
+                # Interface line starts without whitespace
+                case "$_line" in
+                    [a-zA-Z]*|[0-9]*)
+                        _cur_iface=$(echo "$_line" | awk '{print $1}' | sed 's/:$//')
                         ;;
                 esac
-
-                # Build image object
-                image_obj=$(json_build_object \
-                    "image_id" "$image_id" \
-                    "repository" "$repository" \
-                    "tag" "$tag" \
-                    "size_mb" "$size_mb" \
-                    "created_at" "$created_at")
-
-                if [ -z "$image_list" ]; then
-                    image_list="$image_obj"
-                else
-                    image_list="$image_list,$image_obj"
-                fi
-            done << EOF
-$image_data
-EOF
-            [ -n "$image_list" ] && images_json="[$image_list]"
+                case "$_line" in
+                    *"inet "*)
+                        if [ "$_cur_iface" != "lo" ] && [ -n "$_cur_iface" ]; then
+                            # Handle both "inet addr:x.x.x.x" and "inet x.x.x.x"
+                            _addr=$(echo "$_line" | grep -oE 'inet (addr:)?[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 | awk '{print $NF}' | sed 's/addr://')
+                            if [ -n "$_addr" ]; then
+                                [ -n "$_ip_entries" ] && _ip_entries="${_ip_entries},"
+                                _ip_entries="${_ip_entries}{\"address\":\"${_addr}\",\"version\":\"ipv4\",\"interface\":\"${_cur_iface}\"}"
+                            fi
+                        fi
+                        ;;
+                    *"inet6 "*)
+                        if [ "$_cur_iface" != "lo" ] && [ -n "$_cur_iface" ]; then
+                            _addr=$(echo "$_line" | grep -oE 'inet6 (addr: ?)?[0-9a-fA-F:]+' | head -1 | awk '{print $NF}' | sed 's/addr://')
+                            if [ -n "$_addr" ]; then
+                                [ -n "$_ip_entries" ] && _ip_entries="${_ip_entries},"
+                                _ip_entries="${_ip_entries}{\"address\":\"${_addr}\",\"version\":\"ipv6\",\"interface\":\"${_cur_iface}\"}"
+                            fi
+                        fi
+                        ;;
+                esac
+            done
+            IFS="$_oldIFS"
+            [ -n "$_ip_entries" ] && _ip_json="[${_ip_entries}]"
         fi
     fi
 
-    # Build final JSON
-    DOCKER_JSON=$(json_build_object \
-        "name" "docker" \
-        "runtime_type" "docker" \
-        "version" "$version" \
-        "socket" "$socket" \
-        "storage_driver" "$storage_driver" \
-        "storage_root" "$storage_root" \
-        "rootless" "false" \
-        "cgroup_driver" "$cgroup_driver" \
-        "namespaces" "[]" \
-        "image_count" "$image_count" \
-        "container_count" "$container_count" \
-        "running_container_count" "$running_count" \
-        "paused_container_count" "$paused_count" \
-        "stopped_container_count" "$stopped_count" \
-        "client_version" "$version" \
-        "server_version" "$version" \
-        "crictl_version" "" \
-        "resource_usage" "$resource_usage_json" \
-        "registries" "$registries_json" \
-        "containers" "$containers_json" \
-        "images" "$images_json")
+    [ -z "$_ip_json" ] && _ip_json="[]"
+    log_info "IP addresses discovered: $(echo "$_ip_json" | grep -o 'address' | wc -l)"
 
-    log_info "Docker discovery completed: $container_count containers, $running_count running"
+    # ---- Default Gateway ----
+    _gateway=""
+
+    # Method 1: ip route
+    _gateway=$(try_command_str "default gateway via ip route" "ip route 2>/dev/null | grep '^default' | head -1 | awk '{print \$3}'") || _gateway=""
+    if [ -z "$_gateway" ] && ($HAS_SUDO || $IS_ROOT); then
+        _gateway=$(try_sudo_command_str "default gateway via ip route (sudo)" "ip route 2>/dev/null | grep '^default' | head -1 | awk '{print \$3}'") || _gateway=""
+    fi
+
+    # Method 2: route -n
+    if [ -z "$_gateway" ]; then
+        _gateway=$(try_command_str "default gateway via route" "route -n 2>/dev/null | grep '^0\.0\.0\.0' | head -1 | awk '{print \$2}'") || _gateway=""
+        if [ -z "$_gateway" ] && ($HAS_SUDO || $IS_ROOT); then
+            _gateway=$(try_sudo_command_str "default gateway via route (sudo)" "route -n 2>/dev/null | grep '^0\.0\.0\.0' | head -1 | awk '{print \$2}'") || _gateway=""
+        fi
+    fi
+
+    # Method 3: /proc/net/route fallback
+    if [ -z "$_gateway" ] && [ -f /proc/net/route ]; then
+        _hex_gw=$(try_command_str "gateway via /proc/net/route" "awk '\$2 == \"00000000\" {print \$3; exit}' /proc/net/route 2>/dev/null") || _hex_gw=""
+        if [ -n "$_hex_gw" ] && [ "$_hex_gw" != "00000000" ]; then
+            # Convert hex to IP (little-endian on x86)
+            _gateway=$(printf '%d.%d.%d.%d' \
+                "0x$(echo "$_hex_gw" | cut -c7-8)" \
+                "0x$(echo "$_hex_gw" | cut -c5-6)" \
+                "0x$(echo "$_hex_gw" | cut -c3-4)" \
+                "0x$(echo "$_hex_gw" | cut -c1-2)" 2>/dev/null) || _gateway=""
+        fi
+    fi
+
+    _gateway=$(safe_json_string "$_gateway")
+    log_info "Default gateway: ${_gateway}"
+
+    # ---- DNS Servers ----
+    _dns_json="[]"
+    _dns_entries=""
+
+    # Method 1: resolvectl status
+    _dns_raw=$(try_command_str "dns via resolvectl" "resolvectl status 2>/dev/null | grep -i 'DNS Servers' | head -5 | sed 's/.*DNS Servers: *//' | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+|^[0-9a-fA-F]*:'") || _dns_raw=""
+    if [ -z "$_dns_raw" ] && ($HAS_SUDO || $IS_ROOT); then
+        _dns_raw=$(try_sudo_command_str "dns via resolvectl (sudo)" "resolvectl status 2>/dev/null | grep -i 'DNS Servers' | head -5 | sed 's/.*DNS Servers: *//' | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+|^[0-9a-fA-F]*:'") || _dns_raw=""
+    fi
+
+    # Method 2: systemd-resolve --status (older systems)
+    if [ -z "$_dns_raw" ]; then
+        _dns_raw=$(try_command_str "dns via systemd-resolve" "systemd-resolve --status 2>/dev/null | grep -i 'DNS Servers' | head -5 | sed 's/.*DNS Servers: *//' | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+|^[0-9a-fA-F]*:'") || _dns_raw=""
+    fi
+
+    # Method 3: /etc/resolv.conf
+    if [ -z "$_dns_raw" ] && [ -f /etc/resolv.conf ]; then
+        _dns_raw=$(try_command_str "dns via resolv.conf" "grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print \$2}'") || _dns_raw=""
+    fi
+
+    # Method 4: nmcli fallback
+    if [ -z "$_dns_raw" ]; then
+        _dns_raw=$(try_command_str "dns via nmcli" "nmcli dev show 2>/dev/null | grep 'IP4.DNS' | awk '{print \$2}'") || _dns_raw=""
+    fi
+
+    if [ -n "$_dns_raw" ]; then
+        _oldIFS="$IFS"
+        IFS="
+"
+        for _dns in $(echo "$_dns_raw" | grep -v '^$'); do
+            _dns=$(echo "$_dns" | tr -d ' \t\r')
+            [ -z "$_dns" ] && continue
+            _dns_safe=$(safe_json_string "$_dns")
+            [ -n "$_dns_entries" ] && _dns_entries="${_dns_entries},"
+            _dns_entries="${_dns_entries}\"${_dns_safe}\""
+        done
+        IFS="$_oldIFS"
+    fi
+
+    [ -n "$_dns_entries" ] && _dns_json="[${_dns_entries}]"
+    [ -z "$_dns_json" ] && _dns_json="[]"
+    log_info "DNS servers: $(echo "$_dns_json" | grep -o '"' | wc -l | awk '{print $1/2}')"
+
+    # ---- Assemble network JSON ----
+    NETWORK_JSON="{
+      \"ip_addresses\": ${_ip_json},
+      \"default_gateway\": \"${_gateway}\",
+      \"dns_servers\": ${_dns_json}
+    }"
+    log_info "Network discovery complete"
 }
 
-discover_crio() {
-    log_info "Discovering CRI-O..."
+# ========================
+# 2.3 Container Runtimes
+# ========================
 
-    # Version
-    version=$(try_command "crio --version 2>/dev/null | head -n1 | awk '{print \$3}'")
-    [ -z "$version" ] && version=$(try_command "crictl version 2>/dev/null | grep 'RuntimeVersion' | awk '{print \$2}'")
-    [ -z "$version" ] && version=""
+# Helper: get resource usage for a process
+get_process_resource_usage() {
+    _pname="$1"
+    _pid=$(pgrep -x "$_pname" 2>/dev/null | head -1)
+    if [ -z "$_pid" ]; then
+        _pid=$(pgrep -f "$_pname" 2>/dev/null | head -1)
+    fi
+    _cpu="0.0"
+    _mem="0.0"
+    if [ -n "$_pid" ]; then
+        _ps_out=$(ps -p "$_pid" -o %cpu=,rss= 2>/dev/null)
+        if [ -n "$_ps_out" ]; then
+            _cpu=$(echo "$_ps_out" | awk '{printf "%.2f", $1/100}')
+            _rss=$(echo "$_ps_out" | awk '{print $2}')
+            _mem=$(echo "$_rss" | awk '{printf "%.2f", $1/1024}')
+        fi
+    fi
+    echo "${_cpu} ${_mem}"
+}
 
-    # Socket
-    socket="/var/run/crio/crio.sock"
-    [ ! -S "$socket" ] && socket=""
+# Helper: build container JSON for a single container
+# Sets global _CONT_JSON
+build_container_json() {
+    _cid="$1"
+    _cname="$2"
+    _cimage="$3"
+    _cimage_id="$4"
+    _cstate="$5"
+    _ccreated="$6"
+    _cports_json="$7"
+    _ccpu_usage="$8"
+    _ccpu_req="$9"
+    shift 9
+    _ccpu_lim="$1"
+    _cmem_usage="$2"
+    _cmem_req="$3"
+    _cmem_lim="$4"
+    _cnet_mode="$5"
+    _crestart_pol="$6"
+    _orch_managed="$7"
+    _orch_type="$8"
+    _orch_svc="$9"
+    shift 9
+    _orch_task="${1:-}"
+    _orch_pod="${2:-}"
+    _orch_ns="${3:-}"
 
-    # Storage root
-    storage_root="/var/lib/containers/storage"
+    [ -z "$_cports_json" ] && _cports_json="[]"
+    [ -z "$_ccpu_usage" ] && _ccpu_usage="0.0"
+    [ -z "$_ccpu_req" ] && _ccpu_req="0"
+    [ -z "$_ccpu_lim" ] && _ccpu_lim="0"
+    [ -z "$_cmem_usage" ] && _cmem_usage="0.0"
+    [ -z "$_cmem_req" ] && _cmem_req="0"
+    [ -z "$_cmem_lim" ] && _cmem_lim="0"
+    [ -z "$_cnet_mode" ] && _cnet_mode=""
+    [ -z "$_crestart_pol" ] && _crestart_pol=""
+    [ -z "$_orch_managed" ] && _orch_managed="false"
+    [ -z "$_orch_type" ] && _orch_type=""
+    [ -z "$_orch_svc" ] && _orch_svc=""
+    [ -z "$_orch_task" ] && _orch_task=""
+    [ -z "$_orch_pod" ] && _orch_pod=""
+    [ -z "$_orch_ns" ] && _orch_ns=""
 
-    # Check privilege for crictl commands
-    priv=$(check_privilege)
+    _CONT_JSON="{
+                \"container_id\": \"$(safe_json_string "$_cid")\",
+                \"name\": \"$(safe_json_string "$_cname")\",
+                \"image\": \"$(safe_json_string "$_cimage")\",
+                \"image_id\": \"$(safe_json_string "$_cimage_id")\",
+                \"state\": \"$(safe_json_string "$_cstate")\",
+                \"created_at\": \"$(safe_json_string "$_ccreated")\",
+                \"ports\": $_cports_json,
+                \"resource_usage\": {
+                  \"cpu\": {
+                    \"usage_cores\": $_ccpu_usage,
+                    \"request_millicores\": $_ccpu_req,
+                    \"limit_millicores\": $_ccpu_lim
+                  },
+                  \"memory\": {
+                    \"usage_mb\": $_cmem_usage,
+                    \"request_mb\": $_cmem_req,
+                    \"limit_mb\": $_cmem_lim
+                  }
+                },
+                \"network_mode\": \"$(safe_json_string "$_cnet_mode")\",
+                \"restart_policy\": \"$(safe_json_string "$_crestart_pol")\",
+                \"orchestrator_managed\": $_orch_managed,
+                \"orchestrator_ref\": {
+                  \"type\": \"$(safe_json_string "$_orch_type")\",
+                  \"service_name\": \"$(safe_json_string "$_orch_svc")\",
+                  \"task_id\": \"$(safe_json_string "$_orch_task")\",
+                  \"pod_name\": \"$(safe_json_string "$_orch_pod")\",
+                  \"namespace\": \"$(safe_json_string "$_orch_ns")\"
+                }
+              }"
+}
 
-    # Container counts - use sudo for crictl commands
-    if [ "$priv" = "root" ]; then
-        container_count=$(try_command "crictl ps -a -q 2>/dev/null | wc -l" || echo "0")
-        running_count=$(try_command "crictl ps -q 2>/dev/null | wc -l" || echo "0")
-    elif [ "$priv" = "sudo" ]; then
-        container_count=$(try_command "sudo crictl ps -a -q 2>/dev/null | wc -l" || echo "0")
-        running_count=$(try_command "sudo crictl ps -q 2>/dev/null | wc -l" || echo "0")
-    else
-        container_count=$(try_command "crictl ps -a -q 2>/dev/null | wc -l" || echo "0")
-        running_count=$(try_command "crictl ps -q 2>/dev/null | wc -l" || echo "0")
+# ========================
+# 2.3a Docker discovery
+# ========================
+DOCKER_DETECTED=false
+DOCKER_RUNTIME_JSON=""
+
+discover_docker() {
+    log_info "=== Discovering Docker ==="
+
+    # Detection
+    _docker_found=false
+    if command -v dockerd >/dev/null 2>&1 || command -v docker >/dev/null 2>&1; then
+        _docker_found=true
+    elif systemctl is-active docker >/dev/null 2>&1; then
+        _docker_found=true
+    elif [ -S /var/run/docker.sock ]; then
+        _docker_found=true
     fi
 
-    # Image count - use sudo for crictl commands
-    if [ "$priv" = "root" ]; then
-        image_count=$(try_command "crictl images -q 2>/dev/null | wc -l" || echo "0")
-    elif [ "$priv" = "sudo" ]; then
-        image_count=$(try_command "sudo crictl images -q 2>/dev/null | wc -l" || echo "0")
-    else
-        image_count=$(try_command "crictl images -q 2>/dev/null | wc -l" || echo "0")
+    if ! $_docker_found; then
+        log_info "Docker not detected"
+        return
+    fi
+
+    DOCKER_DETECTED=true
+    log_info "Docker detected"
+
+    # Version
+    _version=$(docker_try "docker version" "docker version --format '{{.Server.Version}}'")
+    if [ -z "$_version" ]; then
+        _version=$(try_command_str "dockerd version" "dockerd --version 2>/dev/null | awk '{print \$3}' | tr -d ','") || _version=""
+    fi
+    if [ -z "$_version" ]; then
+        _version=$(docker_try "docker version via socket" "curl -s --unix-socket /var/run/docker.sock http://localhost/version 2>/dev/null | grep -o '\"Version\":\"[^\"]*\"' | head -1 | sed 's/\"Version\":\"//;s/\"//'")
+    fi
+    if [ -z "$_version" ]; then
+        _version=$(try_command_str "docker version dpkg" "dpkg -l 2>/dev/null | grep -i docker-ce | awk '{print \$3}' | head -1 | sed 's/[^0-9.].*//; s/^[0-9]*://'") || _version=""
+    fi
+    if [ -z "$_version" ]; then
+        _version=$(try_command_str "docker version rpm" "rpm -qa 2>/dev/null | grep -i docker-ce | head -1 | sed 's/docker-ce-//i; s/-.*//'") || _version=""
+    fi
+    _version=$(safe_json_string "$_version")
+
+    # Client version
+    _client_version=$(docker_try "docker client version" "docker version --format '{{.Client.Version}}'")
+    [ -z "$_client_version" ] && _client_version="$_version"
+    _client_version=$(safe_json_string "$_client_version")
+
+    # Server version 
+    _server_version="$_version"
+
+    # Socket
+    _socket="/var/run/docker.sock"
+    if [ ! -S "$_socket" ]; then
+        _socket=$(try_command_str "docker socket from ps" "ps aux | grep dockerd | grep -v grep | grep -o '\\-\\-host[= ]unix://[^ ]*' | sed 's/.*unix:\\/\\//\\//'") || _socket="/var/run/docker.sock"
     fi
 
     # Storage driver
-    storage_driver="overlay"
-    if [ -f /etc/crio/crio.conf ]; then
-        if [ "$priv" = "root" ]; then
-            driver=$(grep storage_driver /etc/crio/crio.conf 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
-        elif [ "$priv" = "sudo" ]; then
-            driver=$(try_command "sudo cat /etc/crio/crio.conf 2>/dev/null | grep storage_driver | head -n1 | awk '{print \$3}' | tr -d '\"'")
-        else
-            driver=$(grep storage_driver /etc/crio/crio.conf 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
-        fi
-        [ -n "$driver" ] && storage_driver="$driver"
+    _storage_driver=$(docker_try "docker storage driver" "docker info --format '{{.Driver}}'")
+    if [ -z "$_storage_driver" ]; then
+        _storage_driver=$(docker_try "docker storage driver via socket" "curl -s --unix-socket /var/run/docker.sock http://localhost/info 2>/dev/null | grep -o '\"Driver\":\"[^\"]*\"' | sed 's/\"Driver\":\"//;s/\"//'")
     fi
-
-    # Cgroup driver
-    cgroup_driver="systemd"
-    if [ -f /etc/crio/crio.conf ]; then
-        if [ "$priv" = "root" ]; then
-            cgm=$(grep cgroup_manager /etc/crio/crio.conf 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
-        elif [ "$priv" = "sudo" ]; then
-            cgm=$(try_command "sudo cat /etc/crio/crio.conf 2>/dev/null | grep cgroup_manager | head -n1 | awk '{print \$3}' | tr -d '\"'")
-        else
-            cgm=$(grep cgroup_manager /etc/crio/crio.conf 2>/dev/null | head -n1 | awk '{print $3}' | tr -d '"')
-        fi
-        [ -n "$cgm" ] && cgroup_driver="$cgm"
-    fi
-
-    # Resource usage
-    pid=$(get_pid "crio")
-    cpu_mem=$(get_process_cpu_mem "$pid")
-    cpu_cores=$(echo "$cpu_mem" | awk '{print $1}')
-    memory_mb=$(echo "$cpu_mem" | awk '{print $2}')
-
-    resource_usage_json=$(json_build_object \
-        "cpu_cores" "${cpu_cores:-0}" \
-        "memory_mb" "${memory_mb:-0}")
-
-    # Registries
-    registries="registry.access.redhat.com
-registry.redhat.io
-quay.io
-docker.io"
-    registries_json=$(json_build_array "$registries" false)
-
-    # Namespaces (CRI-O uses k8s.io)
-    namespaces="k8s.io"
-    namespaces_json=$(json_build_array "$namespaces" false)
-
-    # Rootless detection for CRI-O
-    rootless="false"
-    current_uid=$(id -u)
-    # CRI-O is rootless if socket is in user directory or running as non-root with user-specific socket
-    if [ "$current_uid" != "0" ] && [ -S "/run/user/$current_uid/crio/crio.sock" ]; then
-        rootless="true"
-        socket="/run/user/$current_uid/crio/crio.sock"
-        storage_root="$HOME/.local/share/containers/storage"
-    elif [ "$current_uid" != "0" ] && [ ! -S "/var/run/crio/crio.sock" ] && [ -f "$HOME/.config/crio/crio.conf" ]; then
-        # If config exists in user directory, it's likely rootless
-        rootless="true"
-        storage_root="$HOME/.local/share/containers/storage"
-    fi
-
-    # Collect container details
-    containers_json="[]"
-    if [ "$container_count" -gt 0 ]; then
-        container_list=""
-
-        # Get container details with crictl
-        if [ "$priv" = "root" ]; then
-            container_data=$(try_command "crictl ps -a --output json 2>/dev/null" || echo "")
-        elif [ "$priv" = "sudo" ]; then
-            container_data=$(try_command "sudo crictl ps -a --output json 2>/dev/null" || echo "")
-        else
-            container_data=$(try_command "crictl ps -a --output json 2>/dev/null" || echo "")
-        fi
-
-        if [ -n "$container_data" ]; then
-            # Parse JSON output from crictl (simple extraction)
-            container_ids=$(echo "$container_data" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
-
-            if [ -n "$container_ids" ]; then
-                for container_id in $container_ids; do
-                    [ -z "$container_id" ] && continue
-
-                    # Get detailed info for each container
-                    if [ "$priv" = "root" ]; then
-                        container_info=$(try_command "crictl inspect $container_id 2>/dev/null" || echo "")
-                    elif [ "$priv" = "sudo" ]; then
-                        container_info=$(try_command "sudo crictl inspect $container_id 2>/dev/null" || echo "")
-                    else
-                        container_info=$(try_command "crictl inspect $container_id 2>/dev/null" || echo "")
-                    fi
-
-                    if [ -n "$container_info" ]; then
-                        name=$(echo "$container_info" | grep -o '"name":"[^"]*"' | head -n1 | cut -d'"' -f4)
-                        image=$(echo "$container_info" | grep -o '"image":"[^"]*"' | head -n1 | cut -d'"' -f4)
-                        state=$(echo "$container_info" | grep -o '"state":"[^"]*"' | head -n1 | cut -d'"' -f4 | tr '[:upper:]' '[:lower:]')
-
-                        [ -z "$name" ] && name="$container_id"
-                        [ -z "$state" ] && state="unknown"
-
-                        # Build container object
-                        container_obj=$(json_build_object \
-                            "container_id" "$container_id" \
-                            "name" "$name" \
-                            "image" "$image" \
-                            "state" "$state" \
-                            "namespace" "k8s.io" \
-                            "orchestrator_managed" "false" \
-                            "orchestrator_type" "" \
-                            "labels" "{}")
-
-                        if [ -z "$container_list" ]; then
-                            container_list="$container_obj"
-                        else
-                            container_list="$container_list,$container_obj"
-                        fi
-                    fi
-                done
-            fi
-        fi
-        [ -n "$container_list" ] && containers_json="[$container_list]"
-    fi
-
-    # Collect image details
-    images_json="[]"
-    if [ "$image_count" -gt 0 ]; then
-        image_list=""
-
-        # Get image details with crictl
-        if [ "$priv" = "root" ]; then
-            image_data=$(try_command "crictl images --output json 2>/dev/null" || echo "")
-        elif [ "$priv" = "sudo" ]; then
-            image_data=$(try_command "sudo crictl images --output json 2>/dev/null" || echo "")
-        else
-            image_data=$(try_command "crictl images --output json 2>/dev/null" || echo "")
-        fi
-
-        if [ -n "$image_data" ]; then
-            # Parse JSON output from crictl (simple extraction)
-            # Extract image IDs
-            image_ids=$(echo "$image_data" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
-
-            if [ -n "$image_ids" ]; then
-                for image_id in $image_ids; do
-                    [ -z "$image_id" ] && continue
-
-                    # Get repository tags and size
-                    image_info=$(echo "$image_data" | grep -A10 "\"id\":\"$image_id\"")
-
-                    repoTags=$(echo "$image_info" | grep -o '"repoTags":\["[^"]*"' | cut -d'"' -f4 | head -n1)
-                    size=$(echo "$image_info" | grep -o '"size":"[0-9]*"' | cut -d'"' -f4)
-
-                    if [ -n "$repoTags" ]; then
-                        repository=$(echo "$repoTags" | sed 's/:.*$//')
-                        tag=$(echo "$repoTags" | sed 's/.*://')
-                        [ "$tag" = "$repository" ] && tag="latest"
-                    else
-                        repository="<none>"
-                        tag="<none>"
-                    fi
-
-                    # Convert size to MB (size is in bytes)
-                    size_mb="0"
-                    if [ -n "$size" ] && [ "$size" -gt 0 ]; then
-                        size_mb=$(awk "BEGIN {printf \"%.2f\", $size / 1024 / 1024}")
-                    fi
-
-                    # Build image object
-                    image_obj=$(json_build_object \
-                        "image_id" "$image_id" \
-                        "repository" "$repository" \
-                        "tag" "$tag" \
-                        "size_mb" "$size_mb" \
-                        "created_at" "")
-
-                    if [ -z "$image_list" ]; then
-                        image_list="$image_obj"
-                    else
-                        image_list="$image_list,$image_obj"
-                    fi
-                done
-            fi
-        fi
-        [ -n "$image_list" ] && images_json="[$image_list]"
-    fi
-
-    # Build final JSON
-    CRIO_JSON=$(json_build_object \
-        "name" "crio" \
-        "runtime_type" "crio" \
-        "version" "$version" \
-        "socket" "$socket" \
-        "storage_driver" "$storage_driver" \
-        "storage_root" "$storage_root" \
-        "rootless" "$rootless" \
-        "cgroup_driver" "$cgroup_driver" \
-        "namespaces" "$namespaces_json" \
-        "image_count" "$image_count" \
-        "container_count" "$container_count" \
-        "running_container_count" "$running_count" \
-        "paused_container_count" "0" \
-        "stopped_container_count" "$((container_count - running_count))" \
-        "client_version" "$version" \
-        "server_version" "$version" \
-        "crictl_version" "$(try_command 'crictl --version 2>/dev/null | awk \"{print \\\$3}\"')" \
-        "resource_usage" "$resource_usage_json" \
-        "registries" "$registries_json" \
-        "containers" "$containers_json" \
-        "images" "$images_json")
-
-    log_info "CRI-O discovery completed: $container_count containers, $running_count running"
-}
-
-discover_podman() {
-    log_info "Discovering Podman..."
-
-    # Version
-    version=$(try_command "podman version --format '{{.Server.Version}}' 2>/dev/null")
-    [ -z "$version" ] && version=$(try_command "podman --version 2>/dev/null | awk '{print \$3}'")
-    [ -z "$version" ] && version=""
-
-    # Rootless detection
-    rootless="false"
-    current_uid=$(id -u)
-    if [ "$current_uid" != "0" ]; then
-        # Check if podman is running in rootless mode
-        if command_exists podman; then
-            rootless_check=$(try_command "podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null")
-            [ "$rootless_check" = "true" ] && rootless="true"
-        fi
-    fi
-
-    # Socket
-    if [ "$rootless" = "true" ]; then
-        socket="/run/user/$current_uid/podman/podman.sock"
-    else
-        socket="/run/podman/podman.sock"
-    fi
-    [ ! -S "$socket" ] && socket=""
+    _storage_driver=$(safe_json_string "$_storage_driver")
 
     # Storage root
-    if [ "$rootless" = "true" ]; then
-        storage_root="$HOME/.local/share/containers/storage"
-    else
-        storage_root="/var/lib/containers/storage"
-    fi
+    _storage_root=$(docker_try "docker root dir" "docker info --format '{{.DockerRootDir}}'")
+    [ -z "$_storage_root" ] && _storage_root="/var/lib/docker"
+    _storage_root=$(safe_json_string "$_storage_root")
 
-    # Container counts
-    container_count=$(try_command "podman ps -a -q 2>/dev/null | wc -l" || echo "0")
-    running_count=$(try_command "podman ps -q 2>/dev/null | wc -l" || echo "0")
+    # Rootless
+    _rootless=false
+    _rootless_check=$(docker_try "docker rootless" "docker info --format '{{.SecurityOptions}}'")
+    case "$_rootless_check" in *rootless*) _rootless=true ;; esac
+
+    # Cgroup driver
+    _cgroup_driver=$(docker_try "docker cgroup driver" "docker info --format '{{.CgroupDriver}}'")
+    if [ -z "$_cgroup_driver" ]; then
+        _cgroup_driver=$(docker_try "docker cgroup via socket" "curl -s --unix-socket /var/run/docker.sock http://localhost/info 2>/dev/null | grep -o '\"CgroupDriver\":\"[^\"]*\"' | sed 's/\"CgroupDriver\":\"//;s/\"//'")
+    fi
+    [ -z "$_cgroup_driver" ] && _cgroup_driver="systemd"
+    _cgroup_driver=$(safe_json_string "$_cgroup_driver")
+
+    # Container count
+    _container_count=$(docker_try "docker container count" "docker info --format '{{.Containers}}'")
+    if [ -z "$_container_count" ]; then
+        _container_count=$(docker_try "docker containers via socket" "curl -s --unix-socket /var/run/docker.sock http://localhost/info 2>/dev/null | grep -o '\"Containers\":[0-9]*' | sed 's/\"Containers\"://'")
+    fi
+    _container_count=$(num_or_default "$_container_count" 0)
+    # Cross-check: count via docker ps -aq
+    if [ "$_container_count" = "0" ]; then
+        _cc_ids=$(docker_try "docker ps -aq" "docker ps -aq")
+        if [ -n "$_cc_ids" ]; then
+            _cc_check=$(echo "$_cc_ids" | grep -c .)
+            _cc_check=$(num_or_default "$_cc_check" 0)
+            [ "$_cc_check" -gt 0 ] 2>/dev/null && _container_count="$_cc_check"
+        fi
+    fi
+    log_info "Docker container_count=$_container_count"
+
+    # Running container count
+    _running_count=$(docker_try "docker running count" "docker info --format '{{.ContainersRunning}}'")
+    if [ -z "$_running_count" ]; then
+        _running_count=$(docker_try "docker running via socket" "curl -s --unix-socket /var/run/docker.sock http://localhost/info 2>/dev/null | grep -o '\"ContainersRunning\":[0-9]*' | sed 's/\"ContainersRunning\"://'")
+    fi
+    _running_count=$(num_or_default "$_running_count" 0)
 
     # Image count
-    image_count=$(try_command "podman images -q 2>/dev/null | wc -l" || echo "0")
-
-    # Storage driver
-    storage_driver=$(try_command "podman info --format '{{.Store.GraphDriverName}}' 2>/dev/null")
-    [ -z "$storage_driver" ] && storage_driver="overlay"
-
-    # Cgroup driver
-    cgroup_driver="systemd"
+    _image_count=$(docker_try "docker image count" "docker info --format '{{.Images}}'")
+    if [ -z "$_image_count" ]; then
+        _image_count=$(docker_try "docker images via socket" "curl -s --unix-socket /var/run/docker.sock http://localhost/info 2>/dev/null | grep -o '\"Images\":[0-9]*' | sed 's/\"Images\"://'")
+    fi
+    _image_count=$(num_or_default "$_image_count" 0)
+    # Cross-check: count via docker image ls -q
+    if [ "$_image_count" = "0" ]; then
+        _ic_ids=$(docker_try "docker image ls -q" "docker image ls -q")
+        if [ -n "$_ic_ids" ]; then
+            _ic_check=$(echo "$_ic_ids" | grep -c .)
+            _ic_check=$(num_or_default "$_ic_check" 0)
+            [ "$_ic_check" -gt 0 ] 2>/dev/null && _image_count="$_ic_check"
+        fi
+    fi
+    log_info "Docker image_count=$_image_count"
 
     # Resource usage
-    pid=$(get_pid "podman")
-    cpu_mem=$(get_process_cpu_mem "$pid")
-    cpu_cores=$(echo "$cpu_mem" | awk '{print $1}')
-    memory_mb=$(echo "$cpu_mem" | awk '{print $2}')
+    _res=$(get_process_resource_usage "dockerd")
+    _docker_cpu=$(echo "$_res" | awk '{print $1}')
+    _docker_mem=$(echo "$_res" | awk '{print $2}')
 
-    resource_usage_json=$(json_build_object \
-        "cpu_cores" "${cpu_cores:-0}" \
-        "memory_mb" "${memory_mb:-0}")
-
-    # Registries
-    registries="registry.access.redhat.com
-registry.redhat.io
-docker.io
-quay.io"
-    registries_json=$(json_build_array "$registries" false)
-
-    # Collect container details
-    containers_json="[]"
-    if [ "$container_count" -gt 0 ]; then
-        container_list=""
-
-        # Get container details with format: ID|Name|Image|State|CreatedAt
-        container_data=$(try_command "podman ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.CreatedAt}}' 2>/dev/null" || echo "")
-
-        if [ -n "$container_data" ]; then
-            while IFS='|' read -r container_id name image state created_at; do
-                [ -z "$container_id" ] && continue
-
-                # Convert state to lowercase
-                state_lower=$(echo "$state" | tr '[:upper:]' '[:lower:]')
-
-                # Build container object
-                container_obj=$(json_build_object \
-                    "container_id" "$container_id" \
-                    "name" "$name" \
-                    "image" "$image" \
-                    "state" "$state_lower" \
-                    "namespace" "" \
-                    "orchestrator_managed" "false" \
-                    "orchestrator_type" "" \
-                    "labels" "{}")
-
-                if [ -z "$container_list" ]; then
-                    container_list="$container_obj"
-                else
-                    container_list="$container_list,$container_obj"
-                fi
-            done << EOF
-$container_data
-EOF
-        fi
-        [ -n "$container_list" ] && containers_json="[$container_list]"
+    # Discover containers
+    _containers_json="[]"
+    _cont_list=""
+    # Method 1: docker ps with --format
+    _cont_list=$(docker_try "docker ps" "docker ps -a --no-trunc --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.CreatedAt}}'")
+    # Method 2: docker container ls (alias, in case docker ps has issues)
+    if [ -z "$_cont_list" ]; then
+        _cont_list=$(docker_try "docker container ls" "docker container ls -a --no-trunc --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.CreatedAt}}'")
     fi
-
-    # Collect image details
-    images_json="[]"
-    if [ "$image_count" -gt 0 ]; then
-        image_list=""
-
-        # Get image details with format: ID|Repository|Tag|CreatedAt|Size
-        image_data=$(try_command "podman images --format '{{.ID}}|{{.Repository}}|{{.Tag}}|{{.CreatedAt}}|{{.Size}}' 2>/dev/null" || echo "")
-
-        if [ -n "$image_data" ]; then
-            while IFS='|' read -r image_id repository tag created_at size; do
-                [ -z "$image_id" ] && continue
-
-                # Convert size to MB (handle KB, MB, GB)
-                size_mb="0"
-                case "$size" in
-                    *KB)
-                        size_num=$(echo "$size" | sed 's/KB//')
-                        size_mb=$(awk "BEGIN {printf \"%.2f\", $size_num / 1024}")
-                        ;;
-                    *MB)
-                        size_mb=$(echo "$size" | sed 's/MB//')
-                        ;;
-                    *GB)
-                        size_num=$(echo "$size" | sed 's/GB//')
-                        size_mb=$(awk "BEGIN {printf \"%.2f\", $size_num * 1024}")
-                        ;;
-                    *)
-                        size_mb="0"
-                        ;;
-                esac
-
-                # Build image object
-                image_obj=$(json_build_object \
-                    "image_id" "$image_id" \
-                    "repository" "$repository" \
-                    "tag" "$tag" \
-                    "size_mb" "$size_mb" \
-                    "created_at" "$created_at")
-
-                if [ -z "$image_list" ]; then
-                    image_list="$image_obj"
-                else
-                    image_list="$image_list,$image_obj"
-                fi
-            done << EOF
-$image_data
-EOF
-        fi
-        [ -n "$image_list" ] && images_json="[$image_list]"
-    fi
-
-    # Build final JSON
-    PODMAN_JSON=$(json_build_object \
-        "name" "podman" \
-        "runtime_type" "podman" \
-        "version" "$version" \
-        "socket" "$socket" \
-        "storage_driver" "$storage_driver" \
-        "storage_root" "$storage_root" \
-        "rootless" "$rootless" \
-        "cgroup_driver" "$cgroup_driver" \
-        "namespaces" "[]" \
-        "image_count" "$image_count" \
-        "container_count" "$container_count" \
-        "running_container_count" "$running_count" \
-        "paused_container_count" "0" \
-        "stopped_container_count" "$((container_count - running_count))" \
-        "client_version" "$version" \
-        "server_version" "$version" \
-        "crictl_version" "" \
-        "resource_usage" "$resource_usage_json" \
-        "registries" "$registries_json" \
-        "containers" "$containers_json" \
-        "images" "$images_json")
-
-    log_info "Podman discovery completed: $container_count containers, $running_count running (rootless: $rootless)"
-}
-
-#==============================================================================
-# Orchestrator Detection and Discovery
-#==============================================================================
-
-detect_orchestrators() {
-    log_info "Detecting orchestrators..."
-
-    ORCHESTRATORS_DETECTED=""
-    priv=$(check_privilege)
-    docker_cmd="docker"
-    [ "$priv" = "sudo" ] && docker_cmd="sudo docker"
-
-    # Check for Docker Swarm
-    if echo "$RUNTIMES_DETECTED" | grep -q "docker"; then
-        swarm_state=$(try_command "$docker_cmd info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null")
-        if [ "$swarm_state" = "active" ]; then
-            ORCHESTRATORS_DETECTED="$ORCHESTRATORS_DETECTED docker-swarm"
-            log_info "Docker Swarm detected"
-            discover_docker_swarm
-        fi
-    fi
-
-    # Check for Kubernetes - improved detection for worker nodes
-    k8s_detected=false
-
-    # Check if kubelet is running (most reliable for worker nodes)
-    if systemctl is-active kubelet >/dev/null 2>&1; then
-        k8s_detected=true
-    fi
-
-    # Check for kubernetes directories
-    if [ "$k8s_detected" = false ] && [ -d /etc/kubernetes ]; then
-        k8s_detected=true
-    fi
-
-    # Check for kubectl command
-    if [ "$k8s_detected" = false ] && command_exists kubectl; then
-        if try_command "kubectl cluster-info 2>/dev/null" >/dev/null 2>&1; then
-            k8s_detected=true
-        fi
-    fi
-
-    # Check for kubelet binary
-    if [ "$k8s_detected" = false ] && command_exists kubelet; then
-        k8s_detected=true
-    fi
-
-    if [ "$k8s_detected" = true ]; then
-        ORCHESTRATORS_DETECTED="$ORCHESTRATORS_DETECTED kubernetes"
-        log_info "Kubernetes detected"
-        discover_kubernetes
-    fi
-
-    # Check for OpenShift
-    if command_exists oc || (command_exists kubectl && try_command "kubectl get clusterversion 2>/dev/null" >/dev/null 2>&1); then
-        ORCHESTRATORS_DETECTED="$ORCHESTRATORS_DETECTED openshift"
-        log_info "OpenShift detected"
-        discover_openshift
-    fi
-
-    # Check for Tanzu
-    if command_exists tanzu || (command_exists kubectl && try_command "kubectl get tkr 2>/dev/null" >/dev/null 2>&1); then
-        ORCHESTRATORS_DETECTED="$ORCHESTRATORS_DETECTED tanzu"
-        log_info "Tanzu detected"
-        discover_tanzu
-    fi
-
-    ORCHESTRATORS_DETECTED=$(echo "$ORCHESTRATORS_DETECTED" | sed 's/^[ \t]*//')
-}
-
-discover_docker_swarm() {
-    log_info "Discovering Docker Swarm..."
-
-    priv=$(check_privilege)
-    docker_cmd="docker"
-    [ "$priv" = "sudo" ] && docker_cmd="sudo docker"
-
-    # Swarm state
-    swarm_state=$(try_command "$docker_cmd info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null" || echo "inactive")
-
-    # Cluster ID - with multiple fallbacks
-    cluster_id=$(try_command "$docker_cmd info --format '{{.Swarm.Cluster.ID}}' 2>/dev/null")
-    if [ -z "$cluster_id" ]; then
-        # Fallback: try using socket API
-        cluster_id=$(try_privileged_command "curl -s --unix-socket /var/run/docker.sock http://localhost/info 2>/dev/null | grep -o '\"ClusterID\":\"[^\"]*\"' | cut -d'\"' -f4" "")
-    fi
-    if [ -z "$cluster_id" ]; then
-        # Fallback: try docker swarm info
-        cluster_id=$(try_command "$docker_cmd system info 2>/dev/null | grep 'Cluster ID' | awk '{print \$3}'" || echo "")
-    fi
-    # Filter out error messages that might have been captured
-    case "$cluster_id" in
-        *"error"*|*"Error"*|*"ERROR"*|*"failed"*|*"refused"*|*"debug"*)
-            cluster_id=""
-            ;;
-    esac
-    [ -z "$cluster_id" ] && cluster_id=""
-
-    # Cluster name - try to get from node labels or hostname
-    cluster_name=$(try_command "$docker_cmd info --format '{{.Name}}' 2>/dev/null")
-    if [ -z "$cluster_name" ]; then
-        # Fallback: use hostname as cluster identifier
-        cluster_name=$(hostname 2>/dev/null || echo "")
-    fi
-    [ -z "$cluster_name" ] && cluster_name=""
-
-    # Node role
-    is_manager=$(try_command "$docker_cmd info --format '{{.Swarm.ControlAvailable}}' 2>/dev/null")
-    if [ "$is_manager" = "true" ]; then
-        node_role="manager"
-    else
-        node_role="worker"
-    fi
-
-    # Current node
-    node_id=$(try_command "$docker_cmd info --format '{{.Swarm.NodeID}}' 2>/dev/null" || echo "")
-
-    # Get current node availability
-    node_availability="active"
-    if [ -n "$node_id" ] && [ "$node_role" = "manager" ]; then
-        node_availability=$(try_command "$docker_cmd node inspect $node_id --format '{{.Spec.Availability}}' 2>/dev/null" || echo "active")
-    fi
-
-    current_node_json=$(json_build_object \
-        "node_id" "$node_id" \
-        "role" "$node_role" \
-        "availability" "$node_availability")
-
-    # Node counts and arrays
-    total_count=0
-    master_count=0
-    worker_count=0
-    master_nodes_json="[]"
-    worker_nodes_json="[]"
-
-    if [ "$node_role" = "manager" ]; then
-        total_count=$(try_command "$docker_cmd node ls -q 2>/dev/null | wc -l" || echo "0")
-        master_count=$(try_command "$docker_cmd node ls --filter role=manager -q 2>/dev/null | wc -l" || echo "0")
-        worker_count=$((total_count - master_count))
-
-        # Build master nodes array
-        master_nodes_data=$(try_command "$docker_cmd node ls --filter role=manager --format '{{.Hostname}}|{{.ID}}|{{.Status}}' 2>/dev/null" || echo "")
-        if [ -n "$master_nodes_data" ]; then
-            master_nodes_list=""
-            while IFS='|' read -r hostname node_id status; do
-                [ -z "$hostname" ] && continue
-                # Convert status to lowercase using tr (POSIX-compliant)
-                status_lower=$(echo "$status" | tr '[:upper:]' '[:lower:]')
-                node_obj=$(json_build_object \
-                    "name" "$hostname" \
-                    "node_id" "$node_id" \
-                    "status" "$status_lower")
-                if [ -z "$master_nodes_list" ]; then
-                    master_nodes_list="$node_obj"
-                else
-                    master_nodes_list="$master_nodes_list,$node_obj"
-                fi
-            done << EOF
-$master_nodes_data
-EOF
-            [ -n "$master_nodes_list" ] && master_nodes_json="[$master_nodes_list]"
-        fi
-
-        # Build worker nodes array
-        worker_nodes_data=$(try_command "$docker_cmd node ls --filter role=worker --format '{{.Hostname}}|{{.ID}}|{{.Status}}' 2>/dev/null" || echo "")
-        if [ -n "$worker_nodes_data" ]; then
-            worker_nodes_list=""
-            while IFS='|' read -r hostname node_id status; do
-                [ -z "$hostname" ] && continue
-                # Convert status to lowercase using tr (POSIX-compliant)
-                status_lower=$(echo "$status" | tr '[:upper:]' '[:lower:]')
-                node_obj=$(json_build_object \
-                    "name" "$hostname" \
-                    "node_id" "$node_id" \
-                    "status" "$status_lower")
-                if [ -z "$worker_nodes_list" ]; then
-                    worker_nodes_list="$node_obj"
-                else
-                    worker_nodes_list="$worker_nodes_list,$node_obj"
-                fi
-            done << EOF
-$worker_nodes_data
-EOF
-            [ -n "$worker_nodes_list" ] && worker_nodes_json="[$worker_nodes_list]"
-        fi
-    fi
-
-    nodes_json=$(json_build_object \
-        "total_count" "$total_count" \
-        "master_count" "$master_count" \
-        "worker_count" "$worker_count" \
-        "master_nodes" "$master_nodes_json" \
-        "worker_nodes" "$worker_nodes_json")
-
-    # Service count
-    service_count=0
-    if [ "$node_role" = "manager" ]; then
-        service_count=$(try_command "$docker_cmd service ls -q 2>/dev/null | wc -l" || echo "0")
-    fi
-
-    # Container counts - get actual container counts on this node
-    total_container_count=0
-    system_container_count=0
-    user_container_count=0
-
-    # For managers, count running tasks cluster-wide to include services on other nodes
-    if [ "$node_role" = "manager" ]; then
-        running_tasks=$(try_command "$docker_cmd service ps --filter desired-state=running --format '{{.Name}}' 2>/dev/null" || echo "")
-        if [ -n "$running_tasks" ]; then
-            total_container_count=$(echo "$running_tasks" | wc -l | awk '{print $1}')
-            system_container_count=$(echo "$running_tasks" | grep -E 'ingress-sbox|_monitoring|_logging|portainer|swarm-agent' | wc -l | awk '{print $1}')
-            user_container_count=$((total_container_count - system_container_count))
-        fi
-    fi
-
-    # Fallback to local containers if no running tasks were found or on workers
-    if [ "$total_container_count" -eq "0" ]; then
-        total_container_count=$(try_command "$docker_cmd ps -q 2>/dev/null | wc -l" || echo "0")
-
-        # For Swarm, system containers are those with system-related service names
-        # Common patterns: monitoring, logging, overlay network, ingress, etc.
-        if [ "$total_container_count" -gt "0" ]; then
-            system_container_count=$(try_command "$docker_cmd ps --format '{{.Names}}' 2>/dev/null | grep -E 'ingress-sbox|_monitoring|_logging|portainer|swarm-agent' | wc -l" || echo "0")
-
-            # User containers = total - system
-            user_container_count=$((total_container_count - system_container_count))
-        fi
-    fi
-
-    # Ensure all values are set
-    [ -z "$total_container_count" ] && total_container_count=0
-    [ -z "$system_container_count" ] && system_container_count=0
-    [ -z "$user_container_count" ] && user_container_count=0
-
-    # Workloads
-    workloads_json=$(json_build_object \
-        "total_container_count" "$total_container_count" \
-        "system_container_count" "$system_container_count" \
-        "user_container_count" "$user_container_count" \
-        "pod_count" "0" \
-        "service_count" "$service_count" \
-        "deployment_count" "0" \
-        "daemonset_count" "0" \
-        "statefulset_count" "0" \
-        "namespace_count" "0" \
-        "namespaces" "[]")
-
-    # Cluster components
-    cluster_components_json=$(json_build_object \
-        "api_server" "$(json_build_object 'version' '' 'status' '')" \
-        "coredns" "$(json_build_object 'version' '' 'status' '')" \
-        "ingress_controller" "$(json_build_object 'type' '' 'version' '')" \
-        "cni_plugin" "$(json_build_object 'type' 'overlay' 'version' '')" \
-        "csi_drivers" "[]")
-
-    # Platform specific
-    raft_index=$(try_command "$docker_cmd info --format '{{.Swarm.Cluster.RaftIndex}}' 2>/dev/null" || echo "0")
-
-    swarm_specific=$(json_build_object \
-        "raft_index" "$raft_index" \
-        "task_history_limit" "5")
-
-    platform_specific_json=$(json_build_object \
-        "swarm" "$swarm_specific" \
-        "kubernetes" "null" \
-        "openshift" "null" \
-        "tanzu" "null")
-
-    # Get Docker version for Swarm
-    swarm_version=$(try_command "$docker_cmd version --format '{{.Server.Version}}' 2>/dev/null")
-    [ -z "$swarm_version" ] && swarm_version=""
-
-    # Resource usage - get from dockerd process
-    swarm_cpu=0
-    swarm_mem=0
-    dockerd_pid=$(get_pid "dockerd")
-    if [ -n "$dockerd_pid" ] && [ "$dockerd_pid" != "0" ]; then
-        cpu_mem=$(get_process_cpu_mem "$dockerd_pid")
-        swarm_cpu=$(echo "$cpu_mem" | awk '{print $1}')
-        swarm_mem=$(echo "$cpu_mem" | awk '{print $2}')
-    fi
-
-    # Format with 2 decimal places
-    swarm_cpu=$(printf "%.2f" "$swarm_cpu" 2>/dev/null || echo "0")
-    swarm_mem=$(printf "%.2f" "$swarm_mem" 2>/dev/null || echo "0")
-
-    resource_usage_json=$(json_build_object \
-        "cpu_cores" "$swarm_cpu" \
-        "memory_mb" "$swarm_mem")
-
-    # Build final JSON
-    SWARM_JSON=$(json_build_object \
-        "name" "docker_swarm" \
-        "orchestrator_type" "docker-swarm" \
-        "version" "$swarm_version" \
-        "cluster_id" "$cluster_id" \
-        "cluster_name" "$cluster_name" \
-        "state" "$swarm_state" \
-        "current_node" "$current_node_json" \
-        "nodes" "$nodes_json" \
-        "workloads" "$workloads_json" \
-        "cluster_components" "$cluster_components_json" \
-        "platform_specific" "$platform_specific_json" \
-        "resource_usage" "$resource_usage_json")
-
-    log_info "Docker Swarm discovery completed"
-}
-
-discover_kubernetes() {
-    log_info "Discovering Kubernetes..."
-
-    priv=$(check_privilege)
-
-    # Version - try multiple methods
-    version=""
-    if command_exists kubectl; then
-        version=$(try_command "kubectl version --short 2>/dev/null | grep Server | awk '{print \$3}'")
-    fi
-    if [ -z "$version" ] && command_exists kubelet; then
-        version=$(try_command "kubelet --version 2>/dev/null | awk '{print \$2}'")
-    fi
-    if [ -z "$version" ]; then
-        # Try from manifest files with sudo
-        if [ "$priv" = "root" ]; then
-            version=$(grep -h "image:.*kube-apiserver" /etc/kubernetes/manifests/*.yaml 2>/dev/null | grep -o "v[0-9]*\.[0-9]*\.[0-9]*" | head -n1)
-        elif [ "$priv" = "sudo" ]; then
-            version=$(try_command "sudo grep -h 'image:.*kube-apiserver' /etc/kubernetes/manifests/*.yaml 2>/dev/null | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*' | head -n1")
-        fi
-    fi
-    [ -z "$version" ] && version=""
-
-    # Cluster ID - with multiple fallbacks
-    cluster_id=""
-    if command_exists kubectl; then
-        cluster_id=$(try_command "kubectl get ns kube-system -o jsonpath='{.metadata.uid}' 2>/dev/null")
-    fi
-    if [ -z "$cluster_id" ]; then
-        # Fallback: try to get from kubeadm config with sudo
-        if [ "$priv" = "root" ]; then
-            cluster_id=$(cat /etc/kubernetes/admin.conf 2>/dev/null | grep "cluster:" | head -n1 | awk '{print $2}')
-        elif [ "$priv" = "sudo" ]; then
-            cluster_id=$(try_command "sudo cat /etc/kubernetes/admin.conf 2>/dev/null | grep 'cluster:' | head -n1 | awk '{print \$2}'")
-        fi
-    fi
-    if [ -z "$cluster_id" ]; then
-        # Fallback: try to get from kubelet config
-        cluster_id=$(cat /var/lib/kubelet/kubeadm-flags.env 2>/dev/null | grep -o 'cluster-name=[^ ]*' | cut -d= -f2)
-    fi
-    if [ -z "$cluster_id" ]; then
-        # Fallback: check for k3s
-        if [ -d /var/lib/rancher/k3s ]; then
-            cluster_id=$(cat /var/lib/rancher/k3s/server/cred/cluster-id 2>/dev/null)
-        fi
-    fi
-    # Filter out kubectl error messages that might have been captured
-    case "$cluster_id" in
-        *"To further debug"*|*"cluster-info dump"*|*"connection"*"refused"*)
-            cluster_id=""
-            ;;
-    esac
-    [ -z "$cluster_id" ] && cluster_id=""
-
-    # Cluster name - with multiple fallbacks
-    cluster_name=$(try_command "kubectl config current-context 2>/dev/null")
-    if [ -z "$cluster_name" ]; then
-        # Fallback: try to get from kubeconfig
-        cluster_name=$(try_command "kubectl config view --minify -o jsonpath='{.clusters[0].name}' 2>/dev/null" || echo "")
-    fi
-    if [ -z "$cluster_name" ]; then
-        # Fallback: try to get from kubelet config
-        cluster_name=$(try_command "cat /var/lib/kubelet/kubeadm-flags.env 2>/dev/null | grep -o 'cluster-name=[^ ]*' | cut -d= -f2" || echo "")
-    fi
-    if [ -z "$cluster_name" ]; then
-        # Fallback: check hostname or domain
-        cluster_name=$(try_command "hostname -d 2>/dev/null | cut -d. -f1" || echo "")
-    fi
-    [ -z "$cluster_name" ] && cluster_name=""
-
-    # State
-    state="active"
-
-    # Current node
-    node_name=$(hostname)
-    node_role="worker"
-    node_status="Unknown"
-
-    if command_exists kubectl; then
-        node_labels=$(try_command "kubectl get node $node_name -o jsonpath='{.metadata.labels}' 2>/dev/null")
-        if echo "$node_labels" | grep -q "node-role.kubernetes.io/control-plane"; then
-            node_role="control-plane"
-        elif echo "$node_labels" | grep -q "node-role.kubernetes.io/master"; then
-            node_role="control-plane"
-        fi
-
-        node_status=$(try_command "kubectl get node $node_name -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null" || echo "Unknown")
-        [ "$node_status" = "True" ] && node_status="Ready"
-    fi
-
-    current_node_json=$(json_build_object \
-        "node_id" "$node_name" \
-        "role" "$node_role" \
-        "availability" "$node_status")
-
-    # Node counts
-    total_count=$(try_command "kubectl get nodes --no-headers 2>/dev/null | wc -l" || echo "0")
-    master_count=$(try_command "kubectl get nodes -l node-role.kubernetes.io/control-plane --no-headers 2>/dev/null | wc -l" || echo "0")
-    [ "$master_count" = "0" ] && master_count=$(try_command "kubectl get nodes -l node-role.kubernetes.io/master --no-headers 2>/dev/null | wc -l" || echo "0")
-    worker_count=$((total_count - master_count))
-
-    # Get master nodes list
-    master_nodes=""
-    if command_exists kubectl && [ "$total_count" -gt "0" ]; then
-        master_nodes=$(try_command "kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].metadata.name}' 2>/dev/null" | tr ' ' '\n')
-        if [ -z "$master_nodes" ]; then
-            master_nodes=$(try_command "kubectl get nodes -l node-role.kubernetes.io/master -o jsonpath='{.items[*].metadata.name}' 2>/dev/null" | tr ' ' '\n')
-        fi
-    fi
-    master_nodes_json=$(json_build_array "$master_nodes" false)
-
-    # Get worker nodes list - nodes without master or control-plane role
-    worker_nodes=""
-    if command_exists kubectl && [ "$total_count" -gt "0" ]; then
-        # Try to get nodes that are not labeled as control-plane or master
-        worker_nodes=$(try_command "kubectl get nodes -o jsonpath='{range .items[?(!@.metadata.labels.node-role\.kubernetes\.io/control-plane)]}{.metadata.name}{\"\n\"}{end}' 2>/dev/null")
-        if [ -z "$worker_nodes" ]; then
-            # Fallback: try with master label
-            worker_nodes=$(try_command "kubectl get nodes -o jsonpath='{range .items[?(!@.metadata.labels.node-role\.kubernetes\.io/master)]}{.metadata.name}{\"\n\"}{end}' 2>/dev/null")
-        fi
-        # If still empty but we have worker_count > 0, manually filter
-        if [ -z "$worker_nodes" ] && [ "$worker_count" -gt "0" ]; then
-            all_nodes=$(try_command "kubectl get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null" | tr ' ' '\n')
-            if [ -n "$all_nodes" ] && [ -n "$master_nodes" ]; then
-                # Create a simple filter by checking each node
-                worker_nodes=""
-                for node in $all_nodes; do
-                    is_master=false
-                    for master in $master_nodes; do
-                        if [ "$node" = "$master" ]; then
-                            is_master=true
-                            break
-                        fi
-                    done
-                    if [ "$is_master" = "false" ]; then
-                        worker_nodes="${worker_nodes}${node}
-"
+    # Method 3: docker ps without --format (parse table output)
+    if [ -z "$_cont_list" ]; then
+        _raw_table=$(docker_try "docker ps table" "docker ps -a --no-trunc")
+        if [ -n "$_raw_table" ]; then
+            # Skip header line, extract CONTAINER_ID and NAMES (first and second-to-last columns vary)
+            # Use docker ps -a -q to get IDs and docker inspect to fill details
+            _raw_ids=$(echo "$_raw_table" | tail -n +2 | awk '{print $1}')
+            if [ -n "$_raw_ids" ]; then
+                log_info "Got container IDs from table output: $(echo "$_raw_ids" | wc -l)"
+                # Build pipe-delimited list from docker inspect per ID
+                _cont_list=""
+                for _rid in $_raw_ids; do
+                    _ri=$(docker_try "docker inspect $_rid" "docker inspect --format '{{.Id}}|{{.Name}}|{{.Config.Image}}|{{.State.Status}}|{{.Created}}' $_rid 2>/dev/null")
+                    if [ -n "$_ri" ]; then
+                        # docker inspect Name has leading /, strip it
+                        _ri=$(echo "$_ri" | sed 's/|\//|/')
+                        _cont_list="${_cont_list:+${_cont_list}
+}${_ri}"
                     fi
                 done
             fi
         fi
     fi
-    worker_nodes_json=$(json_build_array "$worker_nodes" false)
+    log_info "docker ps result (before API fallback): $(echo "$_cont_list" | grep -c . 2>/dev/null) entries"
 
-    nodes_json=$(json_build_object \
-        "total_count" "$total_count" \
-        "master_count" "$master_count" \
-        "worker_count" "$worker_count" \
-        "master_nodes" "$master_nodes_json" \
-        "worker_nodes" "$worker_nodes_json")
+    if [ -n "$_cont_list" ]; then
+        _containers_json="[$(echo "$_cont_list" | {
+            _cf=true
+            while IFS='|' read -r _cid _cname _cimage _cstate _ccreated; do
+                [ -z "$_cid" ] && continue
 
-    # Workload counts
-    pod_count=$(try_command "kubectl get pods --all-namespaces --no-headers 2>/dev/null | wc -l" || echo "0")
-    service_count=$(try_command "kubectl get services --all-namespaces --no-headers 2>/dev/null | wc -l" || echo "0")
-    deployment_count=$(try_command "kubectl get deployments --all-namespaces --no-headers 2>/dev/null | wc -l" || echo "0")
-    daemonset_count=$(try_command "kubectl get daemonsets --all-namespaces --no-headers 2>/dev/null | wc -l" || echo "0")
-    statefulset_count=$(try_command "kubectl get statefulsets --all-namespaces --no-headers 2>/dev/null | wc -l" || echo "0")
-    namespace_count=$(try_command "kubectl get namespaces --no-headers 2>/dev/null | wc -l" || echo "0")
+                _inspect=$(docker_try "docker inspect $_cid" "docker inspect $_cid 2>/dev/null")
+                _image_id="" _net_mode="" _restart_pol="" _orch_managed="false"
+                _orch_type="" _orch_svc="" _orch_task="" _orch_pod="" _orch_ns=""
 
-    namespaces=$(try_command "kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null" | tr ' ' '\n')
-    namespaces_json=$(json_build_array "$namespaces" false)
+                if [ -n "$_inspect" ] && $HAS_JQ; then
+                    _image_id=$(echo "$_inspect" | jq -r '.[0].Image // ""' 2>/dev/null)
+                    _net_mode=$(echo "$_inspect" | jq -r '.[0].HostConfig.NetworkMode // ""' 2>/dev/null)
+                    _restart_pol=$(echo "$_inspect" | jq -r '.[0].HostConfig.RestartPolicy.Name // ""' 2>/dev/null)
+                    _ccreated=$(echo "$_inspect" | jq -r '.[0].Created // ""' 2>/dev/null)
 
-    # Container counts - calculate from pods
-    total_container_count=0
-    system_container_count=0
-    user_container_count=0
+                    # --- Ports ---
+                    _cports_json=$(echo "$_inspect" | jq -c '[.[0].NetworkSettings.Ports // {} | to_entries[] | select(.value != null) | .value[] as $v | {
+                        host_ip: ($v.HostIp // "0.0.0.0"),
+                        host_port: (($v.HostPort // "0") | tonumber),
+                        container_port: ((.key | split("/")[0]) | tonumber),
+                        protocol: (.key | split("/")[1] // "tcp")
+                    }]' 2>/dev/null) || _cports_json="[]"
+                    # Fallback: if no published ports, list exposed ports without host binding
+                    if [ "$_cports_json" = "[]" ]; then
+                        _cports_json=$(echo "$_inspect" | jq -c '[.[0].NetworkSettings.Ports // {} | to_entries[] | {
+                            host_ip: "",
+                            host_port: 0,
+                            container_port: ((.key | split("/")[0]) | tonumber),
+                            protocol: (.key | split("/")[1] // "tcp")
+                        }]' 2>/dev/null) || _cports_json="[]"
+                    fi
 
-    if command_exists kubectl && [ "$pod_count" -gt "0" ]; then
-        # Count containers in all pods
-        total_container_count=$(try_command "kubectl get pods --all-namespaces -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l" || echo "0")
+                    # --- Resource limits ---
+                    # CPU: NanoCpus (--cpus) → millicores; or CpuQuota/CpuPeriod → millicores
+                    _ccpu_lim=0
+                    _nano=$(echo "$_inspect" | jq -r '.[0].HostConfig.NanoCpus // 0' 2>/dev/null) || _nano=0
+                    if [ "$_nano" -gt 0 ] 2>/dev/null; then
+                        _ccpu_lim=$((_nano / 1000000))
+                    else
+                        _cquota=$(echo "$_inspect" | jq -r '.[0].HostConfig.CpuQuota // 0' 2>/dev/null) || _cquota=0
+                        _cperiod=$(echo "$_inspect" | jq -r '.[0].HostConfig.CpuPeriod // 0' 2>/dev/null) || _cperiod=0
+                        if [ "$_cquota" -gt 0 ] 2>/dev/null && [ "$_cperiod" -gt 0 ] 2>/dev/null; then
+                            _ccpu_lim=$((_cquota * 1000 / _cperiod))
+                        fi
+                    fi
+                    # Memory limit (bytes → MB)
+                    _cmem_lim=0
+                    _mem_bytes=$(echo "$_inspect" | jq -r '.[0].HostConfig.Memory // 0' 2>/dev/null) || _mem_bytes=0
+                    if [ "$_mem_bytes" -gt 0 ] 2>/dev/null; then
+                        _cmem_lim=$((_mem_bytes / 1048576))
+                    fi
+                    # Memory reservation → request_mb
+                    _cmem_req=0
+                    _mem_res=$(echo "$_inspect" | jq -r '.[0].HostConfig.MemoryReservation // 0' 2>/dev/null) || _mem_res=0
+                    if [ "$_mem_res" -gt 0 ] 2>/dev/null; then
+                        _cmem_req=$((_mem_res / 1048576))
+                    fi
 
-        # Count system containers (in kube-system, kube-public, kube-node-lease namespaces)
-        system_container_count=$(try_command "kubectl get pods -n kube-system -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l" || echo "0")
-        kube_public_count=$(try_command "kubectl get pods -n kube-public -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l" || echo "0")
-        kube_node_lease_count=$(try_command "kubectl get pods -n kube-node-lease -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l" || echo "0")
-        system_container_count=$((system_container_count + kube_public_count + kube_node_lease_count))
-
-        # User containers = total - system
-        user_container_count=$((total_container_count - system_container_count))
-    fi
-
-    workloads_json=$(json_build_object \
-        "total_container_count" "$total_container_count" \
-        "system_container_count" "$system_container_count" \
-        "user_container_count" "$user_container_count" \
-        "pod_count" "$pod_count" \
-        "service_count" "$service_count" \
-        "deployment_count" "$deployment_count" \
-        "daemonset_count" "$daemonset_count" \
-        "statefulset_count" "$statefulset_count" \
-        "namespace_count" "$namespace_count" \
-        "namespaces" "$namespaces_json")
-
-    # Detect distribution
-    distribution="kubeadm"
-    if [ -d /var/lib/rancher/k3s ]; then
-        distribution="k3s"
-    elif [ -d /var/lib/rancher/rke2 ]; then
-        distribution="rke2"
-    elif command_exists microk8s; then
-        distribution="microk8s"
-    elif [ -f /kind-version ]; then
-        distribution="kind"
-    fi
-
-    # CNI detection with version
-    cni_plugin="unknown"
-    cni_version=""
-    if command_exists kubectl; then
-        if try_command "kubectl get pods -n kube-system 2>/dev/null | grep -q calico"; then
-            cni_plugin="calico"
-            cni_version=$(try_command "kubectl get pods -n kube-system -l k8s-app=calico-node -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
-        elif try_command "kubectl get pods -n kube-system 2>/dev/null | grep -q flannel"; then
-            cni_plugin="flannel"
-            cni_version=$(try_command "kubectl get pods -n kube-system -l app=flannel -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
-        elif try_command "kubectl get pods -n kube-system 2>/dev/null | grep -q cilium"; then
-            cni_plugin="cilium"
-            cni_version=$(try_command "kubectl get pods -n kube-system -l k8s-app=cilium -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
-        elif try_command "kubectl get pods -n kube-system 2>/dev/null | grep -q weave"; then
-            cni_plugin="weave"
-            cni_version=$(try_command "kubectl get pods -n kube-system -l name=weave-net -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null | grep -o '[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
-        elif [ -d /etc/cni/net.d ]; then
-            cni_conf=$(ls /etc/cni/net.d/*.conf 2>/dev/null | head -n1)
-            if [ -n "$cni_conf" ]; then
-                cni_plugin=$(basename "$cni_conf" .conf)
-            fi
-        fi
-    fi
-
-    # Cluster components
-    api_server_json=$(json_build_object "version" "$version" "status" "Healthy")
-
-    # CoreDNS detection with version
-    coredns_version=""
-    coredns_status="Unknown"
-    if command_exists kubectl; then
-        coredns_version=$(try_command "kubectl get deployment coredns -n kube-system -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
-        if [ -z "$coredns_version" ]; then
-            # Try as DaemonSet (some distributions)
-            coredns_version=$(try_command "kubectl get daemonset coredns -n kube-system -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
-        fi
-        if [ -z "$coredns_version" ]; then
-            # Try kube-dns (older clusters)
-            coredns_version=$(try_command "kubectl get deployment kube-dns -n kube-system -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | grep -o '[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
-        fi
-        # Get status
-        coredns_pods=$(try_command "kubectl get pods -n kube-system -l k8s-app=kube-dns --no-headers 2>/dev/null | grep -c Running" || echo "0")
-        if [ "$coredns_pods" -gt "0" ]; then
-            coredns_status="Running"
-        else
-            coredns_pods=$(try_command "kubectl get pods -n kube-system -l k8s-app=coredns --no-headers 2>/dev/null | grep -c Running" || echo "0")
-            if [ "$coredns_pods" -gt "0" ]; then
-                coredns_status="Running"
-            fi
-        fi
-    fi
-    coredns_json=$(json_build_object "version" "$coredns_version" "status" "$coredns_status")
-
-    # Ingress controller detection
-    ingress_type="none"
-    ingress_version=""
-    if command_exists kubectl; then
-        # Check for nginx ingress
-        if try_command "kubectl get pods --all-namespaces 2>/dev/null | grep -q nginx-ingress"; then
-            ingress_type="nginx"
-            ingress_version=$(try_command "kubectl get deployment -n ingress-nginx ingress-nginx-controller -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
-            if [ -z "$ingress_version" ]; then
-                ingress_version=$(try_command "kubectl get deployment -n kube-system nginx-ingress-controller -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | grep -o '[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
-            fi
-        # Check for traefik
-        elif try_command "kubectl get pods --all-namespaces 2>/dev/null | grep -q traefik"; then
-            ingress_type="traefik"
-            ingress_version=$(try_command "kubectl get deployment -n kube-system traefik -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | grep -o 'v[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
-        # Check for haproxy
-        elif try_command "kubectl get pods --all-namespaces 2>/dev/null | grep -q haproxy-ingress"; then
-            ingress_type="haproxy"
-            ingress_version=$(try_command "kubectl get deployment --all-namespaces -l app=haproxy-ingress -o jsonpath='{.items[0].spec.template.spec.containers[0].image}' 2>/dev/null | grep -o '[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
-        # Check for istio
-        elif try_command "kubectl get pods --all-namespaces 2>/dev/null | grep -q istio-ingressgateway"; then
-            ingress_type="istio"
-            ingress_version=$(try_command "kubectl get deployment -n istio-system istio-ingressgateway -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | grep -o '[0-9]*\.[0-9]*\.[0-9]*'" || echo "")
-        fi
-    fi
-    ingress_json=$(json_build_object "type" "$ingress_type" "version" "$ingress_version")
-
-    cni_json=$(json_build_object "type" "$cni_plugin" "version" "$cni_version")
-
-    # CSI drivers detection
-    csi_drivers=""
-    if command_exists kubectl; then
-        csi_drivers=$(try_command "kubectl get csidrivers -o jsonpath='{.items[*].metadata.name}' 2>/dev/null" | tr ' ' '\n')
-    fi
-    csi_drivers_json=$(json_build_array "$csi_drivers" false)
-
-    cluster_components_json=$(json_build_object \
-        "api_server" "$api_server_json" \
-        "coredns" "$coredns_json" \
-        "ingress_controller" "$ingress_json" \
-        "cni_plugin" "$cni_json" \
-        "csi_drivers" "$csi_drivers_json")
-
-    # Platform specific
-    api_endpoint=$(try_command "kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null" || echo "")
-
-    # Detect cluster CIDR - try multiple sources with sudo
-    cluster_cidr=""
-    # Method 1: From kube-controller-manager pod
-    if [ -z "$cluster_cidr" ] && command_exists kubectl; then
-        cluster_cidr=$(try_command "kubectl get pods -n kube-system -l component=kube-controller-manager -o jsonpath='{.items[0].spec.containers[0].command}' 2>/dev/null | grep -o 'cluster-cidr=[^ ]*' | cut -d= -f2")
-    fi
-    # Method 2: From kube-proxy configmap
-    if [ -z "$cluster_cidr" ] && command_exists kubectl; then
-        cluster_cidr=$(try_command "kubectl get configmap kube-proxy -n kube-system -o jsonpath='{.data.config\.conf}' 2>/dev/null | grep -o 'clusterCIDR: .*' | awk '{print \$2}'")
-    fi
-    # Method 3: From kubeadm config with sudo
-    if [ -z "$cluster_cidr" ]; then
-        if [ "$priv" = "root" ]; then
-            cluster_cidr=$(grep -r 'podSubnet' /etc/kubernetes/manifests/ 2>/dev/null | grep -o 'podSubnet: .*' | awk '{print $2}' | head -n1)
-        elif [ "$priv" = "sudo" ]; then
-            cluster_cidr=$(try_command "sudo grep -r 'podSubnet' /etc/kubernetes/manifests/ 2>/dev/null | grep -o 'podSubnet: .*' | awk '{print \$2}' | head -n1")
-        fi
-    fi
-    # Method 4: From kube-controller-manager manifest with sudo
-    if [ -z "$cluster_cidr" ]; then
-        if [ "$priv" = "root" ]; then
-            cluster_cidr=$(grep -o 'cluster-cidr=[^ ]*' /etc/kubernetes/manifests/kube-controller-manager.yaml 2>/dev/null | cut -d= -f2)
-        elif [ "$priv" = "sudo" ]; then
-            cluster_cidr=$(try_command "sudo grep -o 'cluster-cidr=[^ ]*' /etc/kubernetes/manifests/kube-controller-manager.yaml 2>/dev/null | cut -d= -f2")
-        fi
-    fi
-    # Method 5: For k3s
-    if [ -z "$cluster_cidr" ] && [ -d /var/lib/rancher/k3s ]; then
-        if [ "$priv" = "root" ]; then
-            cluster_cidr=$(grep -o 'cluster-cidr=[^ ]*' /etc/systemd/system/k3s.service 2>/dev/null | cut -d= -f2)
-        elif [ "$priv" = "sudo" ]; then
-            cluster_cidr=$(try_command "sudo grep -o 'cluster-cidr=[^ ]*' /etc/systemd/system/k3s.service 2>/dev/null | cut -d= -f2")
-        fi
-    fi
-
-    # Detect service CIDR - try multiple sources with sudo
-    service_cidr=""
-    # Method 1: From kube-apiserver pod
-    if [ -z "$service_cidr" ] && command_exists kubectl; then
-        service_cidr=$(try_command "kubectl get pods -n kube-system -l component=kube-apiserver -o jsonpath='{.items[0].spec.containers[0].command}' 2>/dev/null | grep -o 'service-cluster-ip-range=[^ ]*' | cut -d= -f2")
-    fi
-    # Method 2: From kube-apiserver manifest with sudo
-    if [ -z "$service_cidr" ]; then
-        if [ "$priv" = "root" ]; then
-            service_cidr=$(grep -o 'service-cluster-ip-range=[^ ]*' /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null | cut -d= -f2)
-        elif [ "$priv" = "sudo" ]; then
-            service_cidr=$(try_command "sudo grep -o 'service-cluster-ip-range=[^ ]*' /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null | cut -d= -f2")
-        fi
-    fi
-    # Method 3: From kubeadm config with sudo
-    if [ -z "$service_cidr" ]; then
-        if [ "$priv" = "root" ]; then
-            service_cidr=$(grep -r 'serviceSubnet' /etc/kubernetes/ 2>/dev/null | grep -o 'serviceSubnet: .*' | awk '{print $2}' | head -n1)
-        elif [ "$priv" = "sudo" ]; then
-            service_cidr=$(try_command "sudo grep -r 'serviceSubnet' /etc/kubernetes/ 2>/dev/null | grep -o 'serviceSubnet: .*' | awk '{print \$2}' | head -n1")
-        fi
-    fi
-    # Method 4: For k3s
-    if [ -z "$service_cidr" ] && [ -d /var/lib/rancher/k3s ]; then
-        if [ "$priv" = "root" ]; then
-            service_cidr=$(grep -o 'service-cidr=[^ ]*' /etc/systemd/system/k3s.service 2>/dev/null | cut -d= -f2)
-        elif [ "$priv" = "sudo" ]; then
-            service_cidr=$(try_command "sudo grep -o 'service-cidr=[^ ]*' /etc/systemd/system/k3s.service 2>/dev/null | cut -d= -f2")
-        fi
-    fi
-
-    # Detect kubeconfig path dynamically
-    kubeconfig_path=""
-    # Method 1: From environment variable
-    if [ -n "$KUBECONFIG" ]; then
-        kubeconfig_path="$KUBECONFIG"
-    # Method 2: Standard locations
-    elif [ -f "/etc/kubernetes/admin.conf" ]; then
-        kubeconfig_path="/etc/kubernetes/admin.conf"
-    elif [ -f "$HOME/.kube/config" ]; then
-        kubeconfig_path="$HOME/.kube/config"
-    elif [ -f "/var/lib/rancher/k3s/server/cred/admin.kubeconfig" ]; then
-        kubeconfig_path="/var/lib/rancher/k3s/server/cred/admin.kubeconfig"
-    elif [ -f "/var/lib/rancher/rke2/server/cred/admin.kubeconfig" ]; then
-        kubeconfig_path="/var/lib/rancher/rke2/server/cred/admin.kubeconfig"
-    else
-        kubeconfig_path=""
-    fi
-
-    k8s_specific=$(json_build_object \
-        "distribution" "$distribution" \
-        "api_server_endpoint" "$api_endpoint" \
-        "cluster_cidr" "$cluster_cidr" \
-        "service_cidr" "$service_cidr" \
-        "kubeconfig_path" "$kubeconfig_path")
-
-    platform_specific_json=$(json_build_object \
-        "swarm" "null" \
-        "kubernetes" "$k8s_specific" \
-        "openshift" "null" \
-        "tanzu" "null")
-
-    # Resource usage - calculate from running components
-    k8s_cpu_total=0
-    k8s_mem_total=0
-
-    # Try to get resource usage from kubelet and kube-proxy
-    if command_exists pgrep; then
-        for proc_name in kubelet kube-proxy kube-apiserver kube-controller kube-scheduler etcd; do
-            pid=$(get_pid "$proc_name")
-            if [ -n "$pid" ] && [ "$pid" != "0" ]; then
-                cpu_mem=$(get_process_cpu_mem "$pid")
-                proc_cpu=$(echo "$cpu_mem" | awk '{print $1}')
-                proc_mem=$(echo "$cpu_mem" | awk '{print $2}')
-
-                # Add to totals (handle decimal addition)
-                if [ -n "$proc_cpu" ] && [ "$proc_cpu" != "0.0" ]; then
-                    k8s_cpu_total=$(echo "$k8s_cpu_total + $proc_cpu" | bc 2>/dev/null || echo "$k8s_cpu_total")
+                    _swarm_svc=$(echo "$_inspect" | jq -r '.[0].Config.Labels["com.docker.swarm.service.name"] // ""' 2>/dev/null)
+                    _k8s_pod=$(echo "$_inspect" | jq -r '.[0].Config.Labels["io.kubernetes.pod.name"] // ""' 2>/dev/null)
+                    _k8s_ns=$(echo "$_inspect" | jq -r '.[0].Config.Labels["io.kubernetes.pod.namespace"] // ""' 2>/dev/null)
+                    _ocp=$(echo "$_inspect" | jq -r '.[0].Config.Labels | keys[] | select(startswith("io.openshift"))' 2>/dev/null | head -1)
+                    if [ -n "$_swarm_svc" ]; then
+                        _orch_managed="true"; _orch_type="docker-swarm"; _orch_svc="$_swarm_svc"
+                        _orch_task=$(echo "$_inspect" | jq -r '.[0].Config.Labels["com.docker.swarm.task.id"] // ""' 2>/dev/null)
+                    elif [ -n "$_ocp" ]; then
+                        _orch_managed="true"; _orch_type="openshift"; _orch_pod="$_k8s_pod"; _orch_ns="$_k8s_ns"
+                    elif [ -n "$_k8s_pod" ]; then
+                        _orch_managed="true"; _orch_type="kubernetes"; _orch_pod="$_k8s_pod"; _orch_ns="$_k8s_ns"
+                    fi
                 fi
-                if [ -n "$proc_mem" ] && [ "$proc_mem" != "0.0" ]; then
-                    k8s_mem_total=$(echo "$k8s_mem_total + $proc_mem" | bc 2>/dev/null || echo "$k8s_mem_total")
-                fi
-            fi
-        done
-    fi
 
-    # Format with 2 decimal places
-    k8s_cpu_total=$(printf "%.2f" "$k8s_cpu_total" 2>/dev/null || echo "0")
-    k8s_mem_total=$(printf "%.2f" "$k8s_mem_total" 2>/dev/null || echo "0")
+                case "$_cstate" in
+                    (running|Running) _cstate="running" ;;
+                    (paused|Paused) _cstate="paused" ;;
+                    (exited|Exited) _cstate="exited" ;;
+                    (created|Created) _cstate="created" ;;
+                    (dead|Dead) _cstate="dead" ;;
+                    (*) _cstate="unknown" ;;
+                esac
 
-    resource_usage_json=$(json_build_object \
-        "cpu_cores" "$k8s_cpu_total" \
-        "memory_mb" "$k8s_mem_total")
+                [ -z "$_cports_json" ] && _cports_json="[]"
+                [ -z "$_ccpu_lim" ] && _ccpu_lim=0
+                [ -z "$_cmem_lim" ] && _cmem_lim=0
+                [ -z "$_cmem_req" ] && _cmem_req=0
 
-    # Build final JSON
-    K8S_JSON=$(json_build_object \
-        "name" "kubernetes" \
-        "orchestrator_type" "kubernetes" \
-        "version" "$version" \
-        "cluster_id" "$cluster_id" \
-        "cluster_name" "$cluster_name" \
-        "state" "$state" \
-        "current_node" "$current_node_json" \
-        "nodes" "$nodes_json" \
-        "workloads" "$workloads_json" \
-        "cluster_components" "$cluster_components_json" \
-        "platform_specific" "$platform_specific_json" \
-        "resource_usage" "$resource_usage_json")
-
-    log_info "Kubernetes discovery completed: $pod_count pods, $total_count nodes"
-}
-
-discover_openshift() {
-    log_info "Discovering OpenShift..."
-
-    # Version
-    ocp_version=$(try_command "oc get clusterversion -o jsonpath='{.items[0].status.desired.version}' 2>/dev/null")
-    [ -z "$ocp_version" ] && ocp_version=$(try_command "kubectl get clusterversion -o jsonpath='{.items[0].status.desired.version}' 2>/dev/null")
-    [ -z "$ocp_version" ] && ocp_version=""
-
-    # Cluster ID - with multiple fallbacks
-    cluster_id=$(try_command "oc get clusterversion -o jsonpath='{.items[0].spec.clusterID}' 2>/dev/null")
-    if [ -z "$cluster_id" ]; then
-        # Fallback: try to get from namespace
-        cluster_id=$(try_command "kubectl get ns openshift-apiserver -o jsonpath='{.metadata.uid}' 2>/dev/null" || echo "")
-    fi
-    # Filter out error messages that might have been captured
-    case "$cluster_id" in
-        *"error"*|*"Error"*|*"ERROR"*|*"failed"*|*"refused"*|*"debug"*|*"To further debug"*|*"cluster-info dump"*|*"connection"*"refused"*)
-            cluster_id=""
-            ;;
-    esac
-    [ -z "$cluster_id" ] && cluster_id=""
-
-    # Cluster name - with multiple fallbacks
-    cluster_name=$(try_command "oc get infrastructure cluster -o jsonpath='{.status.infrastructureName}' 2>/dev/null")
-    if [ -z "$cluster_name" ]; then
-        # Fallback: try current context
-        cluster_name=$(try_command "oc config current-context 2>/dev/null" || echo "")
-    fi
-    if [ -z "$cluster_name" ]; then
-        # Fallback: use hostname
-        cluster_name=$(hostname 2>/dev/null || echo "")
-    fi
-    [ -z "$cluster_name" ] && cluster_name=""
-
-    # Current node information using kubectl
-    node_name=$(hostname)
-    node_role="worker"
-    node_status="Unknown"
-
-    if command_exists kubectl || command_exists oc; then
-        cmd="kubectl"
-        command_exists oc && cmd="oc"
-
-        # Get current node details
-        node_info=$($cmd get node "$node_name" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/master}{"|"}{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
-        if [ -n "$node_info" ]; then
-            IFS='|' read -r role_label ready_status <<EOF
-$node_info
-EOF
-            [ -n "$role_label" ] && node_role="master"
-            [ "$ready_status" = "True" ] && node_status="Ready" || node_status="NotReady"
-        fi
-
-        # Check for control-plane label as well
-        control_plane=$($cmd get node "$node_name" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/control-plane}' 2>/dev/null || echo "")
-        [ -n "$control_plane" ] && node_role="master"
-    fi
-
-    current_node_json=$(json_build_object \
-        "node_id" "$node_name" \
-        "role" "$node_role" \
-        "availability" "$node_status")
-
-    # Node counts using kubectl
-    total_count=0
-    master_count=0
-    worker_count=0
-    master_nodes_json="[]"
-    worker_nodes_json="[]"
-
-    if command_exists kubectl || command_exists oc; then
-        cmd="kubectl"
-        command_exists oc && cmd="oc"
-
-        total_count=$($cmd get nodes --no-headers 2>/dev/null | wc -l || echo "0")
-        master_count=$($cmd get nodes -l node-role.kubernetes.io/master --no-headers 2>/dev/null | wc -l || echo "0")
-        [ "$master_count" = "0" ] && master_count=$($cmd get nodes -l node-role.kubernetes.io/control-plane --no-headers 2>/dev/null | wc -l || echo "0")
-        worker_count=$((total_count - master_count))
-
-        # Get master nodes list
-        master_nodes=$($cmd get nodes -l node-role.kubernetes.io/master -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
-        [ -z "$master_nodes" ] && master_nodes=$($cmd get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
-        master_nodes_json=$(json_build_array "$master_nodes" false)
-
-        # Get worker nodes list
-        worker_nodes=$($cmd get nodes -o jsonpath='{range .items[?(!@.metadata.labels.node-role\.kubernetes\.io/master)]}{.metadata.name}{\"\n\"}{end}' 2>/dev/null)
-        [ -z "$worker_nodes" ] && worker_nodes=$($cmd get nodes -o jsonpath='{range .items[?(!@.metadata.labels.node-role\.kubernetes\.io/control-plane)]}{.metadata.name}{\"\n\"}{end}' 2>/dev/null)
-        worker_nodes_json=$(json_build_array "$worker_nodes" false)
-    fi
-
-    nodes_json=$(json_build_object \
-        "total_count" "$total_count" \
-        "master_count" "$master_count" \
-        "worker_count" "$worker_count" \
-        "master_nodes" "$master_nodes_json" \
-        "worker_nodes" "$worker_nodes_json")
-
-    # Workloads using kubectl
-    pod_count=0
-    service_count=0
-    deployment_count=0
-    daemonset_count=0
-    statefulset_count=0
-    namespace_count=0
-    namespaces_json="[]"
-    total_container_count=0
-    system_container_count=0
-    user_container_count=0
-
-    if command_exists kubectl || command_exists oc; then
-        cmd="kubectl"
-        command_exists oc && cmd="oc"
-
-        pod_count=$($cmd get pods --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
-        service_count=$($cmd get services --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
-        deployment_count=$($cmd get deployments --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
-        daemonset_count=$($cmd get daemonsets --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
-        statefulset_count=$($cmd get statefulsets --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
-        namespace_count=$($cmd get namespaces --no-headers 2>/dev/null | wc -l || echo "0")
-
-        namespaces=$($cmd get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
-        namespaces_json=$(json_build_array "$namespaces" false)
-
-        # Container counts
-        if [ "$pod_count" -gt "0" ]; then
-            total_container_count=$($cmd get pods --all-namespaces -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l || echo "0")
-
-            # OpenShift system namespaces
-            for ns in openshift-apiserver openshift-authentication openshift-console openshift-dns openshift-etcd openshift-ingress openshift-monitoring openshift-operators kube-system kube-public kube-node-lease; do
-                ns_count=$($cmd get pods -n $ns -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l || echo "0")
-                system_container_count=$((system_container_count + ns_count))
+                if ! $_cf; then printf ','; fi
+                _cf=false
+                printf '{
+                "container_id":"%s","name":"%s","image":"%s","image_id":"%s","state":"%s","created_at":"%s",
+                "ports":%s,"resource_usage":{"cpu":{"usage_cores":0.0,"request_millicores":0,"limit_millicores":%s},"memory":{"usage_mb":0.0,"request_mb":%s,"limit_mb":%s}},
+                "network_mode":"%s","restart_policy":"%s","orchestrator_managed":%s,
+                "orchestrator_ref":{"type":"%s","service_name":"%s","task_id":"%s","pod_name":"%s","namespace":"%s"}
+                }' \
+                "$(safe_json_string "$_cid")" "$(safe_json_string "$_cname")" "$(safe_json_string "$_cimage")" \
+                "$(safe_json_string "$_image_id")" "$_cstate" "$(safe_json_string "$_ccreated")" \
+                "$_cports_json" "$_ccpu_lim" "$_cmem_req" "$_cmem_lim" \
+                "$(safe_json_string "$_net_mode")" "$(safe_json_string "$_restart_pol")" "$_orch_managed" \
+                "$(safe_json_string "$_orch_type")" "$(safe_json_string "$_orch_svc")" "$(safe_json_string "$_orch_task")" \
+                "$(safe_json_string "$_orch_pod")" "$(safe_json_string "$_orch_ns")"
             done
+        })]"
+    fi
 
-            user_container_count=$((total_container_count - system_container_count))
+    # Fallback: Docker API via socket + jq for containers
+    if [ "$_containers_json" = "[]" ] && $HAS_JQ; then
+        _api_c=$(docker_try "Docker API containers" "curl -s --unix-socket /var/run/docker.sock 'http://localhost/containers/json?all=true'")
+        if [ -n "$_api_c" ] && [ "$_api_c" != "null" ] && [ "$_api_c" != "[]" ]; then
+            _containers_json=$(echo "$_api_c" | jq -c '[.[]? | {
+                container_id: .Id,
+                name: ((.Names[0] // "") | ltrimstr("/")),
+                image: (.Image // ""),
+                image_id: (.ImageID // ""),
+                state: ((.State // "unknown") | ascii_downcase),
+                created_at: ((.Created // 0) | todate),
+                ports: [],
+                resource_usage: {cpu: {usage_cores: 0.0, request_millicores: 0, limit_millicores: 0}, memory: {usage_mb: 0.0, request_mb: 0, limit_mb: 0}},
+                network_mode: (((.NetworkSettings.Networks // {}) | keys | first) // ""),
+                restart_policy: "",
+                orchestrator_managed: ((((.Labels["com.docker.swarm.service.name"] // "") | length) > 0) or (((.Labels["io.kubernetes.pod.name"] // "") | length) > 0)),
+                orchestrator_ref: {
+                    type: (if ((.Labels["com.docker.swarm.service.name"] // "") | length) > 0 then "docker-swarm" elif ((.Labels["io.kubernetes.pod.name"] // "") | length) > 0 then (if (.Labels | keys[] | select(startswith("io.openshift"))) then "openshift" else "kubernetes" end) else "" end),
+                    service_name: (.Labels["com.docker.swarm.service.name"] // ""),
+                    task_id: (.Labels["com.docker.swarm.task.id"] // ""),
+                    pod_name: (.Labels["io.kubernetes.pod.name"] // ""),
+                    namespace: (.Labels["io.kubernetes.pod.namespace"] // "")
+                }
+            }]' 2>/dev/null) || _containers_json="[]"
+            [ -z "$_containers_json" ] && _containers_json="[]"
+            log_info "Docker API container fallback returned $(echo "$_containers_json" | jq length 2>/dev/null || echo 0) containers"
         fi
     fi
 
-    workloads_json=$(json_build_object \
-        "total_container_count" "$total_container_count" \
-        "system_container_count" "$system_container_count" \
-        "user_container_count" "$user_container_count" \
-        "pod_count" "$pod_count" \
-        "service_count" "$service_count" \
-        "deployment_count" "$deployment_count" \
-        "daemonset_count" "$daemonset_count" \
-        "statefulset_count" "$statefulset_count" \
-        "namespace_count" "$namespace_count" \
-        "namespaces" "$namespaces_json")
-
-    # Cluster components (similar to Kubernetes)
-    api_server_version=""
-    api_server_status="Unknown"
-    coredns_version=""
-    coredns_status="Unknown"
-    ingress_type="haproxy"
-    ingress_version=""
-    cni_type="ovn-kubernetes"
-    cni_version=""
-
-    if command_exists kubectl || command_exists oc; then
-        cmd="kubectl"
-        command_exists oc && cmd="oc"
-
-        # API server version from pods
-        api_server_version=$($cmd get pod -n openshift-apiserver -l app=openshift-apiserver -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+' || echo "")
-        [ -n "$api_server_version" ] && api_server_status="Running"
-
-        # CoreDNS status
-        coredns_pods=$($cmd get pods -n openshift-dns --no-headers 2>/dev/null | wc -l || echo "0")
-        [ "$coredns_pods" -gt "0" ] && coredns_status="Running"
-
-        # Detect CNI type
-        cni_pods=$($cmd get pods -n openshift-sdn 2>/dev/null | grep -c sdn || echo "0")
-        [ "$cni_pods" -gt "0" ] && cni_type="openshift-sdn"
-        cni_pods=$($cmd get pods -n openshift-ovn-kubernetes 2>/dev/null | grep -c ovn || echo "0")
-        [ "$cni_pods" -gt "0" ] && cni_type="ovn-kubernetes"
+    # Discover images
+    _images_json="[]"
+    # Method 1: docker images with --format
+    _img_list=$(docker_try "docker images" "docker images --no-trunc --format '{{.ID}}|{{.Repository}}|{{.Tag}}|{{.Size}}|{{.CreatedAt}}'")
+    # Method 2: docker image ls (alternate)
+    if [ -z "$_img_list" ]; then
+        _img_list=$(docker_try "docker image ls" "docker image ls --no-trunc --format '{{.ID}}|{{.Repository}}|{{.Tag}}|{{.Size}}|{{.CreatedAt}}'")
     fi
-
-    cluster_components_json=$(json_build_object \
-        "api_server" "$(json_build_object 'version' \"$api_server_version\" 'status' \"$api_server_status\")" \
-        "coredns" "$(json_build_object 'version' \"$coredns_version\" 'status' \"$coredns_status\")" \
-        "ingress_controller" "$(json_build_object 'type' \"$ingress_type\" 'version' \"$ingress_version\")" \
-        "cni_plugin" "$(json_build_object 'type' \"$cni_type\" 'version' \"$cni_version\")" \
-        "csi_drivers" "[]")
-
-    # OpenShift-specific platform data
-    ocp_channel=$(try_command "oc get clusterversion -o jsonpath='{.items[0].spec.channel}' 2>/dev/null" || echo "")
-    infra_id=$(try_command "oc get infrastructure cluster -o jsonpath='{.status.infrastructureName}' 2>/dev/null" || echo "")
-    install_type=""  # Could be detected from config
-    project_count=0
-    route_count=0
-    build_config_count=0
-    operator_count=0
-
-    if command_exists oc; then
-        project_count=$(oc get projects --no-headers 2>/dev/null | wc -l || echo "0")
-        route_count=$(oc get routes --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
-        build_config_count=$(oc get buildconfig --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
-        operator_count=$(oc get csv --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
-    fi
-
-    openshift_specific=$(json_build_object \
-        "ocp_version" "$ocp_version" \
-        "channel" "$ocp_channel" \
-        "cluster_id" "$cluster_id" \
-        "infra_id" "$infra_id" \
-        "install_type" "$install_type" \
-        "project_count" "$project_count" \
-        "route_count" "$route_count" \
-        "build_config_count" "$build_config_count" \
-        "operator_count" "$operator_count" \
-        "operator_hub_enabled" "false" \
-        "scc_count" "0" \
-        "cluster_operators_degraded" "0" \
-        "cluster_operators_available" "0")
-
-    platform_specific_json=$(json_build_object \
-        "swarm" "null" \
-        "kubernetes" "null" \
-        "openshift" "$openshift_specific" \
-        "tanzu" "null")
-
-    # Resource usage - get from OpenShift control plane processes
-    ocp_cpu_total=0
-    ocp_mem_total=0
-
-    if command_exists pgrep; then
-        for proc_name in openshift-apiserver openshift-controller hyperkube oc; do
-            pid=$(get_pid "$proc_name")
-            if [ -n "$pid" ] && [ "$pid" != "0" ]; then
-                cpu_mem=$(get_process_cpu_mem "$pid")
-                proc_cpu=$(echo "$cpu_mem" | awk '{print $1}')
-                proc_mem=$(echo "$cpu_mem" | awk '{print $2}')
-
-                if [ -n "$proc_cpu" ] && [ "$proc_cpu" != "0.0" ]; then
-                    ocp_cpu_total=$(echo "$ocp_cpu_total + $proc_cpu" | bc 2>/dev/null || echo "$ocp_cpu_total")
-                fi
-                if [ -n "$proc_mem" ] && [ "$proc_mem" != "0.0" ]; then
-                    ocp_mem_total=$(echo "$ocp_mem_total + $proc_mem" | bc 2>/dev/null || echo "$ocp_mem_total")
-                fi
-            fi
-        done
-    fi
-
-    # Format with 2 decimal places
-    ocp_cpu_total=$(printf "%.2f" "$ocp_cpu_total" 2>/dev/null || echo "0")
-    ocp_mem_total=$(printf "%.2f" "$ocp_mem_total" 2>/dev/null || echo "0")
-
-    resource_usage_json=$(json_build_object \
-        "cpu_cores" "$ocp_cpu_total" \
-        "memory_mb" "$ocp_mem_total")
-
-    OPENSHIFT_JSON=$(json_build_object \
-        "name" "openshift" \
-        "orchestrator_type" "openshift" \
-        "version" "$ocp_version" \
-        "cluster_id" "$cluster_id" \
-        "cluster_name" "$cluster_name" \
-        "state" "active" \
-        "current_node" "$current_node_json" \
-        "nodes" "$nodes_json" \
-        "workloads" "$workloads_json" \
-        "cluster_components" "$cluster_components_json" \
-        "platform_specific" "$platform_specific_json" \
-        "resource_usage" "$resource_usage_json")
-
-    log_info "OpenShift discovery completed"
-}
-
-discover_tanzu() {
-    log_info "Discovering Tanzu..."
-
-    # Version
-    tkg_version=$(try_command "tanzu version 2>/dev/null | grep version | awk '{print \$2}'")
-    [ -z "$tkg_version" ] && tkg_version=""
-
-    # Cluster ID - with multiple fallbacks
-    cluster_id=$(try_command "kubectl get cluster -o jsonpath='{.items[0].metadata.uid}' 2>/dev/null")
-    if [ -z "$cluster_id" ]; then
-        # Fallback: try to get from namespace
-        cluster_id=$(try_command "kubectl get ns tkg-system -o jsonpath='{.metadata.uid}' 2>/dev/null" || echo "")
-    fi
-    # Filter out error messages that might have been captured
-    case "$cluster_id" in
-        *"error"*|*"Error"*|*"ERROR"*|*"failed"*|*"refused"*|*"debug"*|*"To further debug"*|*"cluster-info dump"*|*"connection"*"refused"*)
-            cluster_id=""
-            ;;
-    esac
-    [ -z "$cluster_id" ] && cluster_id=""
-
-    # Cluster name - with multiple fallbacks
-    cluster_name=$(try_command "kubectl get cluster -o jsonpath='{.items[0].metadata.name}' 2>/dev/null")
-    if [ -z "$cluster_name" ]; then
-        # Fallback: try current context
-        cluster_name=$(try_command "kubectl config current-context 2>/dev/null" || echo "")
-    fi
-    if [ -z "$cluster_name" ]; then
-        # Fallback: check for tanzu config
-        cluster_name=$(try_command "tanzu cluster list -o json 2>/dev/null | grep -o '\"name\":\"[^\"]*\"' | head -n1 | cut -d'\"' -f4" || echo "")
-    fi
-    [ -z "$cluster_name" ] && cluster_name=""
-
-    # Current node information using kubectl
-    node_name=$(hostname)
-    node_role="worker"
-    node_status="Unknown"
-
-    if command_exists kubectl; then
-        # Get current node details
-        node_info=$(kubectl get node "$node_name" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/master}{"|"}{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
-        if [ -n "$node_info" ]; then
-            IFS='|' read -r role_label ready_status <<EOF
-$node_info
-EOF
-            [ -n "$role_label" ] && node_role="control-plane"
-            [ "$ready_status" = "True" ] && node_status="Ready" || node_status="NotReady"
-        fi
-
-        # Check for control-plane label as well
-        control_plane=$(kubectl get node "$node_name" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/control-plane}' 2>/dev/null || echo "")
-        [ -n "$control_plane" ] && node_role="control-plane"
-    fi
-
-    current_node_json=$(json_build_object \
-        "node_id" "$node_name" \
-        "role" "$node_role" \
-        "availability" "$node_status")
-
-    # Node counts using kubectl
-    total_count=0
-    master_count=0
-    worker_count=0
-    master_nodes_json="[]"
-    worker_nodes_json="[]"
-
-    if command_exists kubectl; then
-        total_count=$(kubectl get nodes --no-headers 2>/dev/null | wc -l || echo "0")
-        master_count=$(kubectl get nodes -l node-role.kubernetes.io/master --no-headers 2>/dev/null | wc -l || echo "0")
-        [ "$master_count" = "0" ] && master_count=$(kubectl get nodes -l node-role.kubernetes.io/control-plane --no-headers 2>/dev/null | wc -l || echo "0")
-        worker_count=$((total_count - master_count))
-
-        # Get master nodes list
-        master_nodes=$(kubectl get nodes -l node-role.kubernetes.io/master -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
-        [ -z "$master_nodes" ] && master_nodes=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
-        master_nodes_json=$(json_build_array "$master_nodes" false)
-
-        # Get worker nodes list
-        worker_nodes=$(kubectl get nodes -o jsonpath='{range .items[?(!@.metadata.labels.node-role\.kubernetes\.io/master)]}{.metadata.name}{\"\n\"}{end}' 2>/dev/null)
-        [ -z "$worker_nodes" ] && worker_nodes=$(kubectl get nodes -o jsonpath='{range .items[?(!@.metadata.labels.node-role\.kubernetes\.io/control-plane)]}{.metadata.name}{\"\n\"}{end}' 2>/dev/null)
-        worker_nodes_json=$(json_build_array "$worker_nodes" false)
-    fi
-
-    nodes_json=$(json_build_object \
-        "total_count" "$total_count" \
-        "master_count" "$master_count" \
-        "worker_count" "$worker_count" \
-        "master_nodes" "$master_nodes_json" \
-        "worker_nodes" "$worker_nodes_json")
-
-    # Workloads using kubectl
-    pod_count=0
-    service_count=0
-    deployment_count=0
-    daemonset_count=0
-    statefulset_count=0
-    namespace_count=0
-    namespaces_json="[]"
-    total_container_count=0
-    system_container_count=0
-    user_container_count=0
-
-    if command_exists kubectl; then
-        pod_count=$(kubectl get pods --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
-        service_count=$(kubectl get services --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
-        deployment_count=$(kubectl get deployments --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
-        daemonset_count=$(kubectl get daemonsets --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
-        statefulset_count=$(kubectl get statefulsets --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
-        namespace_count=$(kubectl get namespaces --no-headers 2>/dev/null | wc -l || echo "0")
-
-        namespaces=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
-        namespaces_json=$(json_build_array "$namespaces" false)
-
-        # Container counts
-        if [ "$pod_count" -gt "0" ]; then
-            total_container_count=$(kubectl get pods --all-namespaces -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l || echo "0")
-
-            # Tanzu system namespaces
-            for ns in tkg-system tanzu-system tanzu-system-ingress kube-system kube-public kube-node-lease vmware-system-tmc; do
-                ns_count=$(kubectl get pods -n $ns -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.name}{\"\n\"}{end}{end}' 2>/dev/null | wc -l || echo "0")
-                system_container_count=$((system_container_count + ns_count))
+    log_info "docker images result: $(echo "$_img_list" | grep -c . 2>/dev/null) entries"
+    if [ -n "$_img_list" ]; then
+        _images_json="[$(echo "$_img_list" | {
+            _if=true
+            while IFS='|' read -r _iid _irepo _itag _isize _icreated; do
+                [ -z "$_iid" ] && continue
+                # Convert size to MB
+                _size_mb=0
+                case "$_isize" in
+                    (*GB*) _size_mb=$(echo "$_isize" | sed 's/[^0-9.]//g' | awk '{printf "%.1f", $1 * 1024}') ;;
+                    (*MB*) _size_mb=$(echo "$_isize" | sed 's/[^0-9.]//g' | awk '{printf "%.1f", $1}') ;;
+                    (*KB*|*kB*) _size_mb=$(echo "$_isize" | sed 's/[^0-9.]//g' | awk '{printf "%.1f", $1 / 1024}') ;;
+                    (*) _size_mb=$(echo "$_isize" | sed 's/[^0-9.]//g' | awk '{printf "%.1f", $1}') ;;
+                esac
+                [ -z "$_size_mb" ] && _size_mb="0.0"
+                if ! $_if; then printf ','; fi
+                _if=false
+                printf '{"image_id":"%s","repository":"%s","tag":"%s","size_mb":%s,"created_at":"%s"}' \
+                    "$(safe_json_string "$_iid")" "$(safe_json_string "$_irepo")" "$(safe_json_string "$_itag")" \
+                    "$_size_mb" "$(safe_json_string "$_icreated")"
             done
+        })]"
+    fi
 
-            user_container_count=$((total_container_count - system_container_count))
+    # Fallback: Docker API via socket + jq for images
+    if [ "$_images_json" = "[]" ] && $HAS_JQ; then
+        _api_i=$(docker_try "Docker API images" "curl -s --unix-socket /var/run/docker.sock 'http://localhost/images/json'")
+        if [ -n "$_api_i" ] && [ "$_api_i" != "null" ] && [ "$_api_i" != "[]" ]; then
+            _images_json=$(echo "$_api_i" | jq -c '[.[]? | {
+                image_id: .Id,
+                repository: (((.RepoTags[0] // ":") | split(":") | .[0]) // "<none>"),
+                tag: (((.RepoTags[0] // ":") | split(":") | .[1]) // "<none>"),
+                size_mb: (((.Size // 0) / 1048576) | . * 10 | floor / 10),
+                created_at: ((.Created // 0) | todate)
+            }]' 2>/dev/null) || _images_json="[]"
+            [ -z "$_images_json" ] && _images_json="[]"
+            log_info "Docker API image fallback returned $(echo "$_images_json" | jq length 2>/dev/null || echo 0) images"
         fi
     fi
 
-    workloads_json=$(json_build_object \
-        "total_container_count" "$total_container_count" \
-        "system_container_count" "$system_container_count" \
-        "user_container_count" "$user_container_count" \
-        "pod_count" "$pod_count" \
-        "service_count" "$service_count" \
-        "deployment_count" "$deployment_count" \
-        "daemonset_count" "$daemonset_count" \
-        "statefulset_count" "$statefulset_count" \
-        "namespace_count" "$namespace_count" \
-        "namespaces" "$namespaces_json")
-
-    # Cluster components (similar to Kubernetes)
-    api_server_version=""
-    api_server_status="Unknown"
-    coredns_version=""
-    coredns_status="Unknown"
-    ingress_type="contour"
-    ingress_version=""
-    cni_type="antrea"
-    cni_version=""
-
-    if command_exists kubectl; then
-        # API server version from pods
-        api_server_version=$(kubectl get pod -n kube-system -l component=kube-apiserver -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+' || echo "")
-        [ -n "$api_server_version" ] && api_server_status="Running"
-
-        # CoreDNS detection
-        coredns_version=$(kubectl get deployment -n kube-system coredns -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | grep -oP ':\K[0-9.]+' || echo "")
-        coredns_pods=$(kubectl get pods -n kube-system -l k8s-app=kube-dns --no-headers 2>/dev/null | wc -l || echo "0")
-        [ "$coredns_pods" -gt "0" ] && coredns_status="Running"
-
-        # Detect ingress controller type
-        if kubectl get namespace tanzu-system-ingress >/dev/null 2>&1; then
-            contour_pods=$(kubectl get pods -n tanzu-system-ingress -l app=contour 2>/dev/null | grep -c contour || echo "0")
-            [ "$contour_pods" -gt "0" ] && ingress_type="contour"
+    # Reconcile counts with actual discovered items
+    if $HAS_JQ; then
+        _actual_cc=$(echo "$_containers_json" | jq 'length' 2>/dev/null) || _actual_cc=""
+        _actual_cc=$(num_or_default "$_actual_cc" 0)
+        if [ "$_actual_cc" -gt "$_container_count" ] 2>/dev/null; then
+            _container_count="$_actual_cc"
         fi
-
-        # Detect CNI type
-        antrea_pods=$(kubectl get pods -n kube-system -l app=antrea 2>/dev/null | grep -c antrea || echo "0")
-        [ "$antrea_pods" -gt "0" ] && cni_type="antrea"
-        calico_pods=$(kubectl get pods -n kube-system -l k8s-app=calico-node 2>/dev/null | grep -c calico || echo "0")
-        [ "$calico_pods" -gt "0" ] && cni_type="calico"
+        _actual_ic=$(echo "$_images_json" | jq 'length' 2>/dev/null) || _actual_ic=""
+        _actual_ic=$(num_or_default "$_actual_ic" 0)
+        if [ "$_actual_ic" -gt "$_image_count" ] 2>/dev/null; then
+            _image_count="$_actual_ic"
+        fi
     fi
+    log_info "Docker final: container_count=$_container_count image_count=$_image_count containers=$(echo "$_containers_json" | wc -c)B images=$(echo "$_images_json" | wc -c)B"
 
-    cluster_components_json=$(json_build_object \
-        "api_server" "$(json_build_object 'version' \"$api_server_version\" 'status' \"$api_server_status\")" \
-        "coredns" "$(json_build_object 'version' \"$coredns_version\" 'status' \"$coredns_status\")" \
-        "ingress_controller" "$(json_build_object 'type' \"$ingress_type\" 'version' \"$ingress_version\")" \
-        "cni_plugin" "$(json_build_object 'type' \"$cni_type\" 'version' \"$cni_version\")" \
-        "csi_drivers" "[]")
-
-    # Tanzu-specific platform data
-    tkr_version=$(try_command "kubectl get tkr -o jsonpath='{.items[0].metadata.name}' 2>/dev/null" || echo "")
-    cluster_class=""
-    management_cluster=""
-    supervisor_cluster=""
-    vsphere_namespace=""
-    workload_cluster_count=0
-    infrastructure_provider="vsphere"
-    ceip_enabled="false"
-    pinniped_enabled="false"
-
-    if command_exists tanzu; then
-        workload_cluster_count=$(tanzu cluster list -o json 2>/dev/null | grep -c '"name"' || echo "0")
-        management_cluster=$(tanzu management-cluster get 2>/dev/null | grep 'NAME' | awk '{print $2}' || echo "")
-    fi
-
-    tanzu_specific=$(json_build_object \
-        "tkg_version" "$tkg_version" \
-        "tkr_version" "$tkr_version" \
-        "cluster_class" "$cluster_class" \
-        "management_cluster" "$management_cluster" \
-        "supervisor_cluster" "$supervisor_cluster" \
-        "vsphere_namespace" "$vsphere_namespace" \
-        "workload_cluster_count" "$workload_cluster_count" \
-        "infrastructure_provider" "$infrastructure_provider" \
-        "ceip_enabled" "$ceip_enabled" \
-        "pinniped_enabled" "$pinniped_enabled")
-
-    platform_specific_json=$(json_build_object \
-        "swarm" "null" \
-        "kubernetes" "null" \
-        "openshift" "null" \
-        "tanzu" "$tanzu_specific")
-
-    # Resource usage - get from Tanzu control plane processes
-    tanzu_cpu_total=0
-    tanzu_mem_total=0
-
-    if command_exists pgrep; then
-        for proc_name in tanzu kapp-controller; do
-            pid=$(get_pid "$proc_name")
-            if [ -n "$pid" ] && [ "$pid" != "0" ]; then
-                cpu_mem=$(get_process_cpu_mem "$pid")
-                proc_cpu=$(echo "$cpu_mem" | awk '{print $1}')
-                proc_mem=$(echo "$cpu_mem" | awk '{print $2}')
-
-                if [ -n "$proc_cpu" ] && [ "$proc_cpu" != "0.0" ]; then
-                    tanzu_cpu_total=$(echo "$tanzu_cpu_total + $proc_cpu" | bc 2>/dev/null || echo "$tanzu_cpu_total")
-                fi
-                if [ -n "$proc_mem" ] && [ "$proc_mem" != "0.0" ]; then
-                    tanzu_mem_total=$(echo "$tanzu_mem_total + $proc_mem" | bc 2>/dev/null || echo "$tanzu_mem_total")
-                fi
-            fi
-        done
-    fi
-
-    # Format with 2 decimal places
-    tanzu_cpu_total=$(printf "%.2f" "$tanzu_cpu_total" 2>/dev/null || echo "0")
-    tanzu_mem_total=$(printf "%.2f" "$tanzu_mem_total" 2>/dev/null || echo "0")
-
-    resource_usage_json=$(json_build_object \
-        "cpu_cores" "$tanzu_cpu_total" \
-        "memory_mb" "$tanzu_mem_total")
-
-    TANZU_JSON=$(json_build_object \
-        "name" "tanzu" \
-        "orchestrator_type" "tanzu" \
-        "version" "$tkg_version" \
-        "cluster_id" "$cluster_id" \
-        "cluster_name" "$cluster_name" \
-        "state" "active" \
-        "current_node" "$current_node_json" \
-        "nodes" "$nodes_json" \
-        "workloads" "$workloads_json" \
-        "cluster_components" "$cluster_components_json" \
-        "platform_specific" "$platform_specific_json" \
-        "resource_usage" "$resource_usage_json")
-
-    log_info "Tanzu discovery completed"
+    DOCKER_RUNTIME_JSON="{
+          \"name\": \"docker\",
+          \"runtime_type\": \"docker\",
+          \"version\": \"${_version}\",
+          \"socket\": \"$(safe_json_string "$_socket")\",
+          \"storage_driver\": \"${_storage_driver}\",
+          \"storage_root\": \"${_storage_root}\",
+          \"rootless\": ${_rootless},
+          \"cgroup_driver\": \"${_cgroup_driver}\",
+          \"image_count\": ${_image_count},
+          \"container_count\": ${_container_count},
+          \"client_version\": \"${_client_version}\",
+          \"server_version\": \"${_server_version}\",
+          \"resource_usage\": {
+            \"cpu_cores\": ${_docker_cpu},
+            \"memory_mb\": ${_docker_mem}
+          },
+          \"containers\": ${_containers_json},
+          \"images\": ${_images_json}
+        }"
+    log_info "Docker discovery complete"
 }
 
-#==============================================================================
-# Services Discovery
-#==============================================================================
+# ========================
+# 2.3b containerd discovery
+# ========================
+CONTAINERD_DETECTED=false
+CONTAINERD_RUNTIME_JSON=""
+EXTRA_CONTAINERD_RUNTIMES_JSON=""
 
-discover_services() {
-    log_info "Discovering services..."
+# Helper: discover containers and images for a given containerd socket.
+# Sets these variables in caller scope (via eval): _ctrd_cc, _ctrd_ic, _ctrd_cjson, _ctrd_ijson
+_enumerate_containerd_socket() {
+    _ecs_socket="$1"
+    _ecs_ctr_bin="$2"  # path to ctr binary (e.g. ctr, /snap/microk8s/.../bin/ctr)
+    _ctrd_cc=0
+    _ctrd_ic=0
+    _ctrd_cjson="[]"
+    _ctrd_ijson="[]"
 
-    services_json="["
-    first=true
+    log_info "Enumerating containerd socket: $_ecs_socket (ctr=$_ecs_ctr_bin)"
 
-    for service_name in containerd docker crio podman kubelet; do
-        active="inactive"
-        enabled="disabled"
-        service_exists=false
+    # Enumerate namespaces
+    _ecs_ns=$(try_sudo_command_str "ctr namespaces ($_ecs_socket)" \
+        "$_ecs_ctr_bin --address '$_ecs_socket' namespaces list -q 2>/dev/null") || _ecs_ns=""
+    if [ -z "$_ecs_ns" ]; then
+        _ecs_ns="k8s.io default"
+    fi
+    log_info "containerd [$_ecs_socket] namespaces: $_ecs_ns"
 
-        if command_exists systemctl; then
-            # Check if service exists first
-            if systemctl list-unit-files "$service_name.service" 2>/dev/null | grep -q "$service_name.service"; then
-                service_exists=true
+    # Container count
+    for _ns in $_ecs_ns; do
+        _nc=$(try_sudo_command_str "ctr $_ns containers ($_ecs_socket)" \
+            "$_ecs_ctr_bin --address '$_ecs_socket' -n '$_ns' containers list -q 2>/dev/null | wc -l | tr -d ' '") || _nc="0"
+        _nc=$(num_or_default "$_nc" 0)
+        _ctrd_cc=$((_ctrd_cc + _nc))
+        log_info "containerd [$_ecs_socket] namespace '$_ns': $_nc containers"
+    done
+
+    # Image count
+    for _ns in $_ecs_ns; do
+        _ni=$(try_sudo_command_str "ctr $_ns images ($_ecs_socket)" \
+            "$_ecs_ctr_bin --address '$_ecs_socket' -n '$_ns' images list -q 2>/dev/null | wc -l | tr -d ' '") || _ni="0"
+        _ni=$(num_or_default "$_ni" 0)
+        _ctrd_ic=$((_ctrd_ic + _ni))
+        log_info "containerd [$_ecs_socket] namespace '$_ns': $_ni images"
+    done
+    log_info "containerd [$_ecs_socket] totals: containers=$_ctrd_cc images=$_ctrd_ic"
+
+    # Containers detail via ctr per namespace
+    if [ "$_ctrd_cc" -gt 0 ] 2>/dev/null; then
+        _ctr_all_json=""
+        for _ns in $_ecs_ns; do
+            _ns_list=$(try_sudo_command_str "ctr $_ns containers list ($_ecs_socket)" \
+                "$_ecs_ctr_bin --address '$_ecs_socket' -n '$_ns' containers list 2>/dev/null | tail -n +2") || _ns_list=""
+            if [ -n "$_ns_list" ]; then
+                _tasks_out=$(try_sudo_command_str "ctr $_ns tasks ($_ecs_socket)" \
+                    "$_ecs_ctr_bin --address '$_ecs_socket' -n '$_ns' tasks list 2>/dev/null") || _tasks_out=""
+                _ns_entries=$(echo "$_ns_list" | while IFS= read -r _ctr_line; do
+                    _ctr_id=$(echo "$_ctr_line" | awk '{print $1}')
+                    _ctr_img=$(echo "$_ctr_line" | awk '{print $2}')
+                    [ -z "$_ctr_id" ] && continue
+                    _ctr_state="unknown"
+                    _task_match=$(echo "$_tasks_out" | grep "$_ctr_id" 2>/dev/null)
+                    case "$_task_match" in
+                        (*RUNNING*) _ctr_state="running" ;;
+                        (*STOPPED*) _ctr_state="exited" ;;
+                        (*PAUSED*) _ctr_state="paused" ;;
+                    esac
+                    # Detect k8s orchestrator managed
+                    _is_k8s=false
+                    [ "$_ns" = "k8s.io" ] && _is_k8s=true
+                    _orch_type=""
+                    [ "$_is_k8s" = "true" ] && _orch_type="kubernetes"
+                    printf '{"container_id":"%s","name":"%s","image":"%s","image_id":"","state":"%s","created_at":"","ports":[],"resource_usage":{"cpu":{"usage_cores":0.0,"request_millicores":0,"limit_millicores":0},"memory":{"usage_mb":0.0,"request_mb":0,"limit_mb":0}},"network_mode":"","restart_policy":"","orchestrator_managed":%s,"orchestrator_ref":{"type":"%s","service_name":"","task_id":"","pod_name":"","namespace":""}}\n' \
+                        "$(safe_json_string "$_ctr_id")" "$(safe_json_string "$_ctr_id")" "$(safe_json_string "$_ctr_img")" "$_ctr_state" "$_is_k8s" "$_orch_type"
+                done)
+                _oldIFS="$IFS"
+                IFS='
+'
+                for _e in $_ns_entries; do
+                    [ -z "$_e" ] && continue
+                    _ctr_all_json="${_ctr_all_json:+${_ctr_all_json},}${_e}"
+                done
+                IFS="$_oldIFS"
             fi
+        done
+        [ -n "$_ctr_all_json" ] && _ctrd_cjson="[${_ctr_all_json}]"
+    fi
 
-            active_check=$(systemctl is-active "$service_name" 2>/dev/null)
-            [ -n "$active_check" ] && active="$active_check"
-
-            enabled_check=$(systemctl is-enabled "$service_name" 2>/dev/null)
-            [ -n "$enabled_check" ] && enabled="$enabled_check"
-        else
-            # SysV init fallback
-            if service "$service_name" status >/dev/null 2>&1; then
-                service_exists=true
-                active="active"
+    # Images detail via ctr per namespace
+    if [ "$_ctrd_ic" -gt 0 ] 2>/dev/null; then
+        _ctr_all_imgs=""
+        for _ns in $_ecs_ns; do
+            _ns_imgs=$(try_sudo_command_str "ctr $_ns images list ($_ecs_socket)" \
+                "$_ecs_ctr_bin --address '$_ecs_socket' -n '$_ns' images list 2>/dev/null | tail -n +2") || _ns_imgs=""
+            if [ -n "$_ns_imgs" ]; then
+                _ns_img_entries=$(echo "$_ns_imgs" | while IFS= read -r _img_line; do
+                    _img_ref=$(echo "$_img_line" | awk '{print $1}')
+                    _img_size=$(echo "$_img_line" | awk '{print $NF}')
+                    [ -z "$_img_ref" ] && continue
+                    _img_repo=$(echo "$_img_ref" | sed 's/:.*$//')
+                    _img_tag=$(echo "$_img_ref" | grep ':' | sed 's/^[^:]*://' | sed 's/@.*//')
+                    [ -z "$_img_tag" ] && _img_tag="latest"
+                    _img_smb="0.0"
+                    case "$_img_size" in
+                        (*[0-9]) _img_smb=$(echo "$_img_size" | awk '{printf "%.1f", $1 / 1048576}') ;;
+                        (*MiB*|*MB*) _img_smb=$(echo "$_img_size" | sed 's/[^0-9.]//g') ;;
+                        (*GiB*|*GB*) _img_smb=$(echo "$_img_size" | sed 's/[^0-9.]//g' | awk '{printf "%.1f", $1 * 1024}') ;;
+                        (*KiB*|*KB*) _img_smb=$(echo "$_img_size" | sed 's/[^0-9.]//g' | awk '{printf "%.1f", $1 / 1024}') ;;
+                    esac
+                    printf '{"image_id":"%s","repository":"%s","tag":"%s","size_mb":%s,"created_at":""}\n' \
+                        "$(safe_json_string "$_img_ref")" "$(safe_json_string "$_img_repo")" "$(safe_json_string "$_img_tag")" "$_img_smb"
+                done)
+                _oldIFS="$IFS"
+                IFS='
+'
+                for _e in $_ns_img_entries; do
+                    [ -z "$_e" ] && continue
+                    _ctr_all_imgs="${_ctr_all_imgs:+${_ctr_all_imgs},}${_e}"
+                done
+                IFS="$_oldIFS"
             fi
-            enabled="unknown"
-        fi
+        done
+        [ -n "$_ctr_all_imgs" ] && _ctrd_ijson="[${_ctr_all_imgs}]"
+    fi
+}
 
-        # Skip services that are both inactive and not-found/disabled
-        # Only include services that are either:
-        # 1. Active (running)
-        # 2. Enabled (will start on boot)
-        # 3. Have a process running (not a systemd service but exists as a process)
-        if [ "$active" = "inactive" ] && [ "$enabled" = "not-found" ]; then
-            # Check if process is actually running (might not be a service)
-            if ! pgrep -x "$service_name" >/dev/null 2>&1; then
-                continue
-            fi
-        fi
+# Discover additional containerd instances (MicroK8s, k3s, etc.)
+discover_extra_containerd() {
+    log_info "=== Discovering additional containerd instances ==="
 
-        # Also skip services that don't exist and are inactive
-        if [ "$service_exists" = false ] && [ "$active" = "inactive" ] && [ "$enabled" = "disabled" ]; then
+    # Find all containerd processes and extract their socket addresses
+    _ctrd_procs=$(ps -eo args 2>/dev/null | grep '[c]ontainerd' | grep -v 'shim' | grep -v grep) || _ctrd_procs=""
+    log_info "containerd processes found: $(echo "$_ctrd_procs" | wc -l)"
+
+    # Known system sockets to skip (already handled by discover_containerd)
+    _sys_socks="/run/containerd/containerd.sock /var/run/containerd/containerd.sock"
+
+    echo "$_ctrd_procs" | while IFS= read -r _proc_line; do
+        [ -z "$_proc_line" ] && continue
+
+        # Extract --address flag from the process
+        _extra_sock=$(echo "$_proc_line" | grep -o '\-\-address [^ ]*' | awk '{print $2}')
+        [ -z "$_extra_sock" ] && continue
+
+        # Skip system containerd sockets
+        _is_sys=false
+        for _ss in $_sys_socks; do
+            [ "$_extra_sock" = "$_ss" ] && _is_sys=true
+        done
+        $_is_sys && continue
+
+        # Check socket accessibility
+        if [ ! -S "$_extra_sock" ] && ! ($HAS_SUDO && sudo test -S "$_extra_sock" 2>/dev/null); then
+            log_info "Extra containerd socket not accessible: $_extra_sock"
             continue
         fi
 
-        # Get listening ports for the service
-        listening_ports=$(get_listening_ports "$service_name")
+        log_info "Found additional containerd socket: $_extra_sock"
 
-        service_json=$(json_build_object \
-            "name" "$service_name" \
-            "active" "$active" \
-            "enabled" "$enabled" \
-            "listening_ports" "$listening_ports")
-
-        if [ "$first" = false ]; then
-            services_json="$services_json,"
-        fi
-        services_json="$services_json$service_json"
-        first=false
-    done
-
-    services_json="$services_json]"
-
-    SERVICES_JSON="$services_json"
-
-    log_info "Services discovery completed"
-}
-
-#==============================================================================
-# JSON Assembly and Output
-#==============================================================================
-
-build_final_json() {
-    log_info "Building final JSON output..."
-
-    # Combine runtime JSONs
-    runtimes_array="["
-    first=true
-
-    for runtime in $RUNTIMES_DETECTED; do
-        if [ "$first" = false ]; then
-            runtimes_array="$runtimes_array,"
+        # Determine the ctr binary to use (try the one from the same installation)
+        _extra_ctr="ctr"
+        _proc_bin=$(echo "$_proc_line" | awk '{print $1}')
+        _proc_dir=$(dirname "$_proc_bin" 2>/dev/null)
+        if [ -x "${_proc_dir}/ctr" ]; then
+            _extra_ctr="${_proc_dir}/ctr"
         fi
 
-        case "$runtime" in
-            containerd) runtimes_array="$runtimes_array$CONTAINERD_JSON" ;;
-            docker) runtimes_array="$runtimes_array$DOCKER_JSON" ;;
-            crio) runtimes_array="$runtimes_array$CRIO_JSON" ;;
-            podman) runtimes_array="$runtimes_array$PODMAN_JSON" ;;
+        # Determine the runtime name from the socket path
+        _extra_name="containerd"
+        case "$_extra_sock" in
+            (*microk8s*) _extra_name="containerd (microk8s)" ;;
+            (*k3s*) _extra_name="containerd (k3s)" ;;
+            (*rke2*) _extra_name="containerd (rke2)" ;;
         esac
 
-        first=false
-    done
+        # Get version from the process binary
+        _extra_version=$(try_command_str "extra containerd version" "$_proc_bin --version 2>/dev/null | awk '{print \$3}'") || _extra_version=""
+        _extra_version=$(safe_json_string "$_extra_version")
 
-    runtimes_array="$runtimes_array]"
+        # Get storage root from process args (--root flag) or config
+        _extra_root=$(echo "$_proc_line" | grep -o '\-\-root [^ ]*' | awk '{print $2}')
+        [ -z "$_extra_root" ] && _extra_root="/var/lib/containerd"
 
-    # Combine orchestrator JSONs
-    orchestrators_array="["
-    first=true
-
-    for orch in $ORCHESTRATORS_DETECTED; do
-        if [ "$first" = false ]; then
-            orchestrators_array="$orchestrators_array,"
+        # Get config file and extract storage driver
+        _extra_config=$(echo "$_proc_line" | grep -o '\-\-config [^ ]*' | awk '{print $2}')
+        _extra_sd="overlayfs"
+        if [ -n "$_extra_config" ] && [ -f "$_extra_config" ]; then
+            _esd=$(grep -i 'snapshotter' "$_extra_config" 2>/dev/null | grep -v '#' | head -1 | sed 's/.*= *"//;s/"//')
+            [ -n "$_esd" ] && _extra_sd="$_esd"
         fi
 
-        case "$orch" in
-            docker-swarm) orchestrators_array="$orchestrators_array$SWARM_JSON" ;;
-            kubernetes) orchestrators_array="$orchestrators_array$K8S_JSON" ;;
-            openshift) orchestrators_array="$orchestrators_array$OPENSHIFT_JSON" ;;
-            tanzu) orchestrators_array="$orchestrators_array$TANZU_JSON" ;;
-        esac
+        # Enumerate containers and images
+        _enumerate_containerd_socket "$_extra_sock" "$_extra_ctr"
 
-        first=false
+        # Resource usage (estimate from the specific process)
+        _extra_pid=$(echo "$_proc_line" | awk '{print $1}')
+        # Use ps to get CPU/MEM for the binary path
+        _extra_res=$(get_process_resource_usage "$(basename "$_proc_bin")")
+        _extra_cpu=$(echo "$_extra_res" | awk '{print $1}')
+        _extra_mem=$(echo "$_extra_res" | awk '{print $2}')
+
+        _extra_json="{
+          \"name\": \"$(safe_json_string "$_extra_name")\",
+          \"runtime_type\": \"containerd\",
+          \"version\": \"${_extra_version}\",
+          \"socket\": \"$(safe_json_string "$_extra_sock")\",
+          \"storage_driver\": \"$(safe_json_string "$_extra_sd")\",
+          \"storage_root\": \"$(safe_json_string "$_extra_root")\",
+          \"rootless\": false,
+          \"cgroup_driver\": \"systemd\",
+          \"image_count\": ${_ctrd_ic},
+          \"container_count\": ${_ctrd_cc},
+          \"client_version\": \"${_extra_version}\",
+          \"server_version\": \"${_extra_version}\",
+          \"resource_usage\": {
+            \"cpu_cores\": ${_extra_cpu},
+            \"memory_mb\": ${_extra_mem}
+          },
+          \"containers\": ${_ctrd_cjson},
+          \"images\": ${_ctrd_ijson}
+        }"
+
+        # Append to EXTRA_CONTAINERD_RUNTIMES_JSON (newline-separated)
+        if [ -z "$EXTRA_CONTAINERD_RUNTIMES_JSON" ]; then
+            EXTRA_CONTAINERD_RUNTIMES_JSON="$_extra_json"
+        else
+            EXTRA_CONTAINERD_RUNTIMES_JSON="${EXTRA_CONTAINERD_RUNTIMES_JSON}
+EXTRA_CTRD_SEP
+${_extra_json}"
+        fi
     done
 
-    orchestrators_array="$orchestrators_array]"
-
-    # Discovery timestamp
-    TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-    # Build properties object
-    properties=$(json_build_object \
-        "schema_version" "1.0.0" \
-        "timestamp" "$TIMESTAMP" \
-        "host_info" "$HOST_INFO_JSON" \
-        "hypervisor" "$HYPERVISOR_JSON" \
-        "network" "$NETWORK_JSON" \
-        "container_runtimes" "$runtimes_array" \
-        "orchestrators" "$orchestrators_array" \
-        "services" "$SERVICES_JSON")
-
-    # Build armResources
-    arm_resource=$(json_build_object \
-        "type" "" \
-        "name" "" \
-        "apiVersion" "" \
-        "properties" "$properties")
-
-    # Final output
-    final_json="{\"armResources\":[$arm_resource]}"
-
-    echo "$final_json" > "$OUTPUT_FILE"
-
-    log_info "JSON output written to $OUTPUT_FILE"
+    # The while loop runs in a subshell due to the pipe — capture output via temp file
+    # Re-implement without pipe to avoid subshell
+    :
 }
 
-#==============================================================================
-# Main Function
-#==============================================================================
+# Re-implement discover_extra_containerd to avoid subshell issues with pipe
+discover_extra_containerd() {
+    log_info "=== Discovering additional containerd instances ==="
 
+    _ctrd_procs=$(ps -eo args 2>/dev/null | grep '[c]ontainerd' | grep -v 'shim' | grep -v grep) || _ctrd_procs=""
+    if [ -z "$_ctrd_procs" ]; then
+        log_info "No containerd processes found"
+        return
+    fi
+
+    _sys_socks="/run/containerd/containerd.sock /var/run/containerd/containerd.sock"
+
+    # Use temp file to collect extra sockets and avoid subshell issues
+    _extra_socks_file=$(mktemp 2>/dev/null || echo "/tmp/_extra_ctrd_$$")
+    echo "$_ctrd_procs" | grep -o '\-\-address [^ ]*' | awk '{print $2}' | sort -u > "$_extra_socks_file" 2>/dev/null
+
+    while IFS= read -r _extra_sock; do
+        [ -z "$_extra_sock" ] && continue
+
+        # Skip system containerd sockets
+        _is_sys=false
+        for _ss in $_sys_socks; do
+            [ "$_extra_sock" = "$_ss" ] && _is_sys=true
+        done
+        $_is_sys && continue
+
+        # Check socket accessibility
+        if [ ! -S "$_extra_sock" ] && ! ($HAS_SUDO && sudo test -S "$_extra_sock" 2>/dev/null); then
+            log_info "Extra containerd socket not accessible: $_extra_sock"
+            continue
+        fi
+
+        log_info "Found additional containerd socket: $_extra_sock"
+
+        # Find the matching process line to determine binary and config
+        _proc_line=$(echo "$_ctrd_procs" | grep "$_extra_sock" | head -1)
+
+        # Determine the ctr binary (from the same directory as containerd)
+        _extra_ctr="ctr"
+        _proc_bin=$(echo "$_proc_line" | awk '{print $1}')
+        _proc_dir=$(dirname "$_proc_bin" 2>/dev/null)
+        if [ -n "$_proc_dir" ] && [ -x "${_proc_dir}/ctr" ]; then
+            _extra_ctr="${_proc_dir}/ctr"
+        fi
+
+        # Determine the runtime name
+        _extra_name="containerd"
+        case "$_extra_sock" in
+            (*microk8s*) _extra_name="containerd (microk8s)" ;;
+            (*k3s*) _extra_name="containerd (k3s)" ;;
+            (*rke2*) _extra_name="containerd (rke2)" ;;
+        esac
+
+        # Version
+        _extra_version=$(try_command_str "extra containerd version" "$_proc_bin --version 2>/dev/null | awk '{print \$3}'") || _extra_version=""
+        _extra_version=$(safe_json_string "$_extra_version")
+
+        # Storage root
+        _extra_root=$(echo "$_proc_line" | grep -o '\-\-root [^ ]*' | awk '{print $2}')
+        [ -z "$_extra_root" ] && _extra_root="/var/lib/containerd"
+
+        # Storage driver from config
+        _extra_config=$(echo "$_proc_line" | grep -o '\-\-config [^ ]*' | awk '{print $2}')
+        _extra_sd="overlayfs"
+        if [ -n "$_extra_config" ] && [ -f "$_extra_config" ]; then
+            _esd=$(grep -i 'snapshotter' "$_extra_config" 2>/dev/null | grep -v '#' | head -1 | sed 's/.*= *"//;s/"//')
+            [ -n "$_esd" ] && _extra_sd="$_esd"
+        fi
+
+        # Enumerate containers and images via the helper
+        _enumerate_containerd_socket "$_extra_sock" "$_extra_ctr"
+
+        # Resource usage
+        _extra_res=$(get_process_resource_usage "$(basename "$_proc_bin")")
+        _extra_cpu=$(echo "$_extra_res" | awk '{print $1}')
+        _extra_mem=$(echo "$_extra_res" | awk '{print $2}')
+
+        _extra_json="{
+          \"name\": \"$(safe_json_string "$_extra_name")\",
+          \"runtime_type\": \"containerd\",
+          \"version\": \"${_extra_version}\",
+          \"socket\": \"$(safe_json_string "$_extra_sock")\",
+          \"storage_driver\": \"$(safe_json_string "$_extra_sd")\",
+          \"storage_root\": \"$(safe_json_string "$_extra_root")\",
+          \"rootless\": false,
+          \"cgroup_driver\": \"systemd\",
+          \"image_count\": ${_ctrd_ic},
+          \"container_count\": ${_ctrd_cc},
+          \"client_version\": \"${_extra_version}\",
+          \"server_version\": \"${_extra_version}\",
+          \"resource_usage\": {
+            \"cpu_cores\": ${_extra_cpu},
+            \"memory_mb\": ${_extra_mem}
+          },
+          \"containers\": ${_ctrd_cjson},
+          \"images\": ${_ctrd_ijson}
+        }"
+
+        if [ -z "$EXTRA_CONTAINERD_RUNTIMES_JSON" ]; then
+            EXTRA_CONTAINERD_RUNTIMES_JSON="$_extra_json"
+        else
+            EXTRA_CONTAINERD_RUNTIMES_JSON="${EXTRA_CONTAINERD_RUNTIMES_JSON},${_extra_json}"
+        fi
+
+        log_info "Extra containerd instance added: $_extra_name (containers=$_ctrd_cc, images=$_ctrd_ic)"
+
+    done < "$_extra_socks_file"
+
+    rm -f "$_extra_socks_file" 2>/dev/null
+    log_info "Extra containerd discovery complete"
+}
+
+discover_containerd() {
+    log_info "=== Discovering containerd ==="
+
+    _ctrd_found=false
+    if command -v containerd >/dev/null 2>&1; then
+        _ctrd_found=true
+    elif systemctl is-active containerd >/dev/null 2>&1; then
+        _ctrd_found=true
+    elif [ -S /run/containerd/containerd.sock ]; then
+        _ctrd_found=true
+    fi
+
+    if ! $_ctrd_found; then
+        log_info "containerd not detected"
+        return
+    fi
+
+    CONTAINERD_DETECTED=true
+    log_info "containerd detected"
+
+    # Version
+    _version=$(try_command_str "containerd version" "containerd --version 2>/dev/null | awk '{print \$3}'") || _version=""
+    if [ -z "$_version" ]; then
+        _version=$(try_command_str "containerd version via pkg" "dpkg -l containerd.io 2>/dev/null | awk '/containerd.io/{print \$3}' || rpm -q containerd.io 2>/dev/null | sed 's/containerd.io-//' | sed 's/-.*//'") || _version=""
+    fi
+    _version=$(safe_json_string "$_version")
+
+    # Socket
+    _socket="/run/containerd/containerd.sock"
+    [ ! -S "$_socket" ] && _socket="/var/run/containerd/containerd.sock"
+
+    # Storage driver
+    _storage_driver=""
+    if [ -f /etc/containerd/config.toml ]; then
+        _storage_driver=$(try_command_str "containerd storage driver" "grep -i 'snapshotter' /etc/containerd/config.toml | grep -v '#' | head -1 | sed 's/.*= *\"//;s/\"//'") || _storage_driver=""
+    fi
+    if [ -z "$_storage_driver" ]; then
+        _storage_driver=$(try_sudo_command_str "containerd config dump snapshotter" "containerd config dump 2>/dev/null | grep -i snapshotter | head -1 | sed 's/.*= *\"//;s/\"//'") || _storage_driver=""
+    fi
+    [ -z "$_storage_driver" ] && _storage_driver="overlayfs"
+    _storage_driver=$(safe_json_string "$_storage_driver")
+
+    # Storage root
+    _storage_root="/var/lib/containerd"
+    if [ -f /etc/containerd/config.toml ]; then
+        _sr=$(grep -i 'root' /etc/containerd/config.toml 2>/dev/null | grep -v '#' | head -1 | sed 's/.*= *"//;s/"//')
+        [ -n "$_sr" ] && _storage_root="$_sr"
+    fi
+
+    # Rootless
+    _rootless=false
+
+    # Cgroup driver
+    _cgroup_driver="systemd"
+    if [ -f /etc/containerd/config.toml ]; then
+        _cg=$(grep -i 'SystemdCgroup' /etc/containerd/config.toml 2>/dev/null | grep -v '#' | head -1)
+        case "$_cg" in *false*) _cgroup_driver="cgroupfs" ;; esac
+    fi
+    _cgroup_driver=$(safe_json_string "$_cgroup_driver")
+
+    # Enumerate containerd namespaces (moby = Docker-managed, k8s.io = Kubernetes, default = standalone)
+    _ctrd_namespaces=$(try_sudo_command_str "ctr namespaces" "ctr namespaces list -q 2>/dev/null") || _ctrd_namespaces=""
+    if [ -z "$_ctrd_namespaces" ]; then
+        _ctrd_namespaces="moby k8s.io default"
+    fi
+    log_info "containerd namespaces found: $_ctrd_namespaces"
+
+    # Skip 'moby' namespace when Docker daemon is present — those containers are
+    # already reported by discover_docker() with richer metadata.  Reporting them
+    # again under containerd creates duplicates with hash-only names and image "-".
+    _docker_is_present=false
+    if [ -S /var/run/docker.sock ] || [ -S /run/docker.sock ] || pgrep -x dockerd >/dev/null 2>&1; then
+        _docker_is_present=true
+    fi
+    if $_docker_is_present; then
+        _filtered_ns=""
+        for _ns in $_ctrd_namespaces; do
+            case "$_ns" in
+                moby) log_info "Skipping containerd 'moby' namespace (Docker daemon detected — containers reported under Docker runtime)" ;;
+                *)    _filtered_ns="${_filtered_ns:+${_filtered_ns} }${_ns}" ;;
+            esac
+        done
+        _ctrd_namespaces="$_filtered_ns"
+        log_info "containerd namespaces after moby filter: $_ctrd_namespaces"
+    fi
+
+    # Container count — iterate all namespaces
+    _container_count=0
+    for _ns in $_ctrd_namespaces; do
+        _nc=$(try_sudo_command_str "ctr $_ns containers" "ctr -n $_ns containers list -q 2>/dev/null | wc -l | tr -d ' '") || _nc="0"
+        _nc=$(num_or_default "$_nc" 0)
+        _container_count=$((_container_count + _nc))
+        log_info "containerd namespace '$_ns': $_nc containers"
+    done
+    # Fallback: crictl for Kubernetes CRI
+    if [ "$_container_count" = "0" ]; then
+        _container_count=$(try_sudo_command_str "crictl containers count" "crictl ps -a 2>/dev/null | tail -n +2 | wc -l") || _container_count="0"
+        _container_count=$(num_or_default "$_container_count" 0)
+    fi
+
+    # Running container count
+    _running_count=0
+    _rc_crictl=$(try_sudo_command_str "crictl running count" "crictl ps 2>/dev/null | tail -n +2 | wc -l") || _rc_crictl=""
+    if [ -n "$_rc_crictl" ] && [ "$_rc_crictl" != "0" ]; then
+        _running_count=$(num_or_default "$_rc_crictl" 0)
+    else
+        for _ns in $_ctrd_namespaces; do
+            _nr=$(try_sudo_command_str "ctr $_ns tasks running" "ctr -n $_ns tasks list 2>/dev/null | grep -c RUNNING") || _nr="0"
+            _nr=$(num_or_default "$_nr" 0)
+            _running_count=$((_running_count + _nr))
+        done
+    fi
+    _running_count=$(num_or_default "$_running_count" 0)
+
+    # Image count — iterate all namespaces
+    _image_count=0
+    for _ns in $_ctrd_namespaces; do
+        _ni=$(try_sudo_command_str "ctr $_ns images" "ctr -n $_ns images list -q 2>/dev/null | wc -l | tr -d ' '") || _ni="0"
+        _ni=$(num_or_default "$_ni" 0)
+        _image_count=$((_image_count + _ni))
+        log_info "containerd namespace '$_ns': $_ni images"
+    done
+    # Fallback: crictl for Kubernetes CRI
+    if [ "$_image_count" = "0" ]; then
+        _image_count=$(try_sudo_command_str "crictl images count" "crictl images 2>/dev/null | tail -n +2 | wc -l") || _image_count="0"
+        _image_count=$(num_or_default "$_image_count" 0)
+    fi
+    log_info "containerd totals: container_count=$_container_count image_count=$_image_count"
+
+    # Resource usage
+    _res=$(get_process_resource_usage "containerd")
+    _ctrd_cpu=$(echo "$_res" | awk '{print $1}')
+    _ctrd_mem=$(echo "$_res" | awk '{print $2}')
+
+    # Client/server version
+    _client_version="$_version"
+    _server_version="$_version"
+
+    # Containers detail
+    _containers_json="[]"
+
+    # Method 1: crictl (Kubernetes CRI)
+    _cont_list=$(try_sudo_command_str "crictl ps all" "crictl ps -a -o json 2>/dev/null") || _cont_list=""
+    if [ -n "$_cont_list" ] && $HAS_JQ; then
+        # Step 1: Build base container list from crictl ps
+        _containers_json=$(echo "$_cont_list" | jq -c '[.containers[]? | {
+            container_id: .id,
+            name: (.metadata.name // ""),
+            image: (.imageRef // .image.image // ""),
+            image_id: (.imageRef // ""),
+            state: (if .state == "CONTAINER_RUNNING" then "running" elif .state == "CONTAINER_EXITED" then "exited" elif .state == "CONTAINER_CREATED" then "created" else "unknown" end),
+            created_at: (.createdAt // ""),
+            ports: [],
+            resource_usage: {cpu: {usage_cores: 0.0, request_millicores: 0, limit_millicores: 0}, memory: {usage_mb: 0.0, request_mb: 0, limit_mb: 0}},
+            network_mode: "",
+            restart_policy: "",
+            orchestrator_managed: (if .labels["io.kubernetes.pod.name"] then true else false end),
+            orchestrator_ref: {
+                type: (if .labels["io.kubernetes.pod.name"] then (if (.labels | keys[] | select(startswith("io.openshift"))) then "openshift" else "kubernetes" end) else "" end),
+                service_name: "",
+                task_id: "",
+                pod_name: (.labels["io.kubernetes.pod.name"] // ""),
+                namespace: (.labels["io.kubernetes.pod.namespace"] // "")
+            }
+        }]' 2>/dev/null) || _containers_json="[]"
+
+        # Step 2: Enrich running containers with resource limits from crictl inspect
+        _cid_list=$(echo "$_cont_list" | jq -r '.containers[]? | select(.state == "CONTAINER_RUNNING") | .id' 2>/dev/null) || _cid_list=""
+        if [ -n "$_cid_list" ]; then
+            for _cid in $_cid_list; do
+                _ci=$(try_sudo_command_str "crictl inspect $_cid" "crictl inspect $_cid 2>/dev/null") || _ci=""
+                [ -z "$_ci" ] && continue
+                # Extract resource limits from OCI runtime spec
+                _ci_cpu_quota=$(echo "$_ci" | jq -r '.info.runtimeSpec.linux.resources.cpu.quota // 0' 2>/dev/null) || _ci_cpu_quota=0
+                _ci_cpu_period=$(echo "$_ci" | jq -r '.info.runtimeSpec.linux.resources.cpu.period // 0' 2>/dev/null) || _ci_cpu_period=0
+                _ci_mem_limit=$(echo "$_ci" | jq -r '.info.runtimeSpec.linux.resources.memory.limit // 0' 2>/dev/null) || _ci_mem_limit=0
+
+                _ci_cpu_lim=0
+                if [ "$_ci_cpu_quota" -gt 0 ] 2>/dev/null && [ "$_ci_cpu_period" -gt 0 ] 2>/dev/null; then
+                    _ci_cpu_lim=$((_ci_cpu_quota * 1000 / _ci_cpu_period))
+                fi
+                _ci_mem_lim=0
+                if [ "$_ci_mem_limit" -gt 0 ] 2>/dev/null; then
+                    _ci_mem_lim=$((_ci_mem_limit / 1048576))
+                fi
+
+                # Get pod-level ports from the sandbox
+                _ci_pod_id=$(echo "$_ci" | jq -r '.info.sandboxID // ""' 2>/dev/null) || _ci_pod_id=""
+                _ci_ports="[]"
+                if [ -n "$_ci_pod_id" ]; then
+                    _pi=$(try_sudo_command_str "crictl inspectp $_ci_pod_id" "crictl inspectp $_ci_pod_id 2>/dev/null") || _pi=""
+                    if [ -n "$_pi" ]; then
+                        _ci_ports=$(echo "$_pi" | jq -c '[(.info.config.port_mappings // [])[] | {
+                            host_ip: (.host_ip // "0.0.0.0"),
+                            host_port: (.host_port // 0),
+                            container_port: (.container_port // 0),
+                            protocol: (if .protocol == 0 then "tcp" elif .protocol == 1 then "udp" else "tcp" end)
+                        }]' 2>/dev/null) || _ci_ports="[]"
+                    fi
+                fi
+                [ -z "$_ci_ports" ] && _ci_ports="[]"
+
+                # Merge into containers_json if we have any data to add
+                if [ "$_ci_cpu_lim" -gt 0 ] 2>/dev/null || [ "$_ci_mem_lim" -gt 0 ] 2>/dev/null || [ "$_ci_ports" != "[]" ]; then
+                    _containers_json=$(echo "$_containers_json" | jq -c --arg cid "$_cid" \
+                        --argjson cpu_lim "$_ci_cpu_lim" --argjson mem_lim "$_ci_mem_lim" \
+                        --argjson ports "$_ci_ports" \
+                        '[.[] | if (.container_id | startswith($cid)) then
+                            .ports = $ports |
+                            .resource_usage.cpu.limit_millicores = $cpu_lim |
+                            .resource_usage.memory.limit_mb = $mem_lim
+                        else . end]' 2>/dev/null) || true
+                fi
+            done
+            log_info "Enriched crictl containers with resource limits and ports"
+        fi
+
+        # Step 3: Enrich with pod-level requests from kubectl (if available)
+        _my_hostname=$(hostname 2>/dev/null)
+        # Resolve KUBECONFIG for kubectl — discover_containerd runs before discover_kubernetes
+        _kctl_env=""
+        if [ -n "$KUBECONFIG" ] && [ -r "$KUBECONFIG" ]; then
+            _kctl_env="KUBECONFIG=$KUBECONFIG "
+        else
+            for _kc in "$HOME/.kube/config" /etc/kubernetes/admin.conf /etc/rancher/k3s/k3s.yaml; do
+                if [ -r "$_kc" ]; then
+                    _kctl_env="KUBECONFIG=$_kc "
+                    break
+                fi
+            done
+        fi
+        _kubectl_cmd="kubectl"
+        if ! command -v kubectl >/dev/null 2>&1; then
+            if command -v microk8s >/dev/null 2>&1; then _kubectl_cmd="microk8s kubectl"
+            elif command -v microk8s.kubectl >/dev/null 2>&1; then _kubectl_cmd="microk8s.kubectl"; fi
+        fi
+        _pods_json=$(try_sudo_command_str "kubectl pods on node" "${_kctl_env}${_kubectl_cmd} get pods --all-namespaces --field-selector spec.nodeName=$_my_hostname -o json 2>/dev/null") || _pods_json=""
+        if [ -n "$_pods_json" ] && $HAS_JQ; then
+            # Build a lookup: pod_name+container_name -> {cpu_req, mem_req, cpu_lim, mem_lim, ports}
+            _pod_resources=$(echo "$_pods_json" | jq -c '[.items[]? | .metadata as $meta | .spec.containers[]? | {
+                key: ($meta.name + "/" + .name),
+                cpu_req: (if .resources.requests.cpu then (if (.resources.requests.cpu | test("m$")) then (.resources.requests.cpu | rtrimstr("m") | tonumber) else ((.resources.requests.cpu | tonumber) * 1000) end) else 0 end),
+                mem_req: (if .resources.requests.memory then (if (.resources.requests.memory | test("Mi$")) then (.resources.requests.memory | rtrimstr("Mi") | tonumber) elif (.resources.requests.memory | test("Gi$")) then ((.resources.requests.memory | rtrimstr("Gi") | tonumber) * 1024) elif (.resources.requests.memory | test("Ki$")) then ((.resources.requests.memory | rtrimstr("Ki") | tonumber) / 1024 | floor) else 0 end) else 0 end),
+                cpu_lim: (if .resources.limits.cpu then (if (.resources.limits.cpu | test("m$")) then (.resources.limits.cpu | rtrimstr("m") | tonumber) else ((.resources.limits.cpu | tonumber) * 1000) end) else 0 end),
+                mem_lim: (if .resources.limits.memory then (if (.resources.limits.memory | test("Mi$")) then (.resources.limits.memory | rtrimstr("Mi") | tonumber) elif (.resources.limits.memory | test("Gi$")) then ((.resources.limits.memory | rtrimstr("Gi") | tonumber) * 1024) elif (.resources.limits.memory | test("Ki$")) then ((.resources.limits.memory | rtrimstr("Ki") | tonumber) / 1024 | floor) else 0 end) else 0 end),
+                ports: [(.ports // [])[] | {host_ip: (.hostIP // ""), host_port: (.hostPort // 0), container_port: (.containerPort // 0), protocol: ((.protocol // "TCP") | ascii_downcase)}]
+            }]' 2>/dev/null) || _pod_resources=""
+
+            if [ -n "$_pod_resources" ] && [ "$_pod_resources" != "[]" ]; then
+                _containers_json=$(echo "$_containers_json" | jq -c --argjson pr "$_pod_resources" '
+                    [.[] | . as $c |
+                        ($pr[] | select(.key == ($c.orchestrator_ref.pod_name + "/" + $c.name))) as $match |
+                        if $match then
+                            (if ($match.cpu_req > 0) then .resource_usage.cpu.request_millicores = $match.cpu_req else . end) |
+                            (if ($match.cpu_lim > 0) then .resource_usage.cpu.limit_millicores = $match.cpu_lim else . end) |
+                            (if ($match.mem_req > 0) then .resource_usage.memory.request_mb = $match.mem_req else . end) |
+                            (if ($match.mem_lim > 0) then .resource_usage.memory.limit_mb = $match.mem_lim else . end) |
+                            (if ($match.ports | length > 0) then .ports = $match.ports else . end)
+                        else . end
+                    ]' 2>/dev/null) || true
+                log_info "Enriched containers with kubectl pod resource requests/limits"
+            fi
+        fi
+    fi
+    [ -z "$_containers_json" ] && _containers_json="[]"
+
+    # Method 2: ctr per namespace (catches Docker-managed moby containers, standalone, etc.)
+    if [ "$_containers_json" = "[]" ] && [ "$_container_count" -gt 0 ] 2>/dev/null; then
+        _ctr_all_json=""
+        for _ns in $_ctrd_namespaces; do
+            _ns_list=$(try_sudo_command_str "ctr $_ns containers list" "ctr -n $_ns containers list 2>/dev/null | tail -n +2") || _ns_list=""
+            if [ -n "$_ns_list" ]; then
+                # Get tasks list once for state lookup
+                _tasks_out=$(try_sudo_command_str "ctr $_ns tasks" "ctr -n $_ns tasks list 2>/dev/null") || _tasks_out=""
+                # Capture entries from pipe subshell via stdout
+                _ns_entries=$(echo "$_ns_list" | while IFS= read -r _ctr_line; do
+                    _ctr_id=$(echo "$_ctr_line" | awk '{print $1}')
+                    _ctr_img=$(echo "$_ctr_line" | awk '{print $2}')
+                    [ -z "$_ctr_id" ] && continue
+                    # Lookup task state
+                    _ctr_state="unknown"
+                    _task_match=$(echo "$_tasks_out" | grep "$_ctr_id" 2>/dev/null)
+                    case "$_task_match" in
+                        (*RUNNING*) _ctr_state="running" ;;
+                        (*STOPPED*) _ctr_state="exited" ;;
+                        (*PAUSED*) _ctr_state="paused" ;;
+                    esac
+                    printf '{"container_id":"%s","name":"%s","image":"%s","image_id":"","state":"%s","created_at":"","ports":[],"resource_usage":{"cpu":{"usage_cores":0.0,"request_millicores":0,"limit_millicores":0},"memory":{"usage_mb":0.0,"request_mb":0,"limit_mb":0}},"network_mode":"","restart_policy":"","orchestrator_managed":false,"orchestrator_ref":{"type":"","service_name":"","task_id":"","pod_name":"","namespace":""}}\n' \
+                        "$(safe_json_string "$_ctr_id")" "$(safe_json_string "$_ctr_id")" "$(safe_json_string "$_ctr_img")" "$_ctr_state"
+                done)
+                # Join entries from this namespace into the accumulator
+                _oldIFS="$IFS"
+                IFS='
+'
+                for _e in $_ns_entries; do
+                    [ -z "$_e" ] && continue
+                    _ctr_all_json="${_ctr_all_json:+${_ctr_all_json},}${_e}"
+                done
+                IFS="$_oldIFS"
+            fi
+        done
+        [ -n "$_ctr_all_json" ] && _containers_json="[${_ctr_all_json}]"
+    fi
+    log_info "containerd containers detail: $(echo "$_containers_json" | wc -c)B"
+
+    # Images detail
+    _images_json="[]"
+
+    # Method 1: crictl (Kubernetes CRI)
+    _img_list=$(try_sudo_command_str "crictl images json" "crictl images -o json 2>/dev/null") || _img_list=""
+    if [ -n "$_img_list" ] && $HAS_JQ; then
+        _images_json=$(echo "$_img_list" | jq -c '[.images[]? | {
+            image_id: .id,
+            repository: ((.repoTags[0] // "") | split(":")[0]),
+            tag: ((.repoTags[0] // ":") | split(":")[1] // ""),
+            size_mb: ((.size // 0) / 1048576 | . * 10 | floor / 10),
+            created_at: ""
+        }]' 2>/dev/null) || _images_json="[]"
+    fi
+    [ -z "$_images_json" ] && _images_json="[]"
+
+    # Method 2: ctr per namespace for images
+    if [ "$_images_json" = "[]" ] && [ "$_image_count" -gt 0 ] 2>/dev/null; then
+        _ctr_all_imgs=""
+        for _ns in $_ctrd_namespaces; do
+            _ns_imgs=$(try_sudo_command_str "ctr $_ns images list" "ctr -n $_ns images list 2>/dev/null | tail -n +2") || _ns_imgs=""
+            if [ -n "$_ns_imgs" ]; then
+                # Capture entries from pipe subshell via stdout
+                _ns_img_entries=$(echo "$_ns_imgs" | while IFS= read -r _img_line; do
+                    _img_ref=$(echo "$_img_line" | awk '{print $1}')
+                    _img_size=$(echo "$_img_line" | awk '{print $NF}')
+                    [ -z "$_img_ref" ] && continue
+                    # Parse repo:tag from reference
+                    _img_repo=$(echo "$_img_ref" | sed 's/:.*$//')
+                    _img_tag=$(echo "$_img_ref" | grep ':' | sed 's/^[^:]*://' | sed 's/@.*//')
+                    [ -z "$_img_tag" ] && _img_tag="latest"
+                    # Convert size to MB (ctr shows bytes or human-readable)
+                    _img_smb="0.0"
+                    case "$_img_size" in
+                        (*[0-9]) _img_smb=$(echo "$_img_size" | awk '{printf "%.1f", $1 / 1048576}') ;;
+                        (*MiB*|*MB*) _img_smb=$(echo "$_img_size" | sed 's/[^0-9.]//g') ;;
+                        (*GiB*|*GB*) _img_smb=$(echo "$_img_size" | sed 's/[^0-9.]//g' | awk '{printf "%.1f", $1 * 1024}') ;;
+                        (*KiB*|*KB*) _img_smb=$(echo "$_img_size" | sed 's/[^0-9.]//g' | awk '{printf "%.1f", $1 / 1024}') ;;
+                    esac
+                    printf '{"image_id":"%s","repository":"%s","tag":"%s","size_mb":%s,"created_at":""}\n' \
+                        "$(safe_json_string "$_img_ref")" "$(safe_json_string "$_img_repo")" "$(safe_json_string "$_img_tag")" "$_img_smb"
+                done)
+                # Join entries from this namespace into the accumulator
+                _oldIFS="$IFS"
+                IFS='
+'
+                for _e in $_ns_img_entries; do
+                    [ -z "$_e" ] && continue
+                    _ctr_all_imgs="${_ctr_all_imgs:+${_ctr_all_imgs},}${_e}"
+                done
+                IFS="$_oldIFS"
+            fi
+        done
+        [ -n "$_ctr_all_imgs" ] && _images_json="[${_ctr_all_imgs}]"
+    fi
+    log_info "containerd images detail: $(echo "$_images_json" | wc -c)B"
+
+    CONTAINERD_RUNTIME_JSON="{
+          \"name\": \"containerd\",
+          \"runtime_type\": \"containerd\",
+          \"version\": \"${_version}\",
+          \"socket\": \"$(safe_json_string "$_socket")\",
+          \"storage_driver\": \"${_storage_driver}\",
+          \"storage_root\": \"$(safe_json_string "$_storage_root")\",
+          \"rootless\": ${_rootless},
+          \"cgroup_driver\": \"${_cgroup_driver}\",
+          \"image_count\": ${_image_count},
+          \"container_count\": ${_container_count},
+          \"client_version\": \"${_client_version}\",
+          \"server_version\": \"${_server_version}\",
+          \"resource_usage\": {
+            \"cpu_cores\": ${_ctrd_cpu},
+            \"memory_mb\": ${_ctrd_mem}
+          },
+          \"containers\": ${_containers_json},
+          \"images\": ${_images_json}
+        }"
+    log_info "containerd discovery complete"
+}
+
+# ========================
+# 2.3c CRI-O discovery
+# ========================
+CRIO_DETECTED=false
+CRIO_RUNTIME_JSON=""
+
+discover_crio() {
+    log_info "=== Discovering CRI-O ==="
+
+    _crio_found=false
+    if command -v crio >/dev/null 2>&1; then
+        _crio_found=true
+    elif systemctl is-active crio >/dev/null 2>&1; then
+        _crio_found=true
+    elif [ -S /var/run/crio/crio.sock ]; then
+        _crio_found=true
+    fi
+
+    if ! $_crio_found; then
+        log_info "CRI-O not detected"
+        return
+    fi
+
+    CRIO_DETECTED=true
+    log_info "CRI-O detected"
+
+    # Version
+    _version=$(try_command_str "crio version" "crio --version 2>/dev/null | head -1 | awk '{print \$NF}'") || _version=""
+    if [ -z "$_version" ]; then
+        _version=$(try_sudo_command_str "crictl version for crio" "crictl version 2>/dev/null | grep 'RuntimeVersion' | awk '{print \$2}'") || _version=""
+    fi
+    _version=$(safe_json_string "$_version")
+
+    # Socket
+    _socket="/var/run/crio/crio.sock"
+
+    # Storage driver
+    _storage_driver=$(try_sudo_command_str "crio storage_driver" "crio config 2>/dev/null | grep 'storage_driver' | head -1 | sed 's/.*= *\"//;s/\"//'") || _storage_driver=""
+    if [ -z "$_storage_driver" ] && [ -f /etc/crio/crio.conf ]; then
+        _storage_driver=$(try_command_str "crio conf storage" "grep 'storage_driver' /etc/crio/crio.conf | head -1 | sed 's/.*= *\"//;s/\"//'") || _storage_driver=""
+    fi
+    [ -z "$_storage_driver" ] && _storage_driver="overlay"
+    _storage_driver=$(safe_json_string "$_storage_driver")
+
+    # Storage root
+    _storage_root="/var/lib/containers/storage"
+
+    # Cgroup driver
+    _cgroup_driver=$(try_sudo_command_str "crio cgroup_manager" "crio config 2>/dev/null | grep 'cgroup_manager' | head -1 | sed 's/.*= *\"//;s/\"//'") || _cgroup_driver=""
+    if [ -z "$_cgroup_driver" ] && [ -f /etc/crio/crio.conf ]; then
+        _cgroup_driver=$(try_command_str "crio conf cgroup" "grep 'cgroup_manager' /etc/crio/crio.conf | head -1 | sed 's/.*= *\"//;s/\"//'") || _cgroup_driver=""
+    fi
+    [ -z "$_cgroup_driver" ] && _cgroup_driver="systemd"
+    _cgroup_driver=$(safe_json_string "$_cgroup_driver")
+
+    # Container count
+    _container_count=$(try_sudo_command_str "crictl ps count" "crictl ps -a 2>/dev/null | tail -n +2 | wc -l") || _container_count="0"
+    _container_count=$(num_or_default "$_container_count" 0)
+
+    # Image count
+    _image_count=$(try_sudo_command_str "crictl images count" "crictl images 2>/dev/null | tail -n +2 | wc -l") || _image_count="0"
+    _image_count=$(num_or_default "$_image_count" 0)
+
+    # Resource usage
+    _res=$(get_process_resource_usage "crio")
+    _crio_cpu=$(echo "$_res" | awk '{print $1}')
+    _crio_mem=$(echo "$_res" | awk '{print $2}')
+
+    _rootless=false
+
+    # Containers
+    _containers_json="[]"
+    _cont_list=$(try_sudo_command_str "crictl ps crio" "crictl ps -a -o json 2>/dev/null") || _cont_list=""
+    if [ -n "$_cont_list" ] && $HAS_JQ; then
+        _containers_json=$(echo "$_cont_list" | jq -c '[.containers[]? | {
+            container_id: .id,
+            name: (.metadata.name // ""),
+            image: (.imageRef // .image.image // ""),
+            image_id: (.imageRef // ""),
+            state: (if .state == "CONTAINER_RUNNING" then "running" elif .state == "CONTAINER_EXITED" then "exited" elif .state == "CONTAINER_CREATED" then "created" else "unknown" end),
+            created_at: (.createdAt // ""),
+            ports: [],
+            resource_usage: {cpu: {usage_cores: 0.0, request_millicores: 0, limit_millicores: 0}, memory: {usage_mb: 0.0, request_mb: 0, limit_mb: 0}},
+            network_mode: "",
+            restart_policy: "",
+            orchestrator_managed: (if .labels["io.kubernetes.pod.name"] then true else false end),
+            orchestrator_ref: {
+                type: (if .labels["io.kubernetes.pod.name"] then (if (.labels | keys[] | select(startswith("io.openshift"))) then "openshift" else "kubernetes" end) else "" end),
+                service_name: "",
+                task_id: "",
+                pod_name: (.labels["io.kubernetes.pod.name"] // ""),
+                namespace: (.labels["io.kubernetes.pod.namespace"] // "")
+            }
+        }]' 2>/dev/null) || _containers_json="[]"
+    fi
+    [ -z "$_containers_json" ] && _containers_json="[]"
+
+    # Images
+    _images_json="[]"
+    _img_list=$(try_sudo_command_str "crictl images for crio" "crictl images -o json 2>/dev/null") || _img_list=""
+    if [ -n "$_img_list" ] && $HAS_JQ; then
+        _images_json=$(echo "$_img_list" | jq -c '[.images[]? | {
+            image_id: .id,
+            repository: ((.repoTags[0] // "") | split(":")[0]),
+            tag: ((.repoTags[0] // ":") | split(":")[1] // ""),
+            size_mb: ((.size // 0) / 1048576 | . * 10 | floor / 10),
+            created_at: ""
+        }]' 2>/dev/null) || _images_json="[]"
+    fi
+    [ -z "$_images_json" ] && _images_json="[]"
+
+    CRIO_RUNTIME_JSON="{
+          \"name\": \"crio\",
+          \"runtime_type\": \"crio\",
+          \"version\": \"${_version}\",
+          \"socket\": \"$(safe_json_string "$_socket")\",
+          \"storage_driver\": \"${_storage_driver}\",
+          \"storage_root\": \"$(safe_json_string "$_storage_root")\",
+          \"rootless\": ${_rootless},
+          \"cgroup_driver\": \"${_cgroup_driver}\",
+          \"image_count\": ${_image_count},
+          \"container_count\": ${_container_count},
+          \"client_version\": \"${_version}\",
+          \"server_version\": \"${_version}\",
+          \"resource_usage\": {
+            \"cpu_cores\": ${_crio_cpu},
+            \"memory_mb\": ${_crio_mem}
+          },
+          \"containers\": ${_containers_json},
+          \"images\": ${_images_json}
+        }"
+    log_info "CRI-O discovery complete"
+}
+
+# ========================
+# 2.3d Podman discovery
+# ========================
+PODMAN_DETECTED=false
+PODMAN_RUNTIME_JSON=""
+
+discover_podman() {
+    log_info "=== Discovering Podman ==="
+
+    _podman_found=false
+    if command -v podman >/dev/null 2>&1; then
+        _podman_found=true
+    elif systemctl is-active podman >/dev/null 2>&1; then
+        _podman_found=true
+    elif [ -S /run/podman/podman.sock ]; then
+        _podman_found=true
+    fi
+
+    if ! $_podman_found; then
+        log_info "Podman not detected"
+        return
+    fi
+
+    PODMAN_DETECTED=true
+    log_info "Podman detected"
+
+    # Version
+    _version=$(try_command_str "podman version" "podman version --format '{{.Client.Version}}' 2>/dev/null || podman --version 2>/dev/null | awk '{print \$NF}'") || _version=""
+    _version=$(safe_json_string "$_version")
+
+    # Socket
+    _socket=""
+    if [ -S /run/podman/podman.sock ]; then
+        _socket="/run/podman/podman.sock"
+    elif [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock" ]; then
+        _socket="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
+    fi
+
+    # Storage driver
+    _storage_driver=$(try_command_str "podman storage driver" "podman info --format '{{.Store.GraphDriverName}}' 2>/dev/null") || _storage_driver=""
+    [ -z "$_storage_driver" ] && _storage_driver="overlay"
+    _storage_driver=$(safe_json_string "$_storage_driver")
+
+    # Storage root
+    _storage_root=$(try_command_str "podman graph root" "podman info --format '{{.Store.GraphRoot}}' 2>/dev/null") || _storage_root="/var/lib/containers/storage"
+    _storage_root=$(safe_json_string "$_storage_root")
+
+    # Rootless
+    _rootless=false
+    _rootless_check=$(try_command_str "podman rootless" "podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null") || _rootless_check=""
+    case "$_rootless_check" in *true*|*True*) _rootless=true ;; esac
+
+    # Cgroup driver
+    _cgroup_driver=$(try_command_str "podman cgroup" "podman info --format '{{.Host.CgroupManager}}' 2>/dev/null") || _cgroup_driver="systemd"
+    _cgroup_driver=$(safe_json_string "$_cgroup_driver")
+
+    # Container count
+    _container_count=$(try_command_str "podman container count" "podman ps -a --format '{{.ID}}' 2>/dev/null | wc -l") || _container_count="0"
+    _container_count=$(num_or_default "$_container_count" 0)
+
+    # Image count
+    _image_count=$(try_command_str "podman image count" "podman images --format '{{.ID}}' 2>/dev/null | wc -l") || _image_count="0"
+    _image_count=$(num_or_default "$_image_count" 0)
+
+    # Resource usage
+    _res=$(get_process_resource_usage "podman")
+    _podman_cpu=$(echo "$_res" | awk '{print $1}')
+    _podman_mem=$(echo "$_res" | awk '{print $2}')
+
+    # Containers
+    _containers_json="[]"
+    _cont_list=$(try_command_str "podman ps json" "podman ps -a --format json 2>/dev/null") || _cont_list=""
+    if [ -n "$_cont_list" ] && $HAS_JQ; then
+        _containers_json=$(echo "$_cont_list" | jq -c '[.[]? | {
+            container_id: (.Id // .id // ""),
+            name: ((.Names[0]? // .Name // .name // "") | gsub("^/"; "")),
+            image: (.Image // .image // ""),
+            image_id: (.ImageID // .imageID // ""),
+            state: ((.State // .state // "unknown") | ascii_downcase),
+            created_at: (.Created // .CreatedAt // ""),
+            ports: [],
+            resource_usage: {cpu: {usage_cores: 0.0, request_millicores: 0, limit_millicores: 0}, memory: {usage_mb: 0.0, request_mb: 0, limit_mb: 0}},
+            network_mode: "",
+            restart_policy: "",
+            orchestrator_managed: false,
+            orchestrator_ref: {type: "", service_name: "", task_id: "", pod_name: "", namespace: ""}
+        }]' 2>/dev/null) || _containers_json="[]"
+    fi
+    [ -z "$_containers_json" ] && _containers_json="[]"
+
+    # Images
+    _images_json="[]"
+    _img_list=$(try_command_str "podman images json" "podman images --format json 2>/dev/null") || _img_list=""
+    if [ -n "$_img_list" ] && $HAS_JQ; then
+        _images_json=$(echo "$_img_list" | jq -c '[.[]? | {
+            image_id: (.Id // .id // ""),
+            repository: ((.Names[0]? // "") | split(":")[0]),
+            tag: ((.Names[0]? // ":") | split(":")[1] // ""),
+            size_mb: ((.Size // 0) / 1048576 | . * 10 | floor / 10),
+            created_at: (.Created // "")
+        }]' 2>/dev/null) || _images_json="[]"
+    fi
+    [ -z "$_images_json" ] && _images_json="[]"
+
+    PODMAN_RUNTIME_JSON="{
+          \"name\": \"podman\",
+          \"runtime_type\": \"podman\",
+          \"version\": \"${_version}\",
+          \"socket\": \"$(safe_json_string "$_socket")\",
+          \"storage_driver\": \"${_storage_driver}\",
+          \"storage_root\": \"${_storage_root}\",
+          \"rootless\": ${_rootless},
+          \"cgroup_driver\": \"${_cgroup_driver}\",
+          \"image_count\": ${_image_count},
+          \"container_count\": ${_container_count},
+          \"client_version\": \"${_version}\",
+          \"server_version\": \"${_version}\",
+          \"resource_usage\": {
+            \"cpu_cores\": ${_podman_cpu},
+            \"memory_mb\": ${_podman_mem}
+          },
+          \"containers\": ${_containers_json},
+          \"images\": ${_images_json}
+        }"
+    log_info "Podman discovery complete"
+}
+
+# ========================
+# 2.4 Orchestrators
+# ========================
+
+# ========================
+# 2.4a Docker Swarm
+# ========================
+SWARM_DETECTED=false
+SWARM_JSON=""
+
+discover_docker_swarm() {
+    log_info "=== Discovering Docker Swarm ==="
+
+    _swarm_state=""
+
+    # Method 1: docker info --format (Go template)
+    _swarm_state=$(try_command_str "swarm state via format" "docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null") || _swarm_state=""
+    log_info "Swarm detection method 1 (docker info --format): '${_swarm_state}'"
+
+    # Method 2: docker info plain text grep (works on all Docker versions)
+    if [ -z "$_swarm_state" ] || [ "$_swarm_state" = "inactive" ]; then
+        _swarm_grep=$(try_command_str "swarm state via grep" "docker info 2>/dev/null | grep -i '^ *Swarm:' | awk '{print \$2}'") || _swarm_grep=""
+        log_info "Swarm detection method 2 (docker info grep): '${_swarm_grep}'"
+        if [ -n "$_swarm_grep" ]; then
+            _swarm_state="$_swarm_grep"
+        fi
+    fi
+
+    # Method 3: sudo docker info --format (in case docker group membership is missing)
+    if [ -z "$_swarm_state" ] || [ "$_swarm_state" = "inactive" ]; then
+        _swarm_state_sudo=$(try_sudo_command_str "swarm state via sudo format" "docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null") || _swarm_state_sudo=""
+        log_info "Swarm detection method 3 (sudo docker info --format): '${_swarm_state_sudo}'"
+        if [ -n "$_swarm_state_sudo" ]; then
+            _swarm_state="$_swarm_state_sudo"
+        fi
+    fi
+
+    # Method 4: sudo docker info plain text grep
+    if [ -z "$_swarm_state" ] || [ "$_swarm_state" = "inactive" ]; then
+        _swarm_grep2=$(try_sudo_command_str "swarm state via sudo grep" "docker info 2>/dev/null | grep -i '^ *Swarm:' | awk '{print \$2}'") || _swarm_grep2=""
+        log_info "Swarm detection method 4 (sudo docker info grep): '${_swarm_grep2}'"
+        if [ -n "$_swarm_grep2" ]; then
+            _swarm_state="$_swarm_grep2"
+        fi
+    fi
+
+    # Method 5: Docker socket API (works without docker CLI)
+    if [ -z "$_swarm_state" ] || [ "$_swarm_state" = "inactive" ]; then
+        _swarm_state_sock=$(try_command_str "swarm state via socket" "curl -s --unix-socket /var/run/docker.sock http://localhost/info 2>/dev/null | grep -o '\"LocalNodeState\":\"[^\"]*\"' | sed 's/\"LocalNodeState\":\"//;s/\"//'") || _swarm_state_sock=""
+        log_info "Swarm detection method 5 (docker socket API): '${_swarm_state_sock}'"
+        if [ -n "$_swarm_state_sock" ]; then
+            _swarm_state="$_swarm_state_sock"
+        fi
+    fi
+
+    # Method 6: Check for Swarm filesystem artifacts + listening port 2377
+    if [ -z "$_swarm_state" ] || [ "$_swarm_state" = "inactive" ]; then
+        if [ -d /var/lib/docker/swarm ] || [ -d /var/lib/docker/swarm/raft ]; then
+            if ss -tln 2>/dev/null | grep -q ':2377 ' || netstat -tln 2>/dev/null | grep -q ':2377 '; then
+                _swarm_state="active"
+                log_info "Swarm detection method 6 (filesystem + port 2377): active"
+            fi
+        fi
+    fi
+
+    # Method 7: Check docker node ls (only works on manager nodes but confirms swarm)
+    if [ -z "$_swarm_state" ] || [ "$_swarm_state" = "inactive" ]; then
+        if try_command_str "swarm node ls check" "docker node ls >/dev/null 2>&1"; then
+            _swarm_state="active"
+            log_info "Swarm detection method 7 (docker node ls): active"
+        elif try_sudo_command_str "swarm node ls sudo check" "docker node ls >/dev/null 2>&1"; then
+            _swarm_state="active"
+            log_info "Swarm detection method 7b (sudo docker node ls): active"
+        fi
+    fi
+
+    # --- Unprivileged detection methods (no docker socket / no sudo needed) ---
+
+    # Method 8: docker_gwbridge network interface (created automatically by Swarm)
+    if [ -z "$_swarm_state" ] || [ "$_swarm_state" = "inactive" ]; then
+        if ip link show docker_gwbridge >/dev/null 2>&1 || ifconfig docker_gwbridge >/dev/null 2>&1; then
+            _swarm_state="active"
+            log_info "Swarm detection method 8 (docker_gwbridge interface): active"
+        fi
+    fi
+
+    # Method 9: Swarm-specific ports listening (2377 cluster mgmt, 7946 gossip)
+    if [ -z "$_swarm_state" ] || [ "$_swarm_state" = "inactive" ]; then
+        _swarm_port_count=0
+        for _sp in 2377 7946; do
+            if ss -tln 2>/dev/null | grep -q ":${_sp} " || netstat -tln 2>/dev/null | grep -q ":${_sp} "; then
+                _swarm_port_count=$(( _swarm_port_count + 1 ))
+            fi
+        done
+        if [ "$_swarm_port_count" -ge 2 ]; then
+            _swarm_state="active"
+            log_info "Swarm detection method 9 (ports 2377+7946 listening): active"
+        elif [ "$_swarm_port_count" -ge 1 ]; then
+            # Single port — only trust if docker_gwbridge also exists
+            if ip link show docker_gwbridge >/dev/null 2>&1; then
+                _swarm_state="active"
+                log_info "Swarm detection method 9b (1 swarm port + gwbridge): active"
+            fi
+        fi
+    fi
+
+    # Method 10: Check for swarm-related processes (unprivileged ps)
+    if [ -z "$_swarm_state" ] || [ "$_swarm_state" = "inactive" ]; then
+        if ps -eo args 2>/dev/null | grep -q '[d]ockerd' 2>/dev/null; then
+            if ps -eo args 2>/dev/null | grep -qE 'swarm|docker-containerd.*swarm' 2>/dev/null; then
+                _swarm_state="active"
+                log_info "Swarm detection method 10 (swarm process found): active"
+            fi
+        fi
+    fi
+
+    # Method 11: VXLAN port 4789 + docker_gwbridge (Swarm overlay networking)
+    if [ -z "$_swarm_state" ] || [ "$_swarm_state" = "inactive" ]; then
+        if ss -uln 2>/dev/null | grep -q ':4789 ' || netstat -uln 2>/dev/null | grep -q ':4789 '; then
+            if ip link show docker_gwbridge >/dev/null 2>&1 || [ -d /var/lib/docker/swarm ]; then
+                _swarm_state="active"
+                log_info "Swarm detection method 11 (VXLAN 4789 + gwbridge/swarm dir): active"
+            fi
+        fi
+    fi
+
+    # Method 12: Network namespace for Swarm ingress
+    if [ -z "$_swarm_state" ] || [ "$_swarm_state" = "inactive" ]; then
+        if [ -f /var/run/docker/netns/ingress_sbox ] || ls /var/run/docker/netns/ 2>/dev/null | grep -q 'ingress'; then
+            _swarm_state="active"
+            log_info "Swarm detection method 12 (ingress_sbox netns): active"
+        fi
+    fi
+
+    log_info "Final swarm state: '${_swarm_state}'"
+    if [ "$_swarm_state" != "active" ]; then
+        log_info "Docker Swarm not active (state: ${_swarm_state:-none})"
+        return
+    fi
+
+    SWARM_DETECTED=true
+    log_info "Docker Swarm active"
+
+    # Version — try docker CLI, then dpkg/rpm, then dockerd binary
+    _version=$(docker_try "docker version for swarm" "docker version --format '{{.Server.Version}}'")
+    if [ -z "$_version" ]; then
+        _version=$(docker_try "docker version no-format" "docker version 2>/dev/null | grep -i 'Server:' -A2 | grep 'Version:' | awk '{print \$2}'")
+    fi
+    if [ -z "$_version" ]; then
+        # Unprivileged: get version from package manager
+        _version=$(try_command_str "docker version dpkg" "dpkg -l 2>/dev/null | grep -i docker-ce | awk '{print \$3}' | head -1 | sed 's/[^0-9.].*//; s/^[0-9]*://'") || _version=""
+    fi
+    if [ -z "$_version" ]; then
+        _version=$(try_command_str "docker version rpm" "rpm -qa 2>/dev/null | grep -i docker-ce | head -1 | sed 's/docker-ce-//i; s/-.*//'") || _version=""
+    fi
+    if [ -z "$_version" ]; then
+        _version=$(try_command_str "docker version binary" "dockerd --version 2>/dev/null | awk '{print \$3}' | tr -d ','") || _version=""
+    fi
+    _version=$(safe_json_string "$_version")
+
+    # Cluster ID
+    _cluster_id=$(docker_try "swarm cluster ID" "docker info --format '{{.Swarm.Cluster.ID}}'")
+    if [ -z "$_cluster_id" ]; then
+        _cluster_id=$(docker_try "swarm cluster ID grep" "docker info 2>/dev/null | grep 'ClusterID:' | awk '{print \$2}'")
+    fi
+    if [ -z "$_cluster_id" ]; then
+        _cluster_id=$(try_command_str "swarm ID via socket" "curl -s --unix-socket /var/run/docker.sock http://localhost/info 2>/dev/null | grep -o '\"Cluster\":{\"ID\":\"[^\"]*\"' | sed 's/.*\"ID\":\"//;s/\"//'") || _cluster_id=""
+    fi
+    # Fallback for worker nodes: read cluster ID from swarm TLS certificate (O= field)
+    if [ -z "$_cluster_id" ]; then
+        _cert_path="/var/lib/docker/swarm/certificates/swarm-node.crt"
+        if [ -f "$_cert_path" ] || ($HAS_SUDO && sudo test -f "$_cert_path" 2>/dev/null); then
+            _cluster_id=$(try_sudo_command_str "swarm cluster ID from cert" \
+                "openssl x509 -in $_cert_path -noout -subject -nameopt RFC2253 2>/dev/null | sed -n 's/.*O=\([^,]*\).*/\1/p'") || _cluster_id=""
+            if [ -n "$_cluster_id" ]; then
+                log_info "Got cluster_id from swarm TLS certificate: ${_cluster_id}"
+            fi
+        else
+            log_info "Swarm TLS certificate not found at $_cert_path"
+        fi
+    fi
+    _cluster_id=$(safe_json_string "$_cluster_id")
+
+    # Current node
+    _node_id=$(docker_try "swarm node id" "docker info --format '{{.Swarm.NodeID}}'")
+    if [ -z "$_node_id" ]; then
+        _node_id=$(docker_try "swarm node id grep" "docker info 2>/dev/null | grep 'NodeID:' | awk '{print \$2}'")
+    fi
+    _node_id=$(safe_json_string "$_node_id")
+
+    _control_avail=$(docker_try "swarm control available" "docker info --format '{{.Swarm.ControlAvailable}}'")
+    if [ -z "$_control_avail" ]; then
+        _control_avail=$(docker_try "swarm control via grep" "docker info 2>/dev/null | grep -i 'Is Manager:' | awk '{print \$3}'")
+    fi
+    # Unprivileged manager detection: port 2377 = manager node
+    if [ -z "$_control_avail" ]; then
+        if ss -tln 2>/dev/null | grep -q ':2377 ' || netstat -tln 2>/dev/null | grep -q ':2377 '; then
+            _control_avail="true"
+            log_info "Detected manager role via port 2377"
+        fi
+    fi
+    _node_role="worker"
+    case "$_control_avail" in (*true*|*True*|*yes*|*Yes*) _node_role="manager" ;; esac
+
+    _node_avail="active"
+
+    # Nodes
+    _total_nodes=0
+    _manager_count=0
+    _worker_count=0
+    _manager_nodes_json="[]"
+    _worker_nodes_json="[]"
+
+    if [ "$_node_role" = "manager" ]; then
+        _nodes_raw=$(docker_try "docker node ls" "docker node ls --format '{{.ID}}|{{.Hostname}}|{{.Status}}|{{.ManagerStatus}}'")
+        log_info "docker node ls raw output: '${_nodes_raw}'"
+        if [ -n "$_nodes_raw" ]; then
+            _manager_list=""
+            _worker_list=""
+            _total_nodes=0
+            _manager_count=0
+            _worker_count=0
+
+            echo "$_nodes_raw" | grep -v '^$' | while IFS='|' read -r _nid _nname _nstatus _nmgr; do
+                log_info "Node: id='${_nid}' name='${_nname}' status='${_nstatus}' mgr='${_nmgr}'"
+            done
+
+            # Count totals outside subshell
+            _total_nodes=$(echo "$_nodes_raw" | grep -cv '^$')
+            _manager_count=$(echo "$_nodes_raw" | grep -v '^$' | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $4); if ($4 != "") print}' | wc -l | tr -d ' ')
+            _worker_count=$(( _total_nodes - _manager_count ))
+
+            # Build manager nodes JSON
+            _manager_nodes_json="[$(echo "$_nodes_raw" | grep -v '^$' | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $4); if ($4 != "") print}' | {
+                _mf=true
+                while IFS='|' read -r _nid _nname _nstatus _nmgr; do
+                    case "$_nstatus" in
+                        (Ready) _ns="ready" ;;
+                        (Down)  _ns="down" ;;
+                        (*)     _ns="unknown" ;;
+                    esac
+                    if ! $_mf; then printf ','; fi; _mf=false
+                    printf '{"name":"%s","node_id":"%s","status":"%s"}' \
+                        "$(safe_json_string "$_nname")" "$(safe_json_string "$_nid")" "$_ns"
+                done
+            })]"
+
+            # Build worker nodes JSON
+            _worker_nodes_json="[$(echo "$_nodes_raw" | grep -v '^$' | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $4); if ($4 == "") print}' | {
+                _wf=true
+                while IFS='|' read -r _nid _nname _nstatus _nmgr; do
+                    [ -z "$_nid" ] && continue
+                    case "$_nstatus" in
+                        (Ready) _ns="ready" ;;
+                        (Down)  _ns="down" ;;
+                        (*)     _ns="unknown" ;;
+                    esac
+                    if ! $_wf; then printf ','; fi; _wf=false
+                    printf '{"name":"%s","node_id":"%s","status":"%s"}' \
+                        "$(safe_json_string "$_nname")" "$(safe_json_string "$_nid")" "$_ns"
+                done
+            })]"
+
+            log_info "Node counts: total=${_total_nodes} managers=${_manager_count} workers=${_worker_count}"
+        else
+            # Unprivileged fallback: docker node ls failed but we know this is a manager
+            # Report at least the current node
+            log_info "docker node ls unavailable (no socket access) — using unprivileged fallback"
+            _cur_hostname=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo "unknown")
+            _cur_hostname=$(safe_json_string "$_cur_hostname")
+            _cur_nid=$(safe_json_string "$_node_id")
+            _total_nodes=1
+            _manager_count=1
+            _worker_count=0
+            _manager_nodes_json="[{\"name\":\"${_cur_hostname}\",\"node_id\":\"${_cur_nid}\",\"status\":\"ready\"}]"
+            _worker_nodes_json="[]"
+            log_info "Unprivileged fallback: reported current node as manager (hostname=${_cur_hostname})"
+        fi
+    else
+        # Worker node — report self and try to discover manager nodes
+        log_info "Current node is a worker — gathering available cluster info"
+        _cur_hostname=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo "unknown")
+        _cur_hostname=$(safe_json_string "$_cur_hostname")
+        _cur_nid=$(safe_json_string "$_node_id")
+        _worker_count=1
+        _worker_nodes_json="[{\"name\":\"${_cur_hostname}\",\"node_id\":\"${_cur_nid}\",\"status\":\"ready\"}]"
+
+        # Try to discover manager nodes via RemoteManagers (available on workers)
+        _remote_mgrs=""
+        _remote_mgrs=$(docker_try "swarm remote managers json" "docker info --format '{{json .Swarm.RemoteManagers}}'")
+        if [ -z "$_remote_mgrs" ] || [ "$_remote_mgrs" = "null" ] || [ "$_remote_mgrs" = "<no value>" ]; then
+            _remote_mgrs=$(docker_try "swarm remote managers via socket" \
+                "curl -s --unix-socket /var/run/docker.sock http://localhost/info 2>/dev/null | sed -n 's/.*\"RemoteManagers\":\\(\\[[^]]*\\]\\).*/\\1/p'")
+        fi
+        log_info "RemoteManagers raw: ${_remote_mgrs}"
+
+        _manager_count=0
+        _manager_nodes_json="[]"
+
+        if [ -n "$_remote_mgrs" ] && [ "$_remote_mgrs" != "null" ] && [ "$_remote_mgrs" != "<no value>" ]; then
+            if $HAS_JQ; then
+                _manager_count=$(echo "$_remote_mgrs" | jq 'if type == "array" then length else 0 end' 2>/dev/null)
+                _manager_count=$(num_or_default "$_manager_count" 0)
+                if [ "$_manager_count" -gt 0 ] 2>/dev/null; then
+                    _manager_nodes_json=$(echo "$_remote_mgrs" | jq -c '[.[] | {name: .Addr, node_id: .NodeID, status: "ready"}]' 2>/dev/null)
+                    [ -z "$_manager_nodes_json" ] && _manager_nodes_json="[]"
+                fi
+            else
+                # Without jq: count NodeID occurrences and build JSON with awk
+                _manager_count=$(echo "$_remote_mgrs" | grep -o '"NodeID"' | wc -l | tr -d ' ')
+                _manager_count=$(num_or_default "$_manager_count" 0)
+                if [ "$_manager_count" -gt 0 ] 2>/dev/null; then
+                    _manager_nodes_json=$(echo "$_remote_mgrs" | sed 's/\[//;s/\]//' | tr '}' '\n' | awk -F'"' '
+                        BEGIN { printf "[" }
+                        /NodeID/ {
+                            for (i=1; i<=NF; i++) {
+                                if ($i == "NodeID") nid=$(i+2)
+                                if ($i == "Addr") addr=$(i+2)
+                            }
+                            if (c++ > 0) printf ","
+                            printf "{\"name\":\"%s\",\"node_id\":\"%s\",\"status\":\"ready\"}", addr, nid
+                        }
+                        END { printf "]" }
+                    ')
+                    [ -z "$_manager_nodes_json" ] && _manager_nodes_json="[]"
+                fi
+            fi
+        fi
+
+        # Fallback: parse manager addresses from docker info plain text
+        if [ "$_manager_count" -eq 0 ] 2>/dev/null; then
+            _mgr_addrs=$(docker_try "swarm manager addrs text" \
+                "docker info 2>/dev/null | sed -n '/Manager Addresses:/,/^[^ ]/p' | grep -E '^  +[0-9]' | sed 's/^ *//'")
+            if [ -n "$_mgr_addrs" ]; then
+                _manager_count=$(echo "$_mgr_addrs" | grep -c .)
+                _manager_count=$(num_or_default "$_manager_count" 0)
+                _manager_nodes_json=$(echo "$_mgr_addrs" | awk '
+                    BEGIN { printf "[" }
+                    NF > 0 {
+                        gsub(/^[ \t]+|[ \t]+$/, "")
+                        if (c++ > 0) printf ","
+                        printf "{\"name\":\"%s\",\"node_id\":\"\",\"status\":\"ready\"}", $0
+                    }
+                    END { printf "]" }
+                ')
+                [ -z "$_manager_nodes_json" ] && _manager_nodes_json="[]"
+                log_info "Got ${_manager_count} manager(s) from docker info text"
+            fi
+        fi
+
+        _total_nodes=$(( _manager_count + _worker_count ))
+        log_info "Worker node: detected ${_manager_count} manager(s), total_count=${_total_nodes}"
+    fi
+
+    # Raft index
+    _raft_index=$(docker_try "swarm raft index" "docker info --format '{{.Swarm.Cluster.Spec.Raft.SnapshotInterval}}'")
+    _raft_index=$(num_or_default "$_raft_index" 0)
+
+    # Task history
+    _task_history=$(docker_try "swarm task history" "docker info --format '{{.Swarm.Cluster.Spec.TaskHistoryRetentionLimit}}'")
+    _task_history=$(num_or_default "$_task_history" 5)
+
+    # Resource usage
+    _res=$(get_process_resource_usage "dockerd")
+    _swarm_cpu=$(echo "$_res" | awk '{print $1}')
+    _swarm_mem=$(echo "$_res" | awk '{print $2}')
+
+    SWARM_JSON="{
+          \"name\": \"docker_swarm\",
+          \"orchestrator_type\": \"docker-swarm\",
+          \"version\": \"${_version}\",
+          \"cluster_id\": \"${_cluster_id}\",
+          \"cluster_name\": \"\",
+          \"state\": \"active\",
+          \"current_node\": {
+            \"node_id\": \"${_node_id}\",
+            \"role\": \"${_node_role}\",
+            \"availability\": \"${_node_avail}\"
+          },
+          \"nodes\": {
+            \"total_count\": ${_total_nodes},
+            \"master_count\": ${_manager_count},
+            \"worker_count\": ${_worker_count},
+            \"master_nodes\": ${_manager_nodes_json},
+            \"worker_nodes\": ${_worker_nodes_json}
+          },
+          \"platform_specific\": {
+            \"swarm\": {
+              \"raft_index\": ${_raft_index},
+              \"task_history_limit\": ${_task_history}
+            },
+            \"kubernetes\": null,
+            \"openshift\": null,
+            \"tanzu\": null
+          },
+          \"resource_usage\": {
+            \"cpu_cores\": ${_swarm_cpu},
+            \"memory_mb\": ${_swarm_mem}
+          }
+        }"
+    log_info "Docker Swarm discovery complete"
+}
+
+# ========================
+# 2.4 Shared KUBECONFIG Setup
+# ========================
+_KUBECONFIG_ENSURED=false
+
+ensure_kubeconfig() {
+    # Idempotent: only run once per script execution
+    if $_KUBECONFIG_ENSURED; then
+        return
+    fi
+    _KUBECONFIG_ENSURED=true
+    log_info "Ensuring KUBECONFIG is set"
+
+    if [ -n "$KUBECONFIG" ] && [ -r "$KUBECONFIG" ]; then
+        log_info "KUBECONFIG already set and readable: $KUBECONFIG"
+        return
+    fi
+
+    # Discover KUBECONFIG — try standard locations
+    # Use -r (readable) not -f (exists) — /etc/kubernetes/admin.conf is root-owned
+    # and unreadable without sudo, causing all kubectl/oc commands to fail.
+    # kubelet.conf is included for worker nodes where admin.conf doesn't exist.
+    if [ -z "$KUBECONFIG" ]; then
+        for _kc in /etc/kubernetes/admin.conf "$HOME/.kube/config" /etc/rancher/k3s/k3s.yaml /etc/rancher/rke2/rke2.yaml /etc/kubernetes/kubelet.conf; do
+            if [ -r "$_kc" ]; then
+                export KUBECONFIG="$_kc"
+                log_info "Set KUBECONFIG=$_kc (readable)"
+                break
+            elif [ -f "$_kc" ]; then
+                log_info "KUBECONFIG candidate $_kc exists but is not readable (need sudo?)"
+            fi
+        done
+    fi
+    # If no readable config found, try sudo to copy admin.conf or kubelet.conf to a temp location
+    if [ -z "$KUBECONFIG" ]; then
+        for _kc_src in /etc/kubernetes/admin.conf /etc/kubernetes/kubelet.conf; do
+            if [ -f "$_kc_src" ]; then
+                _tmp_kc="/tmp/.guestdetails_kubeconfig_$$"
+                if try_sudo_command_str "copy $(basename $_kc_src)" "cp $_kc_src $_tmp_kc && chmod 644 $_tmp_kc" >/dev/null 2>&1; then
+                    export KUBECONFIG="$_tmp_kc"
+                    log_info "Copied $_kc_src to $_tmp_kc via sudo for kubectl access"
+                    break
+                fi
+            fi
+        done
+    fi
+}
+
+cleanup_kubeconfig() {
+    case "${KUBECONFIG:-}" in /tmp/.guestdetails_kubeconfig_*)
+        rm -f "$KUBECONFIG" 2>/dev/null
+        unset KUBECONFIG
+        log_info "Cleaned up temporary kubeconfig"
+    ;; esac
+}
+
+# ========================
+# 2.4b Kubernetes
+# ========================
+K8S_DETECTED=false
+K8S_JSON=""
+
+discover_kubernetes() {
+    log_info "=== Discovering Kubernetes ==="
+
+    _k8s_found=false
+    if command -v kubectl >/dev/null 2>&1 && try_command "kubectl cluster-info" kubectl cluster-info >/dev/null 2>&1; then
+        _k8s_found=true
+    elif systemctl is-active kubelet >/dev/null 2>&1; then
+        _k8s_found=true
+    elif [ -d /etc/kubernetes ]; then
+        _k8s_found=true
+    elif pgrep -x kubelet >/dev/null 2>&1; then
+        _k8s_found=true
+    # MicroK8s detection
+    elif command -v microk8s >/dev/null 2>&1; then
+        _k8s_found=true
+        log_info "Kubernetes detected via microk8s CLI"
+    elif snap list microk8s >/dev/null 2>&1; then
+        _k8s_found=true
+        log_info "Kubernetes detected via microk8s snap"
+    elif pgrep -f 'snap.microk8s.daemon-kubelite' >/dev/null 2>&1; then
+        _k8s_found=true
+        log_info "Kubernetes detected via microk8s kubelite process"
+    elif [ -S /var/snap/microk8s/common/run/containerd.sock ]; then
+        _k8s_found=true
+        log_info "Kubernetes detected via microk8s containerd socket"
+    fi
+
+    if ! $_k8s_found; then
+        log_info "Kubernetes not detected"
+        return
+    fi
+
+    K8S_DETECTED=true
+    log_info "Kubernetes detected"
+
+    # Use shared KUBECONFIG setup
+    ensure_kubeconfig
+
+    # Determine kubectl command — standard kubectl or microk8s kubectl
+    _kubectl="kubectl"
+    if ! command -v kubectl >/dev/null 2>&1; then
+        if command -v microk8s >/dev/null 2>&1; then
+            _kubectl="microk8s kubectl"
+            log_info "Using microk8s kubectl as kubectl alternative"
+        elif command -v microk8s.kubectl >/dev/null 2>&1; then
+            _kubectl="microk8s.kubectl"
+            log_info "Using microk8s.kubectl as kubectl alternative"
+        fi
+    fi
+
+    # Version
+    _version=$(try_command_str "kubectl version" "$_kubectl version --short 2>/dev/null | grep 'Server' | awk '{print \$NF}'") || _version=""
+    if [ -z "$_version" ] && $HAS_JQ; then
+        _version=$(try_command_str "kubectl version json jq" "$_kubectl version -o json 2>/dev/null | jq -r '.serverVersion.gitVersion // .clientVersion.gitVersion // empty'") || _version=""
+    fi
+    if [ -z "$_version" ]; then
+        _version=$(try_command_str "kubectl version json grep" "$_kubectl version -o json 2>/dev/null | grep -o '\"gitVersion\":\"[^\"]*\"' | tail -1 | sed 's/\"gitVersion\":\"//;s/\"//g'") || _version=""
+    fi
+    if [ -z "$_version" ]; then
+        _version=$(try_command "kubelet version" kubelet --version 2>/dev/null | awk '{print $2}') || _version=""
+    fi
+    if [ -z "$_version" ] && command -v microk8s >/dev/null 2>&1; then
+        _version=$(try_command_str "microk8s version" "microk8s version 2>/dev/null | grep -o 'v[0-9.]*'") || _version=""
+    fi
+    _version=$(safe_json_string "$_version")
+
+    # Cluster ID
+    _cluster_id=$(try_command_str "k8s cluster id" "$_kubectl get ns kube-system -o jsonpath='{.metadata.uid}' 2>/dev/null") || _cluster_id=""
+    _cluster_id=$(safe_json_string "$_cluster_id")
+
+    # Cluster name
+    _cluster_name=$(try_command_str "k8s cluster name" "$_kubectl config current-context 2>/dev/null") || _cluster_name=""
+    # Fallback: parse kubeconfig file directly (use resolved $KUBECONFIG, not hardcoded path)
+    _kc_file="${KUBECONFIG:-/etc/kubernetes/admin.conf}"
+    if [ -z "$_cluster_name" ] && [ -r "$_kc_file" ]; then
+        _cluster_name=$(grep 'current-context:' "$_kc_file" 2>/dev/null | awk '{print $2}') || _cluster_name=""
+    fi
+    if [ -z "$_cluster_name" ] && [ -r "$_kc_file" ]; then
+        _cluster_name=$(grep -E '^\s+cluster:\s+\S' "$_kc_file" 2>/dev/null | head -1 | awk '{print $2}') || _cluster_name=""
+    fi
+    _cluster_name=$(safe_json_string "$_cluster_name")
+
+    # Current node
+    _my_hostname=$(hostname 2>/dev/null)
+    _node_id=$(safe_json_string "$_my_hostname")
+    _node_role="worker"
+    _node_avail="Unknown"
+
+    _node_labels=$(try_command_str "k8s node labels" "$_kubectl get node '$_my_hostname' -o jsonpath='{.metadata.labels}' 2>/dev/null") || _node_labels=""
+    if echo "$_node_labels" | grep -q "node-role.kubernetes.io/control-plane"; then
+        _node_role="control-plane"
+    elif echo "$_node_labels" | grep -q "node-role.kubernetes.io/master"; then
+        _node_role="control-plane"
+    fi
+
+    # Fallback control-plane detection without kubectl (check for kube-apiserver)
+    if [ "$_node_role" = "worker" ]; then
+        if [ -f /etc/kubernetes/manifests/kube-apiserver.yaml ] || \
+           pgrep -x kube-apiserver >/dev/null 2>&1 || \
+           (ss -tln 2>/dev/null | grep -q ':6443 '); then
+            _node_role="control-plane"
+            log_info "Detected control-plane role via fallback (apiserver manifest/process/port)"
+        fi
+    fi
+
+    _node_status=$(try_command_str "k8s node status" "$_kubectl get node '$_my_hostname' -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null") || _node_status=""
+    case "$_node_status" in
+        True|true) _node_avail="Ready" ;;
+        False|false) _node_avail="NotReady" ;;
+        *) _node_avail="Unknown" ;;
+    esac
+
+    # Check for schedulable
+    _unschedulable=$(try_command_str "k8s node schedulable" "$_kubectl get node '$_my_hostname' -o jsonpath='{.spec.unschedulable}' 2>/dev/null") || _unschedulable=""
+    [ "$_unschedulable" = "true" ] && _node_avail="SchedulingDisabled"
+
+    # Nodes
+    _total_nodes=0
+    _master_count=0
+    _worker_count=0
+    _master_nodes_json="[]"
+    _worker_nodes_json="[]"
+
+    _nodes_json_raw=$(try_command_str "k8s nodes" "$_kubectl get nodes -o json 2>/dev/null") || _nodes_json_raw=""
+    if [ -n "$_nodes_json_raw" ] && $HAS_JQ; then
+        _total_nodes=$(echo "$_nodes_json_raw" | jq '.items | length' 2>/dev/null) || _total_nodes=0
+
+        _master_nodes_json=$(echo "$_nodes_json_raw" | jq -c '[.items[] | select(.metadata.labels["node-role.kubernetes.io/control-plane"] != null or .metadata.labels["node-role.kubernetes.io/master"] != null) | {
+            name: .metadata.name,
+            node_id: .metadata.name,
+            status: (if (.status.conditions[] | select(.type == "Ready")).status == "True" then "Ready" else "NotReady" end)
+        }]' 2>/dev/null) || _master_nodes_json="[]"
+
+        _worker_nodes_json=$(echo "$_nodes_json_raw" | jq -c '[.items[] | select(.metadata.labels["node-role.kubernetes.io/control-plane"] == null and .metadata.labels["node-role.kubernetes.io/master"] == null) | {
+            name: .metadata.name,
+            node_id: .metadata.name,
+            status: (if (.status.conditions[] | select(.type == "Ready")).status == "True" then "Ready" else "NotReady" end)
+        }]' 2>/dev/null) || _worker_nodes_json="[]"
+
+        _master_count=$(echo "$_master_nodes_json" | jq 'length' 2>/dev/null) || _master_count=0
+        _worker_count=$(echo "$_worker_nodes_json" | jq 'length' 2>/dev/null) || _worker_count=0
+    elif [ -n "$_nodes_json_raw" ]; then
+        # Without jq, parse node list
+        _nodes_text=$(try_command_str "kubectl get nodes" "$_kubectl get nodes 2>/dev/null") || _nodes_text=""
+        if [ -n "$_nodes_text" ]; then
+            _total_nodes=$(echo "$_nodes_text" | tail -n +2 | wc -l)
+            _master_count=$(echo "$_nodes_text" | grep -c 'control-plane\|master')
+            _worker_count=$(( _total_nodes - _master_count ))
+        fi
+    fi
+
+    # State
+    _state="unknown"
+    if [ -n "$_nodes_json_raw" ] && $HAS_JQ; then
+        _not_ready=$(echo "$_nodes_json_raw" | jq '[.items[].status.conditions[] | select(.type == "Ready" and .status != "True")] | length' 2>/dev/null) || _not_ready=0
+        if [ "$_not_ready" = "0" ] && [ "$_total_nodes" -gt 0 ]; then
+            _state="active"
+        elif [ "$_not_ready" -gt 0 ]; then
+            _state="degraded"
+        fi
+    elif [ -n "$_nodes_json_raw" ]; then
+        _state="active"
+    fi
+
+    # Distribution detection
+    _distribution=""
+    if [ -d /var/lib/rancher/k3s ]; then
+        _distribution="k3s"
+    elif [ -d /var/lib/rancher/rke2 ]; then
+        _distribution="rke2"
+    elif snap list microk8s >/dev/null 2>&1; then
+        _distribution="microk8s"
+    elif command -v kubeadm >/dev/null 2>&1; then
+        _distribution="kubeadm"
+    elif command -v kind >/dev/null 2>&1 && try_command_str "kind clusters" "kind get clusters 2>/dev/null" | grep -q .; then
+        _distribution="kind"
+    elif command -v minikube >/dev/null 2>&1 && try_command_str "minikube status" "minikube status 2>/dev/null" | grep -q "Running"; then
+        _distribution="minikube"
+    else
+        # Check node labels for cloud provider
+        if echo "$_node_labels" | grep -qi "eks.amazonaws.com"; then
+            _distribution="eks"
+        elif echo "$_node_labels" | grep -qi "kubernetes.azure.com"; then
+            _distribution="aks"
+        elif echo "$_node_labels" | grep -qi "cloud.google.com"; then
+            _distribution="gke"
+        # kubeadm on worker nodes: kubeadm may not be in PATH but bootstrap-kubelet.conf exists
+        elif [ -f /etc/kubernetes/bootstrap-kubelet.conf ] || [ -f /etc/kubernetes/kubelet.conf ]; then
+            _distribution="kubeadm"
+        fi
+    fi
+    _distribution=$(safe_json_string "$_distribution")
+
+    # API server endpoint
+    _api_endpoint=$(try_command_str "k8s api endpoint" "$_kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null") || _api_endpoint=""
+    _api_endpoint=$(safe_json_string "$_api_endpoint")
+
+    # Cluster CIDR / Service CIDR
+    _cluster_cidr=$(try_command_str "k8s cluster cidr" "$_kubectl cluster-info dump 2>/dev/null | grep -m1 'cluster-cidr' | grep -o '[0-9]\\+\\.[0-9]\\+\\.[0-9]\\+\\.[0-9]\\+/[0-9]\\+'") || _cluster_cidr=""
+    if [ -z "$_cluster_cidr" ]; then
+        _cluster_cidr=$(try_command_str "k8s cidr from cm" "$_kubectl get cm kubeadm-config -n kube-system -o jsonpath='{.data.ClusterConfiguration}' 2>/dev/null | grep -o 'podSubnet: [^ ]*' | awk '{print \$2}'") || _cluster_cidr=""
+    fi
+    _cluster_cidr=$(safe_json_string "$_cluster_cidr")
+
+    _service_cidr=$(try_command_str "k8s service cidr" "$_kubectl cluster-info dump 2>/dev/null | grep -m1 'service-cluster-ip-range' | grep -o '[0-9]\\+\\.[0-9]\\+\\.[0-9]\\+\\.[0-9]\\+/[0-9]\\+'") || _service_cidr=""
+    if [ -z "$_service_cidr" ]; then
+        _service_cidr=$(try_command_str "k8s svc cidr from cm" "$_kubectl get cm kubeadm-config -n kube-system -o jsonpath='{.data.ClusterConfiguration}' 2>/dev/null | grep -o 'serviceSubnet: [^ ]*' | awk '{print \$2}'") || _service_cidr=""
+    fi
+    _service_cidr=$(safe_json_string "$_service_cidr")
+
+    # ========================================================
+    # Worker-node / unprivileged fallbacks
+    # When kubectl has no working kubeconfig (common on worker nodes
+    # as unprivileged user), fill in gaps from process args, kubelet
+    # healthz, kubelet.conf via sudo, and CA cert fingerprint.
+    # ========================================================
+
+    # --- Sudo kubectl with kubelet.conf ---
+    # kubelet.conf has limited RBAC but CAN read nodes
+    _kubelet_kc="/etc/kubernetes/kubelet.conf"
+    if [ -f "$_kubelet_kc" ] && { [ -z "$_nodes_json_raw" ] || [ "$_state" = "unknown" ]; }; then
+        log_info "Attempting sudo kubectl with kubelet.conf for worker node fallback"
+
+        # Nodes via kubelet.conf (kubelet RBAC allows reading nodes)
+        if [ -z "$_nodes_json_raw" ]; then
+            _nodes_json_raw=$(try_sudo_command_str "k8s nodes via kubelet.conf" \
+                "kubectl --kubeconfig=$_kubelet_kc get nodes -o json 2>/dev/null") || _nodes_json_raw=""
+            if [ -n "$_nodes_json_raw" ] && $HAS_JQ; then
+                _total_nodes=$(echo "$_nodes_json_raw" | jq '.items | length' 2>/dev/null) || _total_nodes=0
+
+                _master_nodes_json=$(echo "$_nodes_json_raw" | jq -c '[.items[] | select(.metadata.labels["node-role.kubernetes.io/control-plane"] != null or .metadata.labels["node-role.kubernetes.io/master"] != null) | {
+                    name: .metadata.name,
+                    node_id: .metadata.name,
+                    status: (if (.status.conditions[] | select(.type == "Ready")).status == "True" then "Ready" else "NotReady" end)
+                }]' 2>/dev/null) || _master_nodes_json="[]"
+
+                _worker_nodes_json=$(echo "$_nodes_json_raw" | jq -c '[.items[] | select(.metadata.labels["node-role.kubernetes.io/control-plane"] == null and .metadata.labels["node-role.kubernetes.io/master"] == null) | {
+                    name: .metadata.name,
+                    node_id: .metadata.name,
+                    status: (if (.status.conditions[] | select(.type == "Ready")).status == "True" then "Ready" else "NotReady" end)
+                }]' 2>/dev/null) || _worker_nodes_json="[]"
+
+                _master_count=$(echo "$_master_nodes_json" | jq 'length' 2>/dev/null) || _master_count=0
+                _worker_count=$(echo "$_worker_nodes_json" | jq 'length' 2>/dev/null) || _worker_count=0
+
+                log_info "Got nodes via kubelet.conf: total=$_total_nodes masters=$_master_count workers=$_worker_count"
+            elif [ -n "$_nodes_json_raw" ]; then
+                _nodes_text=$(try_sudo_command_str "k8s nodes text kubelet.conf" \
+                    "kubectl --kubeconfig=$_kubelet_kc get nodes 2>/dev/null") || _nodes_text=""
+                if [ -n "$_nodes_text" ]; then
+                    _total_nodes=$(echo "$_nodes_text" | tail -n +2 | wc -l)
+                    _master_count=$(echo "$_nodes_text" | grep -c 'control-plane\|master')
+                    _worker_count=$(( _total_nodes - _master_count ))
+                fi
+            fi
+        fi
+
+        # Node availability via kubelet.conf
+        if [ "$_node_avail" = "Unknown" ]; then
+            _node_status=$(try_sudo_command_str "k8s node status kubelet.conf" \
+                "kubectl --kubeconfig=$_kubelet_kc get node '$_my_hostname' -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null") || _node_status=""
+            case "$_node_status" in
+                True|true) _node_avail="Ready" ;;
+                False|false) _node_avail="NotReady" ;;
+            esac
+        fi
+
+        # State from nodes via kubelet.conf
+        if [ "$_state" = "unknown" ] && [ -n "$_nodes_json_raw" ] && $HAS_JQ; then
+            _not_ready=$(echo "$_nodes_json_raw" | jq '[.items[].status.conditions[] | select(.type == "Ready" and .status != "True")] | length' 2>/dev/null) || _not_ready=0
+            if [ "$_not_ready" = "0" ] && [ "$_total_nodes" -gt 0 ] 2>/dev/null; then
+                _state="active"
+            elif [ "$_not_ready" -gt 0 ] 2>/dev/null; then
+                _state="degraded"
+            fi
+        fi
+
+        # Cluster name from kubelet.conf content
+        if [ -z "$_cluster_name" ]; then
+            _cluster_name=$(try_sudo_command_str "k8s cluster name kubelet.conf" \
+                "awk '/^clusters:/,/^[^ ]/{if(/^  - cluster:/){found=1} if(found && /^    name:/){print \$2; exit}}' $_kubelet_kc 2>/dev/null") || _cluster_name=""
+            if [ -z "$_cluster_name" ]; then
+                _cluster_name=$(try_sudo_command_str "k8s cluster name kubelet.conf grep" \
+                    "grep -A20 '^clusters:' $_kubelet_kc 2>/dev/null | grep '  name:' | head -1 | awk '{print \$2}'") || _cluster_name=""
+            fi
+        fi
+
+        # API server endpoint from kubelet.conf content
+        if [ -z "$_api_endpoint" ]; then
+            _api_endpoint=$(try_sudo_command_str "k8s api from kubelet.conf" \
+                "grep 'server:' $_kubelet_kc 2>/dev/null | awk '{print \$2}' | head -1") || _api_endpoint=""
+        fi
+    fi
+
+    # --- Non-sudo fallbacks from kubelet process args ---
+    _kc_from_proc=""
+    if [ -z "$_api_endpoint" ] || [ -z "$_cluster_name" ]; then
+        _kc_from_proc=$(ps aux 2>/dev/null | grep '[k]ubelet' | sed -n 's/.*--kubeconfig=\([^ ]*\).*/\1/p' | head -1)
+        if [ -n "$_kc_from_proc" ] && [ -r "$_kc_from_proc" ]; then
+            if [ -z "$_api_endpoint" ]; then
+                _api_endpoint=$(grep 'server:' "$_kc_from_proc" 2>/dev/null | awk '{print $2}' | head -1) || _api_endpoint=""
+                [ -n "$_api_endpoint" ] && log_info "Got API endpoint from kubelet kubeconfig: $_api_endpoint"
+            fi
+            if [ -z "$_cluster_name" ]; then
+                _cluster_name=$(awk '/^clusters:/,/^[^ ]/{if(/^  - cluster:/){found=1} if(found && /^    name:/){print $2; exit}}' "$_kc_from_proc" 2>/dev/null) || _cluster_name=""
+                [ -n "$_cluster_name" ] && log_info "Got cluster name from kubelet kubeconfig: $_cluster_name"
+            fi
+        fi
+    fi
+
+    # --- API server endpoint from established network connections ---
+    if [ -z "$_api_endpoint" ]; then
+        # kubelet maintains persistent connections to the API server on port 6443
+        _api_host=$(ss -tn state established 2>/dev/null | awk '/:6443$/{print $4}' | head -1 | sed 's/:[0-9]*$//; s/^\[//; s/\]$//') || _api_host=""
+        if [ -z "$_api_host" ]; then
+            _api_host=$(ss -tn 2>/dev/null | grep 'ESTAB' | awk '{print $5}' | grep ':6443$' | head -1 | sed 's/:6443$//') || _api_host=""
+        fi
+        if [ -n "$_api_host" ]; then
+            _api_endpoint="https://${_api_host}:6443"
+            log_info "Got API endpoint from network connections: $_api_endpoint"
+        fi
+    fi
+
+    # --- Kubelet healthz for state and availability ---
+    if [ "$_state" = "unknown" ] && pgrep -x kubelet >/dev/null 2>&1; then
+        _healthz=$(curl -s --max-time 3 http://127.0.0.1:10248/healthz 2>/dev/null) || _healthz=""
+        if [ "$_healthz" = "ok" ]; then
+            _state="active"
+            log_info "Set state=active from kubelet healthz"
+        else
+            # kubelet process running implies cluster is active even if healthz unreachable
+            _state="active"
+            log_info "Set state=active from kubelet process presence"
+        fi
+    fi
+
+    if [ "$_node_avail" = "Unknown" ] && pgrep -x kubelet >/dev/null 2>&1; then
+        _healthz=$(curl -s --max-time 3 http://127.0.0.1:10248/healthz 2>/dev/null) || _healthz=""
+        if [ "$_healthz" = "ok" ]; then
+            _node_avail="Ready"
+            log_info "Set availability=Ready from kubelet healthz"
+        fi
+    fi
+
+    # --- Cluster ID fallback: hashed CA cert fingerprint ---
+    # The raw fingerprint could be considered sensitive, so we hash it with SHA256
+    # to produce a stable, unique, non-reversible cluster identifier.
+    if [ -z "$_cluster_id" ] && [ -r /etc/kubernetes/pki/ca.crt ]; then
+        _raw_fp=$(openssl x509 -in /etc/kubernetes/pki/ca.crt -noout -fingerprint -sha256 2>/dev/null \
+            | sed 's/.*=//;s/://g') || _raw_fp=""
+        if [ -n "$_raw_fp" ]; then
+            _cluster_id=$(printf '%s' "$_raw_fp" | sha256sum 2>/dev/null | awk '{print $1}') || _cluster_id=""
+            # Fallback if sha256sum not available
+            if [ -z "$_cluster_id" ]; then
+                _cluster_id=$(printf '%s' "$_raw_fp" | openssl dgst -sha256 2>/dev/null | awk '{print $NF}') || _cluster_id=""
+            fi
+            [ -n "$_cluster_id" ] && log_info "Got cluster_id from hashed CA cert fingerprint"
+        fi
+    fi
+
+    # --- Nodes: report current node as minimum ---
+    if [ "$_total_nodes" -eq 0 ] 2>/dev/null || [ -z "$_total_nodes" ]; then
+        _total_nodes=1
+        if [ "$_node_role" = "control-plane" ]; then
+            _master_count=1; _worker_count=0
+            _master_nodes_json="[{\"name\":\"$_my_hostname\",\"node_id\":\"$_my_hostname\",\"status\":\"$_node_avail\"}]"
+            _worker_nodes_json="[]"
+        else
+            _master_count=0; _worker_count=1
+            _master_nodes_json="[]"
+            _worker_nodes_json="[{\"name\":\"$_my_hostname\",\"node_id\":\"$_my_hostname\",\"status\":\"$_node_avail\"}]"
+        fi
+        log_info "Reported self as minimum node entry (role=$_node_role, status=$_node_avail)"
+    fi
+
+    # Re-sanitize fields that may have been set by fallbacks
+    _cluster_id=$(safe_json_string "$_cluster_id")
+    _cluster_name=$(safe_json_string "$_cluster_name")
+    _api_endpoint=$(safe_json_string "$_api_endpoint")
+
+    # Kubeconfig path
+    _kubeconfig="${KUBECONFIG:-/etc/kubernetes/admin.conf}"
+    [ ! -f "$_kubeconfig" ] && _kubeconfig="$HOME/.kube/config"
+    [ ! -f "$_kubeconfig" ] && _kubeconfig="/etc/kubernetes/kubelet.conf"
+    [ ! -f "$_kubeconfig" ] && _kubeconfig=""
+    _kubeconfig=$(safe_json_string "$_kubeconfig")
+
+    # Resource usage (kubelet)
+    _res=$(get_process_resource_usage "kubelet")
+    _k8s_cpu=$(echo "$_res" | awk '{print $1}')
+    _k8s_mem=$(echo "$_res" | awk '{print $2}')
+
+    K8S_JSON="{
+          \"name\": \"kubernetes\",
+          \"orchestrator_type\": \"kubernetes\",
+          \"version\": \"${_version}\",
+          \"cluster_id\": \"${_cluster_id}\",
+          \"cluster_name\": \"${_cluster_name}\",
+          \"state\": \"${_state}\",
+          \"current_node\": {
+            \"node_id\": \"${_node_id}\",
+            \"role\": \"${_node_role}\",
+            \"availability\": \"${_node_avail}\"
+          },
+          \"nodes\": {
+            \"total_count\": ${_total_nodes},
+            \"master_count\": ${_master_count},
+            \"worker_count\": ${_worker_count},
+            \"master_nodes\": ${_master_nodes_json},
+            \"worker_nodes\": ${_worker_nodes_json}
+          },
+          \"platform_specific\": {
+            \"swarm\": null,
+            \"kubernetes\": {
+              \"distribution\": \"${_distribution}\",
+              \"api_server_endpoint\": \"${_api_endpoint}\",
+              \"cluster_cidr\": \"${_cluster_cidr}\",
+              \"service_cidr\": \"${_service_cidr}\",
+              \"kubeconfig_path\": \"${_kubeconfig}\"
+            },
+            \"openshift\": null,
+            \"tanzu\": null
+          },
+          \"resource_usage\": {
+            \"cpu_cores\": ${_k8s_cpu},
+            \"memory_mb\": ${_k8s_mem}
+          }
+        }"
+    log_info "Kubernetes discovery complete"
+}
+
+# ========================
+# 2.4c OpenShift
+# ========================
+OCP_DETECTED=false
+OCP_JSON=""
+
+discover_openshift() {
+    log_info "=== Discovering OpenShift ==="
+
+    _ocp_found=false
+    if command -v oc >/dev/null 2>&1 && try_command "oc version" oc version >/dev/null 2>&1; then
+        _ocp_found=true
+        log_info "OpenShift detected via oc CLI"
+    elif try_command_str "kubectl clusterversion" "kubectl get clusterversion 2>/dev/null" | grep -q "version"; then
+        _ocp_found=true
+        log_info "OpenShift detected via kubectl clusterversion"
+    fi
+    # Fallback: detect OpenShift via namespaces (openshift-apiserver, openshift-controller-manager)
+    if ! $_ocp_found; then
+        _ocp_ns=$(try_command_str "openshift namespaces" "kubectl get ns 2>/dev/null | grep -c '^openshift-'") || _ocp_ns="0"
+        if [ "$_ocp_ns" -gt 0 ] 2>/dev/null; then
+            _ocp_found=true
+            log_info "OpenShift detected via openshift-* namespaces ($_ocp_ns found)"
+        fi
+    fi
+    # Fallback: detect OpenShift via openshift-apiserver process
+    if ! $_ocp_found; then
+        if pgrep -f 'openshift-apiserver' >/dev/null 2>&1; then
+            _ocp_found=true
+            log_info "OpenShift detected via openshift-apiserver process"
+        fi
+    fi
+    # Fallback: detect OpenShift via CRI-O + openshift labels on containers
+    if ! $_ocp_found && $CRIO_DETECTED; then
+        _ocp_label=$(try_sudo_command_str "openshift label check" "crictl ps -o json 2>/dev/null | grep -c 'io.openshift'") || _ocp_label="0"
+        if [ "$_ocp_label" -gt 0 ] 2>/dev/null; then
+            _ocp_found=true
+            log_info "OpenShift detected via io.openshift container labels on CRI-O"
+        fi
+    fi
+
+    if ! $_ocp_found; then
+        log_info "OpenShift not detected"
+        return
+    fi
+
+    OCP_DETECTED=true
+    log_info "OpenShift detected"
+
+    # Ensure KUBECONFIG is set so oc/kubectl commands work without root
+    ensure_kubeconfig
+
+    # OCP version
+    _ocp_version=$(try_command_str "ocp version" "oc get clusterversion -o jsonpath='{.items[0].status.desired.version}' 2>/dev/null") || _ocp_version=""
+    if [ -z "$_ocp_version" ]; then
+        _ocp_version=$(try_command_str "ocp version via kubectl" "kubectl get clusterversion -o jsonpath='{.items[0].status.desired.version}' 2>/dev/null") || _ocp_version=""
+    fi
+    # Unprivileged fallback: extract OCP version from openshift-apiserver image tag or process
+    if [ -z "$_ocp_version" ]; then
+        _ocp_version=$(try_command_str "ocp version from crictl" "crictl ps 2>/dev/null | grep 'openshift-apiserver' | awk '{print \$2}' | grep -o 'v[0-9][0-9.]*' | head -1") || _ocp_version=""
+    fi
+    if [ -z "$_ocp_version" ]; then
+        _ocp_version=$(try_sudo_command_str "ocp version from crictl sudo" "crictl ps 2>/dev/null | grep 'openshift-apiserver' | awk '{print \$2}' | grep -o 'v[0-9][0-9.]*' | head -1") || _ocp_version=""
+    fi
+    if [ -z "$_ocp_version" ]; then
+        _ocp_version=$(try_command_str "ocp version from release file" "cat /etc/openshift-release 2>/dev/null | grep -o '[0-9][0-9.]*' | head -1") || _ocp_version=""
+    fi
+    _version="$_ocp_version"
+    _version=$(safe_json_string "$_version")
+
+    # Channel
+    _channel=$(try_command_str "ocp channel" "oc get clusterversion -o jsonpath='{.items[0].spec.channel}' 2>/dev/null") || _channel=""
+    _channel=$(safe_json_string "$_channel")
+
+    # Cluster ID
+    _cluster_id=$(try_command_str "ocp cluster id" "oc get clusterversion -o jsonpath='{.items[0].spec.clusterID}' 2>/dev/null") || _cluster_id=""
+    if [ -z "$_cluster_id" ]; then
+        _cluster_id=$(try_command_str "ocp cluster id via ns" "kubectl get ns kube-system -o jsonpath='{.metadata.uid}' 2>/dev/null") || _cluster_id=""
+    fi
+    _cluster_id_ocp="$_cluster_id"
+    _cluster_id=$(safe_json_string "$_cluster_id")
+
+    # Cluster name
+    _cluster_name=$(try_command_str "ocp cluster name" "oc get infrastructure cluster -o jsonpath='{.status.infrastructureName}' 2>/dev/null") || _cluster_name=""
+    _cluster_name=$(safe_json_string "$_cluster_name")
+
+    # Install type
+    _install_type=$(try_command_str "ocp install type" "oc get infrastructure cluster -o jsonpath='{.status.platform}' 2>/dev/null") || _install_type=""
+    # Map to IPI/UPI/assisted/SNO
+    _install_type_mapped=""
+    case "$_install_type" in
+        AWS|Azure|GCP|vSphere|OpenStack|BareMetal) _install_type_mapped="IPI" ;;
+        None) _install_type_mapped="UPI" ;;
+        *) _install_type_mapped="$_install_type" ;;
+    esac
+    _install_type_mapped=$(safe_json_string "$_install_type_mapped")
+
+    # Infra ID
+    _infra_id=$(try_command_str "ocp infra id" "oc get infrastructure cluster -o jsonpath='{.status.infrastructureName}' 2>/dev/null") || _infra_id=""
+    _infra_id=$(safe_json_string "$_infra_id")
+
+    # Current node
+    _my_hostname=$(hostname 2>/dev/null)
+    _node_id=$(safe_json_string "$_my_hostname")
+    _node_role="worker"
+    _node_avail="Unknown"
+
+    _node_labels=$(try_command_str "ocp node labels" "oc get node '$_my_hostname' -o jsonpath='{.metadata.labels}' 2>/dev/null") || _node_labels=""
+    if [ -z "$_node_labels" ]; then
+        _node_labels=$(try_command_str "ocp node labels via kubectl" "kubectl get node '$_my_hostname' -o jsonpath='{.metadata.labels}' 2>/dev/null") || _node_labels=""
+    fi
+    if echo "$_node_labels" | grep -q "node-role.kubernetes.io/master"; then
+        _node_role="master"
+    elif echo "$_node_labels" | grep -q "node-role.kubernetes.io/control-plane"; then
+        _node_role="master"
+    elif echo "$_node_labels" | grep -q "node-role.kubernetes.io/infra"; then
+        _node_role="infra"
+    fi
+
+    _node_status=$(try_command_str "ocp node status" "oc get node '$_my_hostname' -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null") || _node_status=""
+    if [ -z "$_node_status" ]; then
+        _node_status=$(try_command_str "ocp node status via kubectl" "kubectl get node '$_my_hostname' -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null") || _node_status=""
+    fi
+    # Unprivileged fallback: if kubelet is running, assume node is Ready
+    if [ -z "$_node_status" ]; then
+        if pgrep -x kubelet >/dev/null 2>&1; then
+            _node_status="True"
+            log_info "Assuming node Ready — kubelet process detected (unprivileged fallback)"
+        fi
+    fi
+    case "$_node_status" in True|true) _node_avail="Ready" ;; False|false) _node_avail="NotReady" ;; *) _node_avail="Unknown" ;; esac
+
+    # Unprivileged node role fallback: check for kube-apiserver/openshift-apiserver (control-plane indicator)
+    if [ "$_node_role" = "worker" ]; then
+        if [ -f /etc/kubernetes/manifests/kube-apiserver.yaml ] || \
+           pgrep -x kube-apiserver >/dev/null 2>&1 || \
+           pgrep -f openshift-apiserver >/dev/null 2>&1 || \
+           (ss -tln 2>/dev/null | grep -q ':6443 '); then
+            _node_role="master"
+            log_info "Detected master role via fallback (apiserver manifest/process/port)"
+        fi
+    fi
+
+    # Nodes
+    _total_nodes=0 _master_count=0 _worker_count=0
+    _master_nodes_json="[]" _worker_nodes_json="[]"
+
+    _nodes_json_raw=$(try_command_str "ocp nodes" "oc get nodes -o json 2>/dev/null") || _nodes_json_raw=""
+    if [ -z "$_nodes_json_raw" ]; then
+        _nodes_json_raw=$(try_command_str "ocp nodes via kubectl" "kubectl get nodes -o json 2>/dev/null") || _nodes_json_raw=""
+    fi
+    if [ -n "$_nodes_json_raw" ] && $HAS_JQ; then
+        _total_nodes=$(echo "$_nodes_json_raw" | jq '.items | length' 2>/dev/null) || _total_nodes=0
+        _master_nodes_json=$(echo "$_nodes_json_raw" | jq -c '[.items[] | select(.metadata.labels["node-role.kubernetes.io/master"] != null or .metadata.labels["node-role.kubernetes.io/control-plane"] != null) | {
+            name: .metadata.name, node_id: .metadata.name,
+            status: (if (.status.conditions[] | select(.type == "Ready")).status == "True" then "Ready" else "NotReady" end)
+        }]' 2>/dev/null) || _master_nodes_json="[]"
+        _worker_nodes_json=$(echo "$_nodes_json_raw" | jq -c '[.items[] | select(.metadata.labels["node-role.kubernetes.io/master"] == null and .metadata.labels["node-role.kubernetes.io/control-plane"] == null) | {
+            name: .metadata.name, node_id: .metadata.name,
+            status: (if (.status.conditions[] | select(.type == "Ready")).status == "True" then "Ready" else "NotReady" end)
+        }]' 2>/dev/null) || _worker_nodes_json="[]"
+        _master_count=$(echo "$_master_nodes_json" | jq 'length' 2>/dev/null) || _master_count=0
+        _worker_count=$(echo "$_worker_nodes_json" | jq 'length' 2>/dev/null) || _worker_count=0
+    fi
+
+    # State
+    _state="unknown"
+    _degraded_count=$(try_command_str "ocp degraded" "oc get co -o json 2>/dev/null | jq '[.items[] | select(.status.conditions[] | select(.type == \"Degraded\" and .status == \"True\"))] | length' 2>/dev/null") || _degraded_count=""
+    _progressing=$(try_command_str "ocp progressing" "oc get clusterversion -o jsonpath='{.items[0].status.conditions[?(@.type==\"Progressing\")].status}' 2>/dev/null") || _progressing=""
+    if [ "$_progressing" = "True" ]; then
+        _state="progressing"
+    elif [ -n "$_degraded_count" ] && [ "$_degraded_count" != "0" ]; then
+        _state="degraded"
+    elif [ "$_total_nodes" -gt 0 ]; then
+        _state="active"
+    fi
+    # Unprivileged fallback: if kubectl/oc failed but we detected OCP via process/labels, assume active
+    if [ "$_state" = "unknown" ]; then
+        if pgrep -x kubelet >/dev/null 2>&1; then
+            _state="active"
+            log_info "Assuming state=active — kubelet process detected (unprivileged fallback)"
+        fi
+    fi
+
+    # Project count
+    _project_count=$(try_command_str "ocp projects" "oc get projects --no-headers 2>/dev/null | wc -l") || _project_count=""
+    if [ -z "$_project_count" ]; then
+        _project_count=$(try_command_str "namespaces" "kubectl get namespaces --no-headers 2>/dev/null | wc -l") || _project_count="0"
+    fi
+    _project_count=$(num_or_default "$_project_count" 0)
+
+    # Route count
+    _route_count=$(try_command_str "ocp routes" "oc get routes --all-namespaces --no-headers 2>/dev/null | wc -l") || _route_count="0"
+    _route_count=$(num_or_default "$_route_count" 0)
+
+    # Build config count
+    _bc_count=$(try_command_str "ocp build configs" "oc get bc --all-namespaces --no-headers 2>/dev/null | wc -l") || _bc_count="0"
+    _bc_count=$(num_or_default "$_bc_count" 0)
+
+    # Operator count
+    _operator_count=$(try_command_str "ocp operators" "oc get co --no-headers 2>/dev/null | wc -l") || _operator_count="0"
+    _operator_count=$(num_or_default "$_operator_count" 0)
+
+    # OperatorHub enabled
+    _ophub_enabled=false
+    _ophub=$(try_command_str "ocp operatorhub" "oc get operatorhub cluster -o jsonpath='{.spec.disableAllDefaultSources}' 2>/dev/null") || _ophub=""
+    case "$_ophub" in true|True) _ophub_enabled=false ;; *) _ophub_enabled=true ;; esac
+
+    # SCC count
+    _scc_count=$(try_command_str "ocp scc" "oc get scc --no-headers 2>/dev/null | wc -l") || _scc_count="0"
+    _scc_count=$(num_or_default "$_scc_count" 0)
+
+    # Cluster operators degraded/available
+    _co_degraded=$(num_or_default "$_degraded_count" 0)
+    _co_available=$(try_command_str "ocp co available" "oc get co -o json 2>/dev/null | jq '[.items[] | select(.status.conditions[] | select(.type == \"Available\" and .status == \"True\"))] | length' 2>/dev/null") || _co_available="0"
+    _co_available=$(num_or_default "$_co_available" 0)
+
+    # Resource usage
+    _res=$(get_process_resource_usage "kubelet")
+    _ocp_cpu=$(echo "$_res" | awk '{print $1}')
+    _ocp_mem=$(echo "$_res" | awk '{print $2}')
+
+    OCP_JSON="{
+          \"name\": \"openshift\",
+          \"orchestrator_type\": \"openshift\",
+          \"version\": \"${_version}\",
+          \"cluster_id\": \"${_cluster_id}\",
+          \"cluster_name\": \"${_cluster_name}\",
+          \"state\": \"${_state}\",
+          \"current_node\": {
+            \"node_id\": \"${_node_id}\",
+            \"role\": \"${_node_role}\",
+            \"availability\": \"${_node_avail}\"
+          },
+          \"nodes\": {
+            \"total_count\": ${_total_nodes},
+            \"master_count\": ${_master_count},
+            \"worker_count\": ${_worker_count},
+            \"master_nodes\": ${_master_nodes_json},
+            \"worker_nodes\": ${_worker_nodes_json}
+          },
+          \"platform_specific\": {
+            \"swarm\": null,
+            \"kubernetes\": null,
+            \"openshift\": {
+              \"ocp_version\": \"$(safe_json_string "$_ocp_version")\",
+              \"channel\": \"${_channel}\",
+              \"cluster_id\": \"$(safe_json_string "$_cluster_id_ocp")\",
+              \"infra_id\": \"${_infra_id}\",
+              \"install_type\": \"${_install_type_mapped}\",
+              \"project_count\": ${_project_count},
+              \"route_count\": ${_route_count},
+              \"build_config_count\": ${_bc_count},
+              \"operator_count\": ${_operator_count},
+              \"operator_hub_enabled\": ${_ophub_enabled},
+              \"scc_count\": ${_scc_count},
+              \"cluster_operators_degraded\": ${_co_degraded},
+              \"cluster_operators_available\": ${_co_available}
+            },
+            \"tanzu\": null
+          },
+          \"resource_usage\": {
+            \"cpu_cores\": ${_ocp_cpu},
+            \"memory_mb\": ${_ocp_mem}
+          }
+        }"
+    log_info "OpenShift discovery complete"
+}
+
+# ========================
+# 2.4d Tanzu TKG
+# ========================
+TANZU_DETECTED=false
+TANZU_JSON=""
+
+discover_tanzu() {
+    log_info "=== Discovering VMware Tanzu TKG ==="
+
+    _tanzu_found=false
+    if command -v tanzu >/dev/null 2>&1 && try_command "tanzu version" tanzu version >/dev/null 2>&1; then
+        _tanzu_found=true
+    fi
+    # Check for TKG-specific labels on nodes
+    if ! $_tanzu_found && $K8S_DETECTED; then
+        _tkr_label=$(try_command_str "tanzu tkr label" "kubectl get nodes -o jsonpath='{.items[0].metadata.labels}' 2>/dev/null | grep -o 'run.tanzu.vmware.com'") || _tkr_label=""
+        if [ -n "$_tkr_label" ]; then
+            _tanzu_found=true
+        fi
+    fi
+    # Check for vmware-system namespaces
+    if ! $_tanzu_found; then
+        _vmw_ns=$(try_command_str "vmware namespaces" "kubectl get ns 2>/dev/null | grep 'vmware-system'") || _vmw_ns=""
+        if [ -n "$_vmw_ns" ]; then
+            _tanzu_found=true
+        fi
+    fi
+
+    if ! $_tanzu_found; then
+        log_info "VMware Tanzu TKG not detected"
+        return
+    fi
+
+    TANZU_DETECTED=true
+    log_info "VMware Tanzu TKG detected"
+
+    # Ensure KUBECONFIG is set so kubectl commands work without root
+    ensure_kubeconfig
+
+    # TKG version
+    _tkg_version=$(try_command_str "tanzu version" "tanzu version 2>/dev/null | grep 'version' | head -1 | awk '{print \$NF}'") || _tkg_version=""
+    _version="$_tkg_version"
+    _version=$(safe_json_string "$_version")
+    _tkg_version=$(safe_json_string "$_tkg_version")
+
+    # Version from kubectl
+    _k8s_ver=$(try_command_str "kubectl version tanzu" "kubectl version -o json 2>/dev/null | grep -o '\"gitVersion\":\"[^\"]*\"' | tail -1 | sed 's/\"gitVersion\":\"//;s/\"//'") || _k8s_ver=""
+    [ -z "$_version" ] && _version=$(safe_json_string "$_k8s_ver")
+
+    # TKR version
+    _tkr_version=$(try_command_str "tkr version" "kubectl get tkr -o jsonpath='{.items[0].metadata.name}' 2>/dev/null") || _tkr_version=""
+    if [ -z "$_tkr_version" ]; then
+        _tkr_version=$(try_command_str "tkr from node label" "kubectl get nodes -o jsonpath='{.items[0].metadata.labels.run\\.tanzu\\.vmware\\.com/tkr}' 2>/dev/null") || _tkr_version=""
+    fi
+    _tkr_version=$(safe_json_string "$_tkr_version")
+
+    # Cluster class
+    _cluster_class=$(try_command_str "tanzu cluster class" "kubectl get cluster -A -o jsonpath='{.items[0].spec.topology.class}' 2>/dev/null") || _cluster_class=""
+    _cluster_class=$(safe_json_string "$_cluster_class")
+
+    # Management cluster
+    _mgmt_cluster=$(try_command_str "tanzu mgmt cluster" "tanzu management-cluster get 2>/dev/null | grep 'NAME' -A1 | tail -1 | awk '{print \$1}'") || _mgmt_cluster=""
+    _mgmt_cluster=$(safe_json_string "$_mgmt_cluster")
+
+    # Supervisor cluster
+    _supervisor=""
+    _sv_ns=$(try_command_str "supervisor ns" "kubectl get ns 2>/dev/null | grep 'vmware-system-tkg' | awk '{print \$1}'") || _sv_ns=""
+    [ -n "$_sv_ns" ] && _supervisor="$_sv_ns"
+    _supervisor=$(safe_json_string "$_supervisor")
+
+    # vsphere namespace
+    _vsphere_ns=$(try_command_str "vsphere namespace" "kubectl get ns -l 'vSphereClusterID' -o jsonpath='{.items[0].metadata.name}' 2>/dev/null") || _vsphere_ns=""
+    _vsphere_ns=$(safe_json_string "$_vsphere_ns")
+
+    # Cluster ID / name
+    _cluster_id=$(try_command_str "tanzu cluster id" "kubectl get ns kube-system -o jsonpath='{.metadata.uid}' 2>/dev/null") || _cluster_id=""
+    _cluster_id=$(safe_json_string "$_cluster_id")
+    _cluster_name=$(try_command_str "tanzu cluster name" "kubectl config current-context 2>/dev/null") || _cluster_name=""
+    _cluster_name=$(safe_json_string "$_cluster_name")
+
+    # Workload cluster count
+    _wl_count=$(try_command_str "tanzu workload clusters" "tanzu cluster list 2>/dev/null | tail -n +2 | wc -l") || _wl_count="0"
+    _wl_count=$(num_or_default "$_wl_count" 0)
+
+    # Infrastructure provider
+    _infra_provider=$(try_command_str "tanzu infra provider" "kubectl get infrastructure -o jsonpath='{.items[0].spec.cloudControllerManager}' 2>/dev/null") || _infra_provider=""
+    if [ -z "$_infra_provider" ]; then
+        _infra_provider=$(try_command_str "tanzu infra from node" "kubectl get nodes -o jsonpath='{.items[0].spec.providerID}' 2>/dev/null | sed 's/:.*//;s/\/.*//'") || _infra_provider=""
+    fi
+    case "$(echo "$_infra_provider" | tr '[:upper:]' '[:lower:]')" in
+        *vsphere*) _infra_provider="vsphere" ;;
+        *aws*)     _infra_provider="aws" ;;
+        *azure*)   _infra_provider="azure" ;;
+        *)         _infra_provider="" ;;
+    esac
+    _infra_provider=$(safe_json_string "$_infra_provider")
+
+    # CEIP & Pinniped
+    _ceip=false
+    _ceip_check=$(try_command_str "tanzu ceip" "tanzu telemetry status 2>/dev/null") || _ceip_check=""
+    case "$_ceip_check" in *Opt-in*|*"opted in"*) _ceip=true ;; esac
+
+    _pinniped=false
+    _pinniped_check=$(try_command_str "pinniped" "kubectl get deploy -n pinniped-supervisor 2>/dev/null") || _pinniped_check=""
+    [ -n "$_pinniped_check" ] && _pinniped=true
+
+    # Current node
+    _my_hostname=$(hostname 2>/dev/null)
+    _node_id=$(safe_json_string "$_my_hostname")
+    _node_role="worker"
+    _node_avail="Unknown"
+    _node_labels=$(try_command_str "tanzu node labels" "kubectl get node '$_my_hostname' -o jsonpath='{.metadata.labels}' 2>/dev/null") || _node_labels=""
+    if echo "$_node_labels" | grep -q "node-role.kubernetes.io/control-plane"; then
+        _node_role="control-plane"
+    fi
+    _node_status=$(try_command_str "tanzu node status" "kubectl get node '$_my_hostname' -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null") || _node_status=""
+    # Unprivileged fallback: if kubelet is running, assume node is Ready
+    if [ -z "$_node_status" ]; then
+        if pgrep -x kubelet >/dev/null 2>&1; then
+            _node_status="True"
+            log_info "Assuming node Ready — kubelet process detected (unprivileged fallback)"
+        fi
+    fi
+    case "$_node_status" in True|true) _node_avail="Ready" ;; False|false) _node_avail="NotReady" ;; *) _node_avail="Unknown" ;; esac
+
+    # Unprivileged node role fallback: check for kube-apiserver (control-plane indicator)
+    if [ "$_node_role" = "worker" ]; then
+        if [ -f /etc/kubernetes/manifests/kube-apiserver.yaml ] || \
+           pgrep -x kube-apiserver >/dev/null 2>&1 || \
+           (ss -tln 2>/dev/null | grep -q ':6443 '); then
+            _node_role="control-plane"
+            log_info "Detected control-plane role via fallback (apiserver manifest/process/port)"
+        fi
+    fi
+
+    # Nodes
+    _total_nodes=0 _master_count=0 _worker_count=0
+    _master_nodes_json="[]" _worker_nodes_json="[]"
+    _nodes_json_raw=$(try_command_str "tanzu nodes" "kubectl get nodes -o json 2>/dev/null") || _nodes_json_raw=""
+    if [ -n "$_nodes_json_raw" ] && $HAS_JQ; then
+        _total_nodes=$(echo "$_nodes_json_raw" | jq '.items | length' 2>/dev/null) || _total_nodes=0
+        _master_nodes_json=$(echo "$_nodes_json_raw" | jq -c '[.items[] | select(.metadata.labels["node-role.kubernetes.io/control-plane"] != null) | {
+            name: .metadata.name, node_id: .metadata.name,
+            status: (if (.status.conditions[] | select(.type == "Ready")).status == "True" then "Ready" else "NotReady" end)
+        }]' 2>/dev/null) || _master_nodes_json="[]"
+        _worker_nodes_json=$(echo "$_nodes_json_raw" | jq -c '[.items[] | select(.metadata.labels["node-role.kubernetes.io/control-plane"] == null) | {
+            name: .metadata.name, node_id: .metadata.name,
+            status: (if (.status.conditions[] | select(.type == "Ready")).status == "True" then "Ready" else "NotReady" end)
+        }]' 2>/dev/null) || _worker_nodes_json="[]"
+        _master_count=$(echo "$_master_nodes_json" | jq 'length' 2>/dev/null) || _master_count=0
+        _worker_count=$(echo "$_worker_nodes_json" | jq 'length' 2>/dev/null) || _worker_count=0
+    fi
+
+    # State
+    _state="unknown"
+    if [ "$_total_nodes" -gt 0 ]; then
+        _state="active"
+    fi
+    # Unprivileged fallback: if kubectl failed but we detected Tanzu, assume active if kubelet runs
+    if [ "$_state" = "unknown" ]; then
+        if pgrep -x kubelet >/dev/null 2>&1; then
+            _state="active"
+            log_info "Assuming state=active — kubelet process detected (unprivileged fallback)"
+        fi
+    fi
+
+    # Resource usage
+    _res=$(get_process_resource_usage "kubelet")
+    _tanzu_cpu=$(echo "$_res" | awk '{print $1}')
+    _tanzu_mem=$(echo "$_res" | awk '{print $2}')
+
+    TANZU_JSON="{
+          \"name\": \"tanzu\",
+          \"orchestrator_type\": \"tanzu\",
+          \"version\": \"${_version}\",
+          \"cluster_id\": \"${_cluster_id}\",
+          \"cluster_name\": \"${_cluster_name}\",
+          \"state\": \"${_state}\",
+          \"current_node\": {
+            \"node_id\": \"${_node_id}\",
+            \"role\": \"${_node_role}\",
+            \"availability\": \"${_node_avail}\"
+          },
+          \"nodes\": {
+            \"total_count\": ${_total_nodes},
+            \"master_count\": ${_master_count},
+            \"worker_count\": ${_worker_count},
+            \"master_nodes\": ${_master_nodes_json},
+            \"worker_nodes\": ${_worker_nodes_json}
+          },
+          \"platform_specific\": {
+            \"swarm\": null,
+            \"kubernetes\": null,
+            \"openshift\": null,
+            \"tanzu\": {
+              \"tkg_version\": \"${_tkg_version}\",
+              \"tkr_version\": \"${_tkr_version}\",
+              \"cluster_class\": \"${_cluster_class}\",
+              \"management_cluster\": \"${_mgmt_cluster}\",
+              \"supervisor_cluster\": \"${_supervisor}\",
+              \"vsphere_namespace\": \"${_vsphere_ns}\",
+              \"workload_cluster_count\": ${_wl_count},
+              \"infrastructure_provider\": \"${_infra_provider}\",
+              \"ceip_enabled\": ${_ceip},
+              \"pinniped_enabled\": ${_pinniped}
+            }
+          },
+          \"resource_usage\": {
+            \"cpu_cores\": ${_tanzu_cpu},
+            \"memory_mb\": ${_tanzu_mem}
+          }
+        }"
+    log_info "VMware Tanzu TKG discovery complete"
+}
+
+# ========================
+# 2.5 Services
+# ========================
+SERVICES_JSON=""
+
+discover_services() {
+    log_info "=== Discovering services ==="
+    _services=""
+
+    for _svc_name in containerd docker crio podman kubelet; do
+        _active="inactive"
+        _enabled="disabled"
+        _ports_json="[]"
+
+        # systemctl
+        _sys_active=$(try_command_str "systemctl is-active $_svc_name" "systemctl is-active $_svc_name 2>/dev/null") || _sys_active=""
+        if [ -n "$_sys_active" ]; then
+            _active="$_sys_active"
+        else
+            # Fallback: service command
+            _svc_status=$(try_command_str "service $_svc_name status" "service $_svc_name status 2>/dev/null") || _svc_status=""
+            if echo "$_svc_status" | grep -qi "running"; then
+                _active="active"
+            elif echo "$_svc_status" | grep -qi "stopped\|dead"; then
+                _active="inactive"
+            fi
+            # Fallback: check init.d
+            if [ -z "$_sys_active" ] && [ -z "$_svc_status" ]; then
+                if [ -f "/etc/init.d/$_svc_name" ]; then
+                    _init_status=$(try_command_str "init.d $_svc_name" "/etc/init.d/$_svc_name status 2>/dev/null") || _init_status=""
+                    if echo "$_init_status" | grep -qi "running"; then
+                        _active="active"
+                    fi
+                fi
+            fi
+            # Fallback: check if the process is running (pgrep)
+            if [ "$_active" = "inactive" ]; then
+                if pgrep -x "$_svc_name" >/dev/null 2>&1 || pgrep -x "${_svc_name}d" >/dev/null 2>&1; then
+                    _active="active"
+                fi
+            fi
+        fi
+
+        _sys_enabled=$(try_command_str "systemctl is-enabled $_svc_name" "systemctl is-enabled $_svc_name 2>/dev/null") || _sys_enabled=""
+        if [ -n "$_sys_enabled" ]; then
+            _enabled="$_sys_enabled"
+        else
+            # Fallback: check for init.d symlinks if no systemctl
+            if [ -f "/etc/init.d/$_svc_name" ]; then
+                _enabled="enabled"
+            fi
+        fi
+
+        # Skip services that are not present on this machine
+        # (both inactive and disabled means the service unit doesn't exist or is completely absent)
+        if [ "$_active" = "inactive" ] && [ "$_enabled" = "disabled" ]; then
+            log_info "Skipping service $_svc_name — not installed (inactive + disabled)"
+            continue
+        fi
+
+        # Listening ports — discover for ALL active services
+        if [ "$_active" = "active" ]; then
+            _port_list=""
+            # Build the process name pattern to match in ss/netstat output
+            # IMPORTANT: patterns must match the exact daemon process, not child shims
+            _proc_pattern="$_svc_name"
+            case "$_svc_name" in
+                docker)    _proc_pattern="dockerd\|docker-proxy" ;;
+                containerd) _proc_pattern="\"containerd\"" ;;
+                crio)      _proc_pattern="crio" ;;
+                podman)    _proc_pattern="podman" ;;
+                kubelet)   _proc_pattern="kubelet" ;;
+            esac
+
+            # Method 1: ss with sudo (needs -p for process names)
+            if [ -z "$_port_list" ]; then
+                _port_list=$(try_sudo_command_str "$_svc_name ports via ss" "ss -tlnp 2>/dev/null | grep -E '$_proc_pattern' | awk '{print \$4}' | grep -oE '[0-9]+$' | sort -un") || _port_list=""
+            fi
+            # Method 2: netstat with sudo
+            if [ -z "$_port_list" ]; then
+                _port_list=$(try_sudo_command_str "$_svc_name ports via netstat" "netstat -tlnp 2>/dev/null | grep -E '$_proc_pattern' | awk '{print \$4}' | grep -oE '[0-9]+$' | sort -un") || _port_list=""
+            fi
+            # Method 3: ss without sudo (may not show process names, but still try)
+            if [ -z "$_port_list" ]; then
+                _port_list=$(try_command_str "$_svc_name ports ss no-sudo" "ss -tlnp 2>/dev/null | grep -E '$_proc_pattern' | awk '{print \$4}' | grep -oE '[0-9]+$' | sort -un") || _port_list=""
+            fi
+            # Method 4: /proc/pid/fd — match PIDs of the service process to sockets
+            if [ -z "$_port_list" ]; then
+                _pids=$(pgrep -x "$_svc_name" 2>/dev/null || pgrep -x "${_svc_name}d" 2>/dev/null) || _pids=""
+                if [ -n "$_pids" ]; then
+                    _fd_ports=""
+                    for _pid in $_pids; do
+                        _tcp_entries=$(try_command_str "$_svc_name /proc/$_pid fd" "ls -la /proc/$_pid/fd 2>/dev/null | grep socket | sed 's/.*socket:\[//;s/\]//' | while read _inode; do grep \"\$_inode\" /proc/net/tcp 2>/dev/null; done | awk '{print \$2}' | grep -oE ':[0-9A-F]+$' | while read _hex; do printf '%d\n' \"0x\$(echo \$_hex | tr -d ':')\"; done | sort -un") || true
+                        if [ -n "$_tcp_entries" ]; then
+                            _fd_ports="${_fd_ports}${_tcp_entries}
+"
+                        fi
+                    done
+                    _port_list=$(echo "$_fd_ports" | grep -v '^$' | sort -un)
+                fi
+            fi
+            # Method 5: /proc/net/tcp + /proc/<pid>/fd via sudo
+            if [ -z "$_port_list" ]; then
+                _pids=$(pgrep -x "$_svc_name" 2>/dev/null || pgrep -x "${_svc_name}d" 2>/dev/null) || _pids=""
+                if [ -n "$_pids" ]; then
+                    _fd_ports=""
+                    for _pid in $_pids; do
+                        _tcp_entries=$(try_sudo_command_str "$_svc_name /proc/$_pid fd (sudo)" "ls -la /proc/$_pid/fd 2>/dev/null | grep socket | sed 's/.*socket:\[//;s/\]//' | while read _inode; do grep \"\$_inode\" /proc/net/tcp 2>/dev/null; done | awk '{print \$2}' | grep -oE ':[0-9A-F]+$' | while read _hex; do printf '%d\n' \"0x\$(echo \$_hex | tr -d ':')\"; done | sort -un") || true
+                        if [ -n "$_tcp_entries" ]; then
+                            _fd_ports="${_fd_ports}${_tcp_entries}
+"
+                        fi
+                    done
+                    _port_list=$(echo "$_fd_ports" | grep -v '^$' | sort -un)
+                fi
+            fi
+            # Method 6: Well-known port probe via ss/netstat (no -p, no sudo needed)
+            # When process-matching methods fail (non-sudo), check if known ports
+            # for this service are actually listening on the host.
+            if [ -z "$_port_list" ]; then
+                _known_ports=""
+                case "$_svc_name" in
+                    docker)     _known_ports="2375 2376 2377 7946" ;;
+                    containerd) _known_ports="" ;;
+                    crio)       _known_ports="10010" ;;
+                    podman)     _known_ports="" ;;
+                    kubelet)    _known_ports="10250 10255 10248" ;;
+                esac
+                for _kp in $_known_ports; do
+                    if ss -tln 2>/dev/null | grep -q ":${_kp} " || netstat -tln 2>/dev/null | grep -q ":${_kp} "; then
+                        _port_list="${_port_list}${_kp}
+"
+                    fi
+                done
+                _port_list=$(echo "$_port_list" | grep -v '^$')
+            fi
+            # Method 7: PID-based port scan via /proc/net/tcp (non-sudo fallback)
+            # Read all listening sockets from /proc/net/tcp, convert hex local_address
+            # ports to decimal, then check if the PID has those socket inodes open
+            # using /proc/<pid>/net/tcp6 as additional source
+            if [ -z "$_port_list" ]; then
+                _pids=$(pgrep -x "$_svc_name" 2>/dev/null || pgrep -x "${_svc_name}d" 2>/dev/null) || _pids=""
+                if [ -n "$_pids" ]; then
+                    # Get all listening (state 0A) local ports from /proc/net/tcp
+                    _all_listen_ports=""
+                    if [ -r /proc/net/tcp ]; then
+                        _all_listen_ports=$(awk '$4 == "0A" {split($2, a, ":"); cmd="printf \"%d\\n\" 0x" a[2]; cmd | getline p; close(cmd); print p}' /proc/net/tcp 2>/dev/null | sort -un) || _all_listen_ports=""
+                    fi
+                    if [ -n "$_all_listen_ports" ]; then
+                        _known_ports=""
+                        case "$_svc_name" in
+                            docker)     _known_ports="2375 2376 2377 7946 4789" ;;
+                            kubelet)    _known_ports="10250 10255 10248 10249" ;;
+                            crio)       _known_ports="10010 9090 9537" ;;
+                            containerd) _known_ports="10010" ;;
+                            podman)     _known_ports="" ;;
+                        esac
+                        for _kp in $_known_ports; do
+                            if echo "$_all_listen_ports" | grep -qw "$_kp"; then
+                                _port_list="${_port_list}${_kp}
+"
+                            fi
+                        done
+                    fi
+                    # Also try /proc/net/tcp6 for IPv6 listeners
+                    if [ -z "$_port_list" ] && [ -r /proc/net/tcp6 ]; then
+                        _all_listen_ports6=$(awk '$4 == "0A" {split($2, a, ":"); cmd="printf \"%d\\n\" 0x" a[2]; cmd | getline p; close(cmd); print p}' /proc/net/tcp6 2>/dev/null | sort -un) || _all_listen_ports6=""
+                        if [ -n "$_all_listen_ports6" ]; then
+                            _known_ports=""
+                            case "$_svc_name" in
+                                docker)     _known_ports="2375 2376 2377 7946" ;;
+                                kubelet)    _known_ports="10250 10255 10248 10249" ;;
+                                crio)       _known_ports="10010 9090 9537" ;;
+                                containerd) _known_ports="10010" ;;
+                                podman)     _known_ports="" ;;
+                            esac
+                            for _kp in $_known_ports; do
+                                if echo "$_all_listen_ports6" | grep -qw "$_kp"; then
+                                    _port_list="${_port_list}${_kp}
+"
+                                fi
+                            done
+                        fi
+                    fi
+                    _port_list=$(echo "$_port_list" | grep -v '^$' | sort -un)
+                fi
+            fi
+
+            if [ -n "$_port_list" ]; then
+                _ports_json="[$(echo "$_port_list" | {
+                    _pf=true
+                    while read -r _port; do
+                        [ -z "$_port" ] && continue
+                        # Validate the value is a number
+                        case "$_port" in
+                            (*[!0-9]*) continue ;;
+                        esac
+                        if ! $_pf; then printf ','; fi; _pf=false
+                        printf '{"port":%s,"protocol":"tcp"}' "$_port"
+                    done
+                })]"
+            fi
+        fi
+
+        _svc_entry="{\"name\":\"${_svc_name}\",\"active\":\"$(safe_json_string "$_active")\",\"enabled\":\"$(safe_json_string "$_enabled")\",\"listening_ports\":${_ports_json}}"
+
+        if [ -z "$_services" ]; then
+            _services="$_svc_entry"
+        else
+            _services="${_services},${_svc_entry}"
+        fi
+    done
+
+    SERVICES_JSON="[${_services}]"
+    log_info "Services discovery complete"
+}
+
+# --------------------------------------------------------------------------
+# 3. Main — Assemble JSON
+# --------------------------------------------------------------------------
+assemble_output() {
+    log_info "=== Assembling final JSON output ==="
+
+    # Container runtimes array
+    _runtimes_json=""
+    _rt_first=true
+    if $CONTAINERD_DETECTED && [ -n "$CONTAINERD_RUNTIME_JSON" ]; then
+        # Skip containerd if Docker is detected and containerd is purely Docker's
+        # backend (0 containers, 0 images after moby namespace filtering).
+        _skip_containerd=false
+        if $DOCKER_DETECTED; then
+            _ctrd_cc=0; _ctrd_ic=0
+            if $HAS_JQ; then
+                _ctrd_cc=$(echo "$CONTAINERD_RUNTIME_JSON" | jq -r '.container_count // 0' 2>/dev/null) || _ctrd_cc=0
+                _ctrd_ic=$(echo "$CONTAINERD_RUNTIME_JSON" | jq -r '.image_count // 0' 2>/dev/null) || _ctrd_ic=0
+            fi
+            _ctrd_cc=$(num_or_default "$_ctrd_cc" 0)
+            _ctrd_ic=$(num_or_default "$_ctrd_ic" 0)
+            if [ "$_ctrd_cc" = "0" ] && [ "$_ctrd_ic" = "0" ]; then
+                _skip_containerd=true
+                log_info "Skipping system containerd runtime — Docker detected and containerd has 0 containers, 0 images (Docker backend only)"
+            else
+                log_info "Both Docker and containerd detected — reporting both (containerd has $_ctrd_cc containers, $_ctrd_ic images)"
+            fi
+        fi
+        if ! $_skip_containerd; then
+            if $_rt_first; then _rt_first=false; else _runtimes_json="${_runtimes_json},"; fi
+            _runtimes_json="${_runtimes_json}${CONTAINERD_RUNTIME_JSON}"
+        fi
+    fi
+    if $DOCKER_DETECTED && [ -n "$DOCKER_RUNTIME_JSON" ]; then
+        if $_rt_first; then _rt_first=false; else _runtimes_json="${_runtimes_json},"; fi
+        _runtimes_json="${_runtimes_json}${DOCKER_RUNTIME_JSON}"
+    fi
+    if $CRIO_DETECTED && [ -n "$CRIO_RUNTIME_JSON" ]; then
+        if $_rt_first; then _rt_first=false; else _runtimes_json="${_runtimes_json},"; fi
+        _runtimes_json="${_runtimes_json}${CRIO_RUNTIME_JSON}"
+    fi
+    if $PODMAN_DETECTED && [ -n "$PODMAN_RUNTIME_JSON" ]; then
+        if $_rt_first; then _rt_first=false; else _runtimes_json="${_runtimes_json},"; fi
+        _runtimes_json="${_runtimes_json}${PODMAN_RUNTIME_JSON}"
+    fi
+    # Append any extra containerd instances (MicroK8s, k3s, etc.)
+    if [ -n "$EXTRA_CONTAINERD_RUNTIMES_JSON" ]; then
+        if $_rt_first; then _rt_first=false; else _runtimes_json="${_runtimes_json},"; fi
+        _runtimes_json="${_runtimes_json}${EXTRA_CONTAINERD_RUNTIMES_JSON}"
+    fi
+    _runtimes_json="[${_runtimes_json}]"
+
+    # Orchestrators array
+    _orch_json=""
+    _orch_first=true
+    if $SWARM_DETECTED && [ -n "$SWARM_JSON" ]; then
+        if $_orch_first; then _orch_first=false; else _orch_json="${_orch_json},"; fi
+        _orch_json="${_orch_json}${SWARM_JSON}"
+    fi
+    if $K8S_DETECTED && [ -n "$K8S_JSON" ]; then
+        if $_orch_first; then _orch_first=false; else _orch_json="${_orch_json},"; fi
+        _orch_json="${_orch_json}${K8S_JSON}"
+    fi
+    if $OCP_DETECTED && [ -n "$OCP_JSON" ]; then
+        if $_orch_first; then _orch_first=false; else _orch_json="${_orch_json},"; fi
+        _orch_json="${_orch_json}${OCP_JSON}"
+    fi
+    if $TANZU_DETECTED && [ -n "$TANZU_JSON" ]; then
+        if $_orch_first; then _orch_first=false; else _orch_json="${_orch_json},"; fi
+        _orch_json="${_orch_json}${TANZU_JSON}"
+    fi
+    _orch_json="[${_orch_json}]"
+
+    # Check if we discovered anything
+    if ! $DOCKER_DETECTED && ! $CONTAINERD_DETECTED && ! $CRIO_DETECTED && ! $PODMAN_DETECTED; then
+        log_error "No container runtimes detected"
+        EXIT_CODE=1
+    fi
+
+    # Assemble final JSON
+    cat > "$OUTPUT_FILE" <<FINALEOF
+{
+  "armResources": [
+    {
+      "type": "",
+      "name": "",
+      "apiVersion": "",
+      "properties": {
+        "schema_version": "${SCHEMA_VERSION}",
+        "timestamp": "${TIMESTAMP}",
+        "host_info": ${HOST_INFO_JSON},
+        "hypervisor": ${HYPERVISOR_JSON},
+        "network": ${NETWORK_JSON},
+        "container_runtimes": ${_runtimes_json},
+        "orchestrators": ${_orch_json},
+        "services": ${SERVICES_JSON}
+      }
+    }
+  ]
+}
+FINALEOF
+
+    # Validate JSON if jq is available
+    if $HAS_JQ; then
+        if jq . "$OUTPUT_FILE" > /dev/null 2>&1; then
+            log_info "Output JSON is valid"
+            # Pretty-print in place
+            _tmp=$(jq . "$OUTPUT_FILE" 2>/dev/null)
+            if [ -n "$_tmp" ]; then
+                echo "$_tmp" > "$OUTPUT_FILE"
+            fi
+        else
+            log_error "Output JSON is INVALID — attempting repair"
+            EXIT_CODE=2
+        fi
+    fi
+
+    log_info "Output written to ${OUTPUT_FILE}"
+}
+
+# --------------------------------------------------------------------------
+# 4. Entry Point
+# --------------------------------------------------------------------------
 main() {
-    log_info "===== Container Discovery Script Started ====="
-    log_info "Script version: 1.0.0"
-    log_info "Timestamp: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    log_info "Running as user: $(whoami)"
-    log_info "Privilege level: $(check_privilege)"
+    init_files
+    check_privilege
 
-    # Discover all components
+    log_info "============================="
+    log_info "Container Discovery Script"
+    log_info "Schema Version: ${SCHEMA_VERSION}"
+    log_info "Timestamp: ${TIMESTAMP}"
+    log_info "============================="
+
+    # Run all discovery modules
     discover_host_info
     discover_hypervisor
     discover_network
-    detect_container_runtimes
-    detect_orchestrators
+
+    # Container runtimes
+    discover_containerd
+    discover_extra_containerd
+    discover_docker
+    discover_crio
+    discover_podman
+
+    # Orchestrators (order matters: detect OpenShift before generic K8s to avoid
+    # double-counting when openshift IS kubernetes)
+    discover_docker_swarm
+    discover_openshift
+    if ! $OCP_DETECTED; then
+        # Only discover generic K8s if OpenShift is NOT detected (OpenShift IS K8s)
+        discover_kubernetes
+    fi
+    discover_tanzu
+
+    # Cleanup temp kubeconfig after all orchestrator discovery is done
+    cleanup_kubeconfig
+
+    # Services
     discover_services
 
-    # Build and output JSON
-    build_final_json
+    # Assemble output
+    assemble_output
 
-    log_info "===== Container Discovery Script Completed ====="
-    log_info "Output written to: $OUTPUT_FILE"
-    log_info "Errors logged to: $ERROR_FILE"
-    log_info "Debug logs written to: $DEBUG_FILE"
-    log_info "Exit code: $EXIT_CODE"
-
-    # Output JSON to stdout as well
-    cat "$OUTPUT_FILE"
-
+    log_info "Discovery complete. Exit code: ${EXIT_CODE}"
     return $EXIT_CODE
 }
 
-# Entry point
 main "$@"
+exit $?
