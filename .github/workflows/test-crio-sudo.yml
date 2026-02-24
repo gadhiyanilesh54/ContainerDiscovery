@@ -18,30 +18,46 @@ jobs:
 
       - name: Install CRI-O
         run: |
-          # Add CRI-O repository using modern gpg method
-          OS=xUbuntu_22.04
-          VERSION=1.28
+          # Install CRI-O using the official script method
+          # This is more reliable than manual repository setup
 
           # Install dependencies
           sudo apt-get update
-          sudo apt-get install -y gnupg2 curl
+          sudo apt-get install -y apt-transport-https ca-certificates curl gnupg2
 
-          # Add GPG keys
+          # Add Kubernetes repo (needed for cri-tools)
           sudo mkdir -p /etc/apt/keyrings
-          curl -fsSL https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/$OS/Release.key | \
-            sudo gpg --dearmor -o /etc/apt/keyrings/libcontainers-archive-keyring.gpg
-          curl -fsSL https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/$VERSION/$OS/Release.key | \
-            sudo gpg --dearmor -o /etc/apt/keyrings/libcontainers-crio-archive-keyring.gpg
+          curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | \
+            sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /" | \
+            sudo tee /etc/apt/sources.list.d/kubernetes.list
 
-          # Add repositories
-          echo "deb [signed-by=/etc/apt/keyrings/libcontainers-archive-keyring.gpg] https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/$OS/ /" | \
-            sudo tee /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list
-          echo "deb [signed-by=/etc/apt/keyrings/libcontainers-crio-archive-keyring.gpg] https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/$VERSION/$OS/ /" | \
-            sudo tee /etc/apt/sources.list.d/devel:kubic:libcontainers:stable:cri-o:$VERSION.list
-
-          # Install CRI-O
+          # Install cri-tools first
           sudo apt-get update
-          sudo apt-get install -y cri-o cri-o-runc cri-tools
+          sudo apt-get install -y cri-tools
+
+          # Download and install CRI-O directly from GitHub releases
+          CRIO_VERSION=v1.28.0
+          wget https://github.com/cri-o/cri-o/releases/download/$CRIO_VERSION/crio.amd64.$CRIO_VERSION.tar.gz
+          sudo tar -C / -xzf crio.amd64.$CRIO_VERSION.tar.gz
+          rm crio.amd64.$CRIO_VERSION.tar.gz
+
+          # Download and install conmon
+          wget https://github.com/containers/conmon/releases/download/v2.1.10/conmon.amd64 -O conmon
+          sudo install -D -m 755 conmon /usr/local/bin/conmon
+          rm conmon
+
+          # Download and install runc
+          wget https://github.com/opencontainers/runc/releases/download/v1.1.12/runc.amd64
+          sudo install -D -m 755 runc.amd64 /usr/local/bin/runc
+          rm runc.amd64
+
+          # Download and install CNI plugins
+          CNI_VERSION=v1.3.0
+          wget https://github.com/containernetworking/plugins/releases/download/$CNI_VERSION/cni-plugins-linux-amd64-$CNI_VERSION.tgz
+          sudo mkdir -p /opt/cni/bin
+          sudo tar -C /opt/cni/bin -xzf cni-plugins-linux-amd64-$CNI_VERSION.tgz
+          rm cni-plugins-linux-amd64-$CNI_VERSION.tgz
 
       - name: Configure and Start CRI-O
         run: |
